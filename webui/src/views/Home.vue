@@ -108,14 +108,15 @@ function libPath(lib) {
 
       <template v-else>
         <!-- ================= continue watching ================= -->
-        <section v-if="continueList.length" class="section">
+        <section v-if="continueList.length" v-reveal class="section">
           <div class="section-head">
             <h2 class="section-title"><AppIcon name="history" :size="18" /> 继续观看</h2>
           </div>
           <MediaRail>
             <router-link
-              v-for="c in continueList" :key="c.item.id + '-' + c.file_id"
+              v-for="(c, i) in continueList" :key="c.item.id + '-' + c.file_id"
               :to="`/play/${c.file_id}`" class="wide-card"
+              :style="{ '--i': Math.min(i, 8) }"
             >
               <div class="still">
                 <SmartImage :src="artUrl(c.item)" :alt="c.item.name" :seed="c.item.name" />
@@ -136,7 +137,7 @@ function libPath(lib) {
         </section>
 
         <!-- ================= movies ================= -->
-        <section v-if="movies.length" class="section">
+        <section v-if="movies.length" v-reveal class="section">
           <div class="section-head">
             <h2 class="section-title">最近添加的电影</h2>
             <router-link v-if="movieMore" :to="`/library/${movieLib.id}?type=movie`" class="more">
@@ -144,12 +145,15 @@ function libPath(lib) {
             </router-link>
           </div>
           <MediaRail>
-            <PosterCard v-for="m in movies" :key="m.id" :item="m" />
+            <PosterCard
+              v-for="(m, i) in movies" :key="m.id" :item="m"
+              :style="{ '--i': Math.min(i, 8) }"
+            />
           </MediaRail>
         </section>
 
         <!-- ================= shows ================= -->
-        <section v-if="shows.length" class="section">
+        <section v-if="shows.length" v-reveal class="section">
           <div class="section-head">
             <h2 class="section-title">最近添加的剧集</h2>
             <router-link v-if="showMore" :to="`/library/${seriesLib.id}?type=show`" class="more">
@@ -157,12 +161,15 @@ function libPath(lib) {
             </router-link>
           </div>
           <MediaRail>
-            <PosterCard v-for="s in shows" :key="s.id" :item="s" />
+            <PosterCard
+              v-for="(s, i) in shows" :key="s.id" :item="s"
+              :style="{ '--i': Math.min(i, 8) }"
+            />
           </MediaRail>
         </section>
 
         <!-- ================= top rated ================= -->
-        <section v-if="topRated.length >= 4" class="section">
+        <section v-if="topRated.length >= 4" v-reveal class="section">
           <div class="section-head">
             <h2 class="section-title"><AppIcon name="sparkles" :size="18" /> 评分最高</h2>
             <span class="tiny">来自 TMDB / Bangumi 评分</span>
@@ -171,12 +178,13 @@ function libPath(lib) {
             <PosterCard
               v-for="(t, i) in topRated" :key="t.id" :item="t"
               class="ranked" :rank="i + 1"
+              :style="{ '--i': Math.min(i, 8) }"
             />
           </MediaRail>
         </section>
 
         <!-- ================= libraries ================= -->
-        <section v-if="libraries.length" class="section">
+        <section v-if="libraries.length" v-reveal.stagger class="section">
           <div class="section-head">
             <h2 class="section-title">我的媒体库</h2>
             <router-link v-if="$route.path !== '/settings'" to="/settings" class="more">
@@ -185,9 +193,9 @@ function libPath(lib) {
           </div>
           <div class="lib-grid">
             <router-link
-              v-for="l in libraries" :key="l.id"
+              v-for="(l, i) in libraries" :key="l.id"
               :to="`/library/${l.id}?type=${l.type === 'series' ? 'show' : 'movie'}`"
-              class="lib-tile"
+              class="lib-tile" :style="{ '--i': i }"
             >
               <span class="lib-icon"><AppIcon :name="l.type === 'series' ? 'tv' : 'film'" :size="20" /></span>
               <span class="lib-meta">

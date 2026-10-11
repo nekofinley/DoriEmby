@@ -42,8 +42,8 @@ onBeforeUnmount(() => {
 <template>
   <div class="rail" :class="{ over: overflowing }">
     <button
-      class="rail-arrow left" :hidden="atStart" aria-label="向左滚动"
-      @click="scrollBy(-1)"
+      class="rail-arrow left" :class="{ off: atStart }" aria-label="向左滚动"
+      :tabindex="atStart ? -1 : 0" @click="scrollBy(-1)"
     ><span><AppIcon name="chevronLeft" :size="20" /></span></button>
 
     <div ref="track" class="rail-track no-scrollbar" @scroll.passive="measure">
@@ -51,8 +51,8 @@ onBeforeUnmount(() => {
     </div>
 
     <button
-      class="rail-arrow right" :hidden="atEnd" aria-label="向右滚动"
-      @click="scrollBy(1)"
+      class="rail-arrow right" :class="{ off: atEnd }" aria-label="向右滚动"
+      :tabindex="atEnd ? -1 : 0" @click="scrollBy(1)"
     ><span><AppIcon name="chevronRight" :size="20" /></span></button>
   </div>
 </template>

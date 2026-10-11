@@ -68,8 +68,7 @@ function genresOf(it) {
     </div>
 
     <div class="content page">
-      <Transition name="rise" mode="out-in">
-        <div :key="current.id" class="copy">
+      <div :key="current.id" class="copy">
           <div class="eyebrow-row">
             <span class="eyebrow">DoriyaMedia 精选</span>
             <span class="dot"></span>
@@ -97,7 +96,6 @@ function genresOf(it) {
             </router-link>
           </div>
         </div>
-      </Transition>
 
       <div v-if="hasMany" class="dots">
         <button
@@ -160,6 +158,17 @@ function genresOf(it) {
   padding-top: calc(var(--header-h) + 40px);
 }
 .copy { max-width: min(660px, 62vw); }
+/* the copy block is re-keyed on every slide, so these play per rotation */
+.copy > * { animation: cardIn 620ms var(--ease-out) backwards; }
+.copy > *:nth-child(1) { animation-delay: 60ms; }
+.copy > *:nth-child(2) { animation-delay: 130ms; }
+.copy > *:nth-child(3) { animation-delay: 210ms; }
+.copy > *:nth-child(4) { animation-delay: 280ms; }
+.copy > *:nth-child(5) { animation-delay: 360ms; }
+@keyframes cardIn {
+  from { opacity: 0; transform: translateY(16px); }
+  to { opacity: 1; transform: none; }
+}
 .eyebrow-row { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
 .eyebrow-row .dot { width: 4px; height: 4px; border-radius: 50%; background: var(--text-4); }
 .title {

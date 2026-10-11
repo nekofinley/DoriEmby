@@ -131,13 +131,19 @@ function reset() { search.value = ''; type.value = isSeries.value ? 'show' : '';
         </div>
 
         <!-- grid -->
-        <div v-if="view === 'grid'" class="grid-auto">
-          <PosterCard v-for="(it, i) in items" :key="it.id" :item="it" :eager="i < 8" />
+        <div v-if="view === 'grid'" v-reveal.stagger class="grid-auto">
+          <PosterCard
+            v-for="(it, i) in items" :key="it.id" :item="it" :eager="i < 8"
+            :style="{ '--i': Math.min(i, 11) }"
+          />
         </div>
 
         <!-- list -->
-        <div v-else class="list">
-          <router-link v-for="it in items" :key="it.id" :to="`/item/${it.id}`" class="list-row">
+        <div v-else v-reveal.stagger class="list">
+          <router-link
+            v-for="(it, i) in items" :key="it.id" :to="`/item/${it.id}`" class="list-row"
+            :style="{ '--i': Math.min(i, 11) }"
+          >
             <div class="thumb">
               <SmartImage :src="artIf(it, 'poster')" :alt="it.name" :seed="it.name" />
             </div>

@@ -576,19 +576,24 @@ select option { background: var(--bg-2); color: var(--text-1); }
 /* The track bleeds exactly one gutter past the page on each side, so the scrim
    has to be anchored to the track's clip edge — anchoring it to the page
    content edge puts it a whole gutter too far in. The inner button is then
-   padded back to sit on the content edge instead. */
+   padded back to sit on the content edge instead.
+
+   Vertically it covers the whole rail band (plus a little slack for the card's
+   hover lift): the scrim shares the page background colour, so the overhang is
+   invisible while a short scrim leaves a bright strip at the card edge. */
 .rail-arrow {
   position: absolute;
-  top: 6px;
-  bottom: 14px;
+  top: -10px;
+  bottom: -10px;
   width: calc(var(--gutter) + 56px);
   display: flex;
   align-items: center;
   border: none;
   color: #fff;
   opacity: 0;
+  visibility: hidden;
   pointer-events: none;
-  transition: opacity var(--t-mid);
+  transition: opacity 300ms var(--ease-out), visibility 300ms var(--ease-out);
   z-index: 3;
 }
 .rail-arrow.left {
@@ -614,11 +619,17 @@ select option { background: var(--bg-2); color: var(--text-1); }
   backdrop-filter: blur(10px);
   /* the scrim itself stays click-through so the card underneath is reachable */
   pointer-events: auto;
-  transition: transform var(--t-fast), background var(--t-fast);
+  transition: transform 340ms var(--ease-out), background var(--t-fast);
 }
-.rail-arrow:hover span { background: var(--bg-3); transform: scale(1.08); }
-.rail:hover .rail-arrow { opacity: 1; }
-.rail-arrow[hidden] { display: none; }
+/* the button slides in from the edge as the scrim fades up */
+.rail-arrow.left span { transform: translateX(-12px) scale(0.92); }
+.rail-arrow.right span { transform: translateX(12px) scale(0.92); }
+.rail:hover .rail-arrow:not(.off) { opacity: 1; visibility: visible; }
+.rail:hover .rail-arrow:not(.off) span { transform: translateX(0) scale(1); }
+.rail:hover .rail-arrow:not(.off) span:hover { background: var(--bg-3); transform: translateX(0) scale(1.09); }
+/* `.off` = nothing left to scroll in that direction: keep it mounted so the
+   fade always animates instead of popping in */
+.rail-arrow.off { visibility: hidden; }
 @media (hover: none) { .rail-arrow { display: none !important; } }
 
 /* ============================ poster card ================================ */
@@ -960,6 +971,50 @@ select option { background: var(--bg-2); color: var(--text-1); }
   transition: all var(--t-mid);
 }
 .step-dots i.on { width: 22px; background: #fff; }
+
+/* ============================ motion ==================================== */
+
+/* Card entrance, staggered by the --i index the views set on each item.
+   `backwards` (not `both`) on purpose: a filled animation would keep winning
+   over the hover transform once it finished. */
+@keyframes cardIn {
+  from { opacity: 0; transform: translateY(14px) scale(0.985); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes fadeIn { from { opacity: 0; } }
+@keyframes panelIn {
+  from { opacity: 0; transform: translateY(-16px) scale(0.985); }
+}
+@keyframes riseIn {
+  from { opacity: 0; transform: translateY(18px); }
+}
+
+.rail-track > * {
+  animation: cardIn 520ms var(--ease-out) backwards;
+  animation-delay: calc(var(--i, 0) * 42ms);
+}
+.stagger > * {
+  animation: cardIn 520ms var(--ease-out) backwards;
+  animation-delay: calc(var(--i, 0) * 42ms);
+}
+
+/* Scroll reveal: `v-reveal` fades the block itself, `v-reveal.stagger` fades
+   its children in sequence. The hidden state is applied by the directive, so
+   content still shows if the observer never runs. Children use an animation
+   rather than a transition so each card keeps its own hover transition. */
+.reveal {
+  opacity: 0;
+  transform: translateY(20px);
+  transition: opacity 640ms var(--ease-out), transform 640ms var(--ease-out);
+  transition-delay: var(--d, 0ms);
+}
+.reveal.in { opacity: 1; transform: none; }
+.reveal-stagger > * { opacity: 0; }
+.reveal-stagger.in > * {
+  opacity: 1;
+  animation: cardIn 560ms var(--ease-out) backwards;
+  animation-delay: calc(var(--i, 0) * 55ms);
+}
 
 /* ============================ utilities ================================= */
 

@@ -174,13 +174,16 @@ function seasonBackdrop(s) {
 
       <!-- ================= show: seasons ================= -->
       <template v-if="isShow">
-        <section v-if="seasons.length" class="section">
+        <section v-if="seasons.length" v-reveal.stagger class="section">
           <div class="section-head">
             <h2 class="section-title">季与版本</h2>
             <span class="tiny">共 {{ seasons.length }} 季</span>
           </div>
           <div class="season-grid">
-            <router-link v-for="s in seasons" :key="s.id" :to="`/season/${s.id}`" class="season-card">
+            <router-link
+              v-for="(s, i) in seasons" :key="s.id" :to="`/season/${s.id}`" class="season-card"
+              :style="{ '--i': Math.min(i, 8) }"
+            >
               <div class="still">
                 <SmartImage v-if="seasonBackdrop(s)" :src="seasonBackdrop(s)" :alt="s.name" :seed="s.name" />
                 <div v-else class="ph"><span>{{ seasonLabel(s) }}</span></div>
@@ -198,17 +201,18 @@ function seasonBackdrop(s) {
 
       <!-- ================= movie / episode: files ================= -->
       <template v-else>
-        <section v-if="files.length" class="section files-section">
+        <section v-if="files.length" v-reveal class="section files-section">
           <div class="section-head">
             <h2 class="section-title">文件与版本</h2>
             <span class="tiny">{{ files.length }} 个可播放文件</span>
           </div>
 
           <div class="files-layout">
-            <div class="versions">
+            <div class="versions stagger">
               <button
-                v-for="f in files" :key="f.id"
+                v-for="(f, i) in files" :key="f.id"
                 class="version-card" :class="{ on: f.id === selectedFile }"
+                :style="{ '--i': i }"
                 @click="selectedFile = f.id"
               >
                 <span class="check"><AppIcon name="check" :size="13" /></span>

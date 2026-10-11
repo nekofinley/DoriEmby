@@ -127,10 +127,11 @@ function onKeydown(e) {
               <div class="tiny">试试更短的关键词,或检查媒体库是否已扫描</div>
             </div>
 
-            <div v-if="shown.length" class="results">
+            <div v-if="shown.length" class="results stagger">
               <PosterCard
                 v-for="(it, i) in shown" :key="it.id" :item="it"
                 :class="{ active: i === active }"
+                :style="{ '--i': Math.min(i, 11) }"
                 @mouseenter="active = i"
               />
             </div>
@@ -164,6 +165,7 @@ function onKeydown(e) {
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
   display: flex;
+  align-items: flex-start;
   justify-content: center;
   padding: clamp(12px, 8vh, 96px) 16px 16px;
 }
@@ -177,6 +179,7 @@ function onKeydown(e) {
   border-radius: var(--r-l);
   box-shadow: var(--sh-4);
   overflow: hidden;
+  animation: panelIn 340ms var(--ease-out) backwards;
 }
 .bar {
   display: flex;

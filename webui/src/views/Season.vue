@@ -129,10 +129,11 @@ onMounted(load)
         <span class="tiny">共 {{ episodes.length }} 集 · 点击任意一集开始播放</span>
       </div>
 
-      <div v-if="episodes.length" class="eps">
+      <div v-if="episodes.length" class="eps stagger">
         <article
-          v-for="ep in episodes" :key="ep.id"
+          v-for="(ep, i) in episodes" :key="ep.id"
           class="ep" :class="{ hot: hovered === ep.id }"
+          :style="{ '--i': Math.min(i, 11) }"
           @mouseenter="hovered = ep.id" @mouseleave="hovered = 0"
         >
           <div class="ep-no">{{ epNo(ep) }}</div>
