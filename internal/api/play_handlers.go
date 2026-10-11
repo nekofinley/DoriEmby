@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"doriya/internal/media"
-	"doriya/internal/models"
-	"doriya/internal/source"
+	"doriyamedia/internal/media"
+	"doriyamedia/internal/models"
+	"doriyamedia/internal/source"
 )
 
 // proxyClient streams media through the server (no global timeout).
@@ -339,7 +339,7 @@ func proxyRemote(w http.ResponseWriter, r *http.Request, target string, headers 
 		req.Header.Set("Range", rng)
 	}
 	if req.Header.Get("User-Agent") == "" {
-		req.Header.Set("User-Agent", "Doriya/0.1")
+		req.Header.Set("User-Agent", "DoriyaMedia/0.1")
 	}
 	resp, err := proxyClient.Do(req)
 	if err != nil {

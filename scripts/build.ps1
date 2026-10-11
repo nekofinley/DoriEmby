@@ -1,6 +1,6 @@
-# Build Doriya: frontend -> embed -> single binary
+# Build DoriyaMedia: frontend -> embed -> single binary
 param(
-  [string]$Output = "doriya.exe"
+  [string]$Output = "doriyamedia.exe"
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path | Split-Path -Parent
@@ -18,7 +18,7 @@ Write-Host "==> building server (embeds webui/dist)" -ForegroundColor Cyan
 $env:GOPROXY = "https://goproxy.cn,https://proxy.golang.org,direct"
 Push-Location $root
 try {
-  go build -ldflags "-s -w" -o $Output ./cmd/doriya
+  go build -ldflags "-s -w" -o $Output ./cmd/doriyamedia
   if ($LASTEXITCODE -ne 0) { throw "go build failed" }
 } finally {
   Pop-Location

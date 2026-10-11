@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"doriya/internal/models"
-	"doriya/internal/scan"
-	"doriya/internal/source"
+	"doriyamedia/internal/models"
+	"doriyamedia/internal/scan"
+	"doriyamedia/internal/source"
 )
 
 // GET /api/browse/{sourceId}?path=/ — list a directory of a source (file browser).
@@ -96,6 +96,11 @@ func (s *Server) handleBrowsePlay(w http.ResponseWriter, r *http.Request, user *
 }
 
 func (s *Server) ensureBrowseFile(ctx context.Context, sourceID int64, path string) (*models.MediaFile, error) {
+	// Already scanned into a library? Play that row as-is — re-registering it
+	// under the browse scratchpad would steal the file from its show/movie.
+	if f, err := s.Store.FileBySourcePath(sourceID, path); err == nil {
+		return f, nil
+	}
 	lib, err := s.Store.EnsureBrowseLibrary(sourceID)
 	if err != nil {
 		return nil, err

@@ -20,16 +20,19 @@ type TMDBClient struct {
 	client  *http.Client
 }
 
-func NewTMDBClient(apiKey, language, apiBase, imgBase string) *TMDBClient {
+func NewTMDBClient(apiKey, language, apiBase, imgBase string, client *http.Client) *TMDBClient {
 	if language == "" {
 		language = "zh-CN"
+	}
+	if client == nil {
+		client = &http.Client{Timeout: 30 * time.Second}
 	}
 	return &TMDBClient{
 		APIKey:   apiKey,
 		Language: language,
 		APIBase:  apiBase,
 		ImgBase:  imgBase,
-		client:   &http.Client{Timeout: 30 * time.Second},
+		client:   client,
 	}
 }
 

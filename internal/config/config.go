@@ -8,11 +8,32 @@ import (
 	"path/filepath"
 )
 
+// DefaultTMDBProxy is the usual local SOCKS5 port (Clash/v2rayN default).
+const DefaultTMDBProxy = "socks5://127.0.0.1:7890"
+
 type TMDB struct {
-	APIKey  string `json:"api_key"`
+	APIKey   string `json:"api_key"`
 	Language string `json:"language"`
+	APIBase  string `json:"api_base"`
+	ImgBase  string `json:"img_base"`
+	// UseProxy routes TMDB API calls and poster/backdrop downloads through a
+	// local proxy — required for api.themoviedb.org / image.tmdb.org from
+	// mainland China.
+	UseProxy bool   `json:"use_proxy"`
+	Proxy    string `json:"proxy"`
+}
+
+// BGMTV is the Bangumi (bgm.tv) metadata source — the best Chinese-language
+// source for anime titles, episode titles and air dates.
+type BGMTV struct {
+	// Token is an optional personal access token (next.bgm.tv/demo/access-token).
+	// Public search/detail/episode endpoints work without it.
+	Token   string `json:"token"`
 	APIBase string `json:"api_base"`
-	ImgBase string `json:"img_base"`
+	// UseProxy defaults to true: api.bgm.tv is frequently DNS-poisoned from
+	// mainland China, so a local proxy is usually the only way to reach it.
+	UseProxy bool   `json:"use_proxy"`
+	Proxy    string `json:"proxy"`
 }
 
 type Playback struct {
@@ -28,6 +49,7 @@ type Config struct {
 	FFmpeg          string   `json:"ffmpeg"`
 	FFProbe         string   `json:"ffprobe"`
 	TMDB            TMDB     `json:"tmdb"`
+	BGM             BGMTV    `json:"bgm"`
 	Playback        Playback `json:"playback"`
 	ScanConcurrency int      `json:"scan_concurrency"`
 	DevWebDir       string   `json:"dev_web_dir"`
@@ -44,6 +66,12 @@ func Defaults() *Config {
 			Language: "zh-CN",
 			APIBase:  "https://api.themoviedb.org/3",
 			ImgBase:  "https://image.tmdb.org/t/p",
+			Proxy:    DefaultTMDBProxy,
+		},
+		BGM: BGMTV{
+			APIBase:  "https://api.bgm.tv",
+			UseProxy: true,
+			Proxy:    DefaultTMDBProxy,
 		},
 		Playback: Playback{
 			ForceMode:       "auto",
@@ -90,6 +118,15 @@ func (c *Config) normalize() {
 	if c.TMDB.ImgBase == "" {
 		c.TMDB.ImgBase = "https://image.tmdb.org/t/p"
 	}
+	if c.TMDB.Proxy == "" {
+		c.TMDB.Proxy = DefaultTMDBProxy
+	}
+	if c.BGM.APIBase == "" {
+		c.BGM.APIBase = "https://api.bgm.tv"
+	}
+	if c.BGM.Proxy == "" {
+		c.BGM.Proxy = DefaultTMDBProxy
+	}
 	if c.Playback.ForceMode == "" {
 		c.Playback.ForceMode = "auto"
 	}
@@ -129,7 +166,7 @@ func (c *Config) Abs() string {
 	return filepath.Join(wd, c.DataDir)
 }
 
-func (c *Config) DBPath() string     { return filepath.Join(c.Abs(), "doriya.db") }
+func (c *Config) DBPath() string     { return filepath.Join(c.Abs(), "doriyamedia.db") }
 func (c *Config) ImagesDir() string  { return filepath.Join(c.Abs(), "images") }
 func (c *Config) LogsDir() string    { return filepath.Join(c.Abs(), "logs") }
 

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -8,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"doriya/internal/models"
-	"doriya/internal/source"
+	"doriyamedia/internal/models"
+	"doriyamedia/internal/source"
 )
 
 // ---------- sources ----------
@@ -169,26 +170,60 @@ func (s *Server) handleListLibraries(w http.ResponseWriter, r *http.Request, use
 	writeJSON(w, 200, visible)
 }
 
+// providersField accepts both shapes clients may send for the scraper list:
+// a JSON array (["nfo","bgm","tmdb"]) or the double-encoded string the DB
+// stores ("[\"nfo\",\"bgm\",\"tmdb\"]"). Stored form is always the string.
+type providersField string
+
+func (p *providersField) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	switch {
+	case s == "" || s == "null":
+		*p = ""
+		return nil
+	case strings.HasPrefix(s, `"`):
+		var str string
+		if err := json.Unmarshal(b, &str); err != nil {
+			return err
+		}
+		*p = providersField(str)
+		return nil
+	default:
+		var arr []string
+		if err := json.Unmarshal(b, &arr); err != nil {
+			return err
+		}
+		raw, _ := json.Marshal(arr)
+		*p = providersField(string(raw))
+		return nil
+	}
+}
+
 func (s *Server) handleCreateLibrary(w http.ResponseWriter, r *http.Request, user *models.User) {
-	var req models.Library
+	var req struct {
+		models.Library
+		Providers providersField `json:"providers"`
+	}
 	if err := readBody(r, &req); err != nil || req.Name == "" {
 		fail(w, 400, "名称不能为空")
 		return
 	}
-	if req.Type != "movie" && req.Type != "series" {
-		req.Type = "movie"
+	lib := req.Library
+	lib.Providers = string(req.Providers)
+	if lib.Type != "movie" && lib.Type != "series" {
+		lib.Type = "movie"
 	}
-	if req.Path == "" {
-		req.Path = "/"
+	if lib.Path == "" {
+		lib.Path = "/"
 	}
-	if req.Providers == "" {
-		req.Providers = `["nfo","tmdb"]`
+	if lib.Providers == "" {
+		lib.Providers = `["nfo","bgm","tmdb"]`
 	}
-	if err := s.Store.CreateLibrary(&req); err != nil {
+	if err := s.Store.CreateLibrary(&lib); err != nil {
 		fail(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, req)
+	writeJSON(w, 200, lib)
 }
 
 func (s *Server) handleUpdateLibrary(w http.ResponseWriter, r *http.Request, user *models.User) {
@@ -198,7 +233,10 @@ func (s *Server) handleUpdateLibrary(w http.ResponseWriter, r *http.Request, use
 		fail(w, 404, "媒体库不存在")
 		return
 	}
-	var req models.Library
+	var req struct {
+		models.Library
+		Providers providersField `json:"providers"`
+	}
 	if err := readBody(r, &req); err != nil {
 		fail(w, 400, err.Error())
 		return
@@ -212,8 +250,8 @@ func (s *Server) handleUpdateLibrary(w http.ResponseWriter, r *http.Request, use
 	if req.Path != "" {
 		lib.Path = req.Path
 	}
-	if req.Providers != "" {
-		lib.Providers = req.Providers
+	if p := string(req.Providers); p != "" {
+		lib.Providers = p
 	}
 	if err := s.Store.UpdateLibrary(lib); err != nil {
 		fail(w, 500, err.Error())
@@ -300,7 +338,28 @@ func (s *Server) handleItemDetail(w http.ResponseWriter, r *http.Request, user *
 		resp["seasons"] = out
 	case "season":
 		eps, _ := s.Store.ItemChildren(item.ID)
-		resp["episodes"] = eps
+		type episodeOut struct {
+			models.Item
+			// Versions always holds at least one entry so the season grid can
+			// offer "play" for single-release episodes; FileID is the default.
+			Versions []versionDTO `json:"versions,omitempty"`
+			FileID   int64        `json:"file_id,omitempty"`
+		}
+		out := make([]episodeOut, 0, len(eps))
+		for _, ep := range eps {
+			vs := s.versionsForAll(ep.ID, 0)
+			var def int64
+			if len(vs) > 0 {
+				def = vs[0].ID
+			}
+			out = append(out, episodeOut{Item: ep, Versions: vs, FileID: def})
+		}
+		resp["episodes"] = out
+		if item.ParentID != nil {
+			if show, err := s.Store.ItemByID(*item.ParentID); err == nil {
+				resp["show"] = show
+			}
+		}
 	default:
 		files, _ := s.Store.FilesByItem(item.ID)
 		fdtos := make([]map[string]any, 0, len(files))
@@ -327,9 +386,15 @@ func (s *Server) handleItemRefresh(w http.ResponseWriter, r *http.Request, user 
 	id, _ := pathID(r)
 	var req struct {
 		TMDBID int `json:"tmdb_id"`
+		BGMID  int `json:"bgm_id"`
 	}
 	_ = readBody(r, &req)
-	if err := s.Metadata.RefreshItem(id, req.TMDBID); err != nil {
+	if req.BGMID > 0 {
+		if err := s.Metadata.RefreshItemByBGM(id, req.BGMID); err != nil {
+			fail(w, 400, err.Error())
+			return
+		}
+	} else if err := s.Metadata.RefreshItem(id, req.TMDBID); err != nil {
 		fail(w, 400, err.Error())
 		return
 	}

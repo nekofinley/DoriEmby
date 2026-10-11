@@ -6,6 +6,9 @@ config.json
 # build artifacts
 *.exe
 
+# local UI verification sandbox (fixtures, screenshots, seeding)
+.uitest/
+
 node_modules/
 webui/node_modules/
 webui/dist/

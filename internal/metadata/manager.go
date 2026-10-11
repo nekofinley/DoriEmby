@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -12,18 +13,21 @@ import (
 	"sync"
 	"time"
 
-	"doriya/internal/config"
-	"doriya/internal/db"
-	"doriya/internal/models"
-	"doriya/internal/source"
+	"doriyamedia/internal/config"
+	"doriyamedia/internal/db"
+	"doriyamedia/internal/models"
+	"doriyamedia/internal/source"
 )
 
 type Manager struct {
 	Store *db.Store
 	Cfg   *config.Config
 
-	listMu     sync.Mutex
-	listCache  map[string][]source.Entry // per-EnrichLibrary-run dir listing cache
+	listMu    sync.Mutex
+	listCache map[string][]source.Entry // per-EnrichLibrary-run dir listing cache
+
+	bgmMu       sync.Mutex
+	bgmEpsCache map[int][]BgmEpisodeMeta
 }
 
 func NewManager(store *db.Store, cfg *config.Config) *Manager {
@@ -50,9 +54,79 @@ func (m *Manager) cachedList(ctx context.Context, drv source.Driver, dir string)
 	return ents, nil
 }
 
+// httpClient returns the client used for TMDB API/image traffic, routed
+// through the configured local proxy when enabled (falls back to a direct
+// client if the proxy address is unusable, so scraping never dies silently).
+func (m *Manager) httpClient(timeout time.Duration) *http.Client {
+	c := m.Cfg.TMDB
+	if !c.UseProxy {
+		client, _ := HTTPClientFor("", timeout)
+		return client
+	}
+	client, err := HTTPClientFor(c.Proxy, timeout)
+	if err != nil {
+		log.Printf("TMDB 代理配置无效(%v),本次直连", err)
+		client, _ = HTTPClientFor("", timeout)
+	}
+	return client
+}
+
 func (m *Manager) tmdb() *TMDBClient {
 	c := m.Cfg.TMDB
-	return NewTMDBClient(c.APIKey, c.Language, c.APIBase, c.ImgBase)
+	return NewTMDBClient(c.APIKey, c.Language, c.APIBase, c.ImgBase, m.httpClient(30*time.Second))
+}
+
+// bgmHTTPClient routes Bangumi traffic through its own proxy setting (api.bgm.tv
+// is DNS-poisoned for many mainland users), falling back to a direct client.
+func (m *Manager) bgmHTTPClient(timeout time.Duration) *http.Client {
+	c := m.Cfg.BGM
+	if !c.UseProxy {
+		client, _ := HTTPClientFor("", timeout)
+		return client
+	}
+	client, err := HTTPClientFor(c.Proxy, timeout)
+	if err != nil {
+		log.Printf("Bangumi 代理配置无效(%v),本次直连", err)
+		client, _ = HTTPClientFor("", timeout)
+	}
+	return client
+}
+
+func (m *Manager) bgm() *BangumiClient {
+	c := m.Cfg.BGM
+	return NewBangumiClient(c.Token, c.APIBase, m.bgmHTTPClient(30*time.Second))
+}
+
+// bgmEpisodes caches one subject's episode list for the duration of an
+// enrichment run — otherwise every episode of a show refetches it.
+func (m *Manager) bgmEpisodes(ctx context.Context, subjectID int) ([]BgmEpisodeMeta, error) {
+	m.bgmMu.Lock()
+	if m.bgmEpsCache == nil {
+		m.bgmEpsCache = map[int][]BgmEpisodeMeta{}
+	}
+	if eps, ok := m.bgmEpsCache[subjectID]; ok {
+		m.bgmMu.Unlock()
+		return eps, nil
+	}
+	m.bgmMu.Unlock()
+
+	eps, err := m.bgm().Episodes(ctx, subjectID)
+	if err != nil {
+		return nil, err
+	}
+	m.bgmMu.Lock()
+	m.bgmEpsCache[subjectID] = eps
+	m.bgmMu.Unlock()
+	return eps, nil
+}
+
+// preferCN returns the Chinese title when available (DoriyaMedia's UI is Chinese),
+// otherwise the original one.
+func preferCN(cn, orig string) string {
+	if strings.TrimSpace(cn) != "" {
+		return strings.TrimSpace(cn)
+	}
+	return strings.TrimSpace(orig)
 }
 
 func providers(lib *models.Library) []string {
@@ -61,7 +135,7 @@ func providers(lib *models.Library) []string {
 		_ = json.Unmarshal([]byte(lib.Providers), &out)
 	}
 	if len(out) == 0 {
-		out = []string{"nfo", "tmdb"}
+		out = []string{"nfo", "bgm", "tmdb"}
 	}
 	return out
 }
@@ -207,6 +281,10 @@ func (m *Manager) enrichMovie(ctx context.Context, drv source.Driver, lib *model
 			if m.tryMovieTMDB(ctx, it, it.Name, it.Year) {
 				return
 			}
+		case "bgm":
+			if m.tryMovieBGM(ctx, it, it.Name, it.Year) {
+				return
+			}
 		}
 	}
 }
@@ -229,12 +307,16 @@ func (m *Manager) enrichShow(ctx context.Context, drv source.Driver, lib *models
 			if m.tryShowTMDB(ctx, show, show.Name, 0) {
 				return
 			}
+		case "bgm":
+			if m.tryShowBGM(ctx, show, show.Name, show.Year) {
+				return
+			}
 		}
 	}
 }
 
 func (m *Manager) enrichEpisode(ctx context.Context, drv source.Driver, lib *models.Library, ep *models.Item, show *models.Item, season *models.Item) {
-	if ep.Name != "" && !strings.HasPrefix(ep.Name, "绗?") && !strings.HasPrefix(ep.Name, "Episode") {
+	if ep.Name != "" && !strings.HasPrefix(ep.Name, "第") && !strings.HasPrefix(ep.Name, "Episode") {
 		// already has a real name (from a previous run) 鈥?still refresh stills if missing
 		if ep.StillPath != "" {
 			return
@@ -244,9 +326,19 @@ func (m *Manager) enrichEpisode(ctx context.Context, drv source.Driver, lib *mod
 	if err != nil || len(files) == 0 {
 		return
 	}
-	// nfo first for episodes (precise), then tmdb season data
-	if m.tryEpisodeNFO(ctx, drv, ep, &files[0]) {
-		return
+	// provider order decides who wins: nfo (precise, local) → Bangumi (Chinese
+	// titles for anime) → TMDB season data.
+	for _, p := range providers(lib) {
+		switch p {
+		case "nfo":
+			if m.tryEpisodeNFO(ctx, drv, ep, &files[0]) {
+				return
+			}
+		case "bgm":
+			if m.tryEpisodeBGM(ctx, ep, show) {
+				return
+			}
+		}
 	}
 	if show.TMDBID > 0 && m.tmdb().Enabled() {
 		throttle()
@@ -294,32 +386,72 @@ func (m *Manager) RefreshItem(itemID int64, tmdbID int) error {
 		if tmdbID > 0 {
 			return m.tryMovieTMDBByID(ctx, it, tmdbID)
 		}
-		it.TMDBID, it.Overview, it.PosterPath, it.BackdropPath = 0, "", "", ""
+		it.TMDBID, it.BGMID, it.Overview, it.PosterPath, it.BackdropPath = 0, 0, "", "", ""
 		_ = m.Store.UpdateItemMeta(it)
 		f := firstFile(m.Store, it.ID)
-		if m.tryMovieNFO(ctx, drv, it, f) {
-			return nil
+		for _, p := range providers(lib) {
+			switch p {
+			case "nfo":
+				if m.tryMovieNFO(ctx, drv, it, f) {
+					return nil
+				}
+			case "bgm":
+				if m.tryMovieBGM(ctx, it, it.Name, it.Year) {
+					return nil
+				}
+			case "tmdb":
+				if m.tryMovieTMDB(ctx, it, it.Name, it.Year) {
+					return nil
+				}
+			}
 		}
-		m.tryMovieTMDB(ctx, it, it.Name, it.Year)
 		return nil
 	case "show":
 		if tmdbID > 0 {
 			return m.tryShowTMDBByID(ctx, it, tmdbID)
 		}
-		it.TMDBID, it.Overview, it.PosterPath, it.BackdropPath = 0, "", "", ""
+		it.TMDBID, it.BGMID, it.Overview, it.PosterPath, it.BackdropPath = 0, 0, "", "", ""
 		_ = m.Store.UpdateItemMeta(it)
 		filePath, ok := m.firstEpisodeFile(it.ID)
 		if !ok {
-			return fmt.Errorf("鍓ч泦涓嬫病鏈夊彲鐢ㄧ殑鍓ч泦鏂囦欢")
+			return fmt.Errorf("剧集下没有可用的剧集文件")
 		}
-		if m.tryShowNFO(ctx, drv, it, filePath) {
-			return nil
+		for _, p := range providers(lib) {
+			switch p {
+			case "nfo":
+				if m.tryShowNFO(ctx, drv, it, filePath) {
+					return nil
+				}
+			case "bgm":
+				if m.tryShowBGM(ctx, it, it.Name, it.Year) {
+					return nil
+				}
+			case "tmdb":
+				if m.tryShowTMDB(ctx, it, it.Name, 0) {
+					return nil
+				}
+			}
 		}
-		m.tryShowTMDB(ctx, it, it.Name, 0)
 		return nil
 	default:
-		return fmt.Errorf("璇ョ被鍨嬩笉鏀寔鎵嬪姩璇嗗埆")
+		return fmt.Errorf("该类型不支持手动识别")
 	}
+}
+
+// RefreshItemByBGM pins an item to a specific Bangumi subject (manual identify
+// for anime, where search results are often ambiguous).
+func (m *Manager) RefreshItemByBGM(itemID int64, bgmID int) error {
+	it, err := m.Store.ItemByID(itemID)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	sub, err := m.bgm().Subject(ctx, bgmID)
+	if err != nil {
+		return err
+	}
+	return m.applyBGM(ctx, it, sub)
 }
 
 func firstFile(store *db.Store, itemID int64) *models.MediaFile {
@@ -353,6 +485,7 @@ func (m *Manager) tryMovieNFO(ctx context.Context, drv source.Driver, it *models
 		return false
 	}
 	dir, base := dirBase(f.Path)
+	stem := fileStem(base)
 	list, err := m.cachedList(ctx, drv, dir)
 	if err != nil {
 		return false
@@ -362,7 +495,7 @@ func (m *Manager) tryMovieNFO(ctx context.Context, drv source.Driver, it *models
 		names[strings.ToLower(e.Name)] = e
 	}
 	var nfoPath string
-	for _, cand := range []string{base + ".nfo", "movie.nfo", baseName2(dir) + ".nfo"} {
+	for _, cand := range []string{stem + ".nfo", base + ".nfo", "movie.nfo", baseName2(dir) + ".nfo"} {
 		if e, ok := names[strings.ToLower(cand)]; ok && !e.IsDir {
 			nfoPath = e.Path
 			break
@@ -402,10 +535,11 @@ func (m *Manager) tryMovieNFO(ctx context.Context, drv source.Driver, it *models
 		it.TMDBID = id
 	}
 	// local artwork files
-	if p := findImage(names, []string{"poster.jpg", "folder.jpg", "cover.jpg", base + "-poster.jpg", base + "-thumb.jpg"}); p != "" {
+	if p := findImage(names, []string{"poster.jpg", "folder.jpg", "cover.jpg",
+		stem + "-poster.jpg", stem + "-thumb.jpg", base + "-poster.jpg", base + "-thumb.jpg"}); p != "" {
 		it.PosterPath = m.saveRawImage(ctx, drv, p, it.ID, "poster")
 	}
-	if p := findImage(names, []string{"fanart.jpg", "backdrop.jpg", base + "-fanart.jpg"}); p != "" {
+	if p := findImage(names, []string{"fanart.jpg", "backdrop.jpg", stem + "-fanart.jpg", base + "-fanart.jpg"}); p != "" {
 		it.BackdropPath = m.saveRawImage(ctx, drv, p, it.ID, "backdrop")
 	}
 	// artwork URLs inside nfo
@@ -426,7 +560,8 @@ func (m *Manager) tryEpisodeNFO(ctx context.Context, drv source.Driver, ep *mode
 	if f == nil || isHTTP(f.Path) {
 		return false
 	}
-	dir, base := dirBase(f.Path)
+	dir, file := dirBase(f.Path)
+	stem := fileStem(file)
 	list, err := m.cachedList(ctx, drv, dir)
 	if err != nil {
 		return false
@@ -435,9 +570,15 @@ func (m *Manager) tryEpisodeNFO(ctx context.Context, drv source.Driver, ep *mode
 	for _, e := range list {
 		names[strings.ToLower(e.Name)] = e
 	}
+	// Kodi names sidecar files after the video without its extension
+	// (Show S01E01.mkv → Show S01E01.nfo); keep the old exact-name form as a
+	// fallback so existing libraries keep working.
 	var nfoPath string
-	if e, ok := names[strings.ToLower(base+".nfo")]; ok && !e.IsDir {
-		nfoPath = e.Path
+	for _, cand := range []string{stem + ".nfo", file + ".nfo", "episode.nfo"} {
+		if e, ok := names[strings.ToLower(cand)]; ok && !e.IsDir {
+			nfoPath = e.Path
+			break
+		}
 	}
 	if nfoPath == "" {
 		return false
@@ -465,7 +606,7 @@ func (m *Manager) tryEpisodeNFO(ctx context.Context, drv source.Driver, ep *mode
 	if nfo.Aired != "" {
 		ep.AirDate = nfo.Aired
 	}
-	if p := findImage(names, []string{base + "-thumb.jpg", "thumb.jpg"}); p != "" {
+	if p := findImage(names, []string{stem + "-thumb.jpg", "thumb.jpg", file + "-thumb.jpg"}); p != "" {
 		ep.StillPath = m.saveRawImage(ctx, drv, p, ep.ID, "still")
 	}
 	return m.Store.UpdateItemMeta(ep) == nil
@@ -623,6 +764,178 @@ func (m *Manager) tryShowTMDBByID(ctx context.Context, show *models.Item, id int
 	return m.Store.UpdateItemMeta(show)
 }
 
+// ---------- bangumi ----------
+
+func (m *Manager) tryMovieBGM(ctx context.Context, it *models.Item, query string, year int) bool {
+	sub, err := m.searchBGM(ctx, query, year)
+	if err != nil || sub == nil {
+		return false
+	}
+	return m.applyBGM(ctx, it, sub) == nil
+}
+
+func (m *Manager) tryShowBGM(ctx context.Context, show *models.Item, query string, year int) bool {
+	sub, err := m.searchBGM(ctx, query, year)
+	if err != nil || sub == nil {
+		return false
+	}
+	return m.applyBGM(ctx, show, sub) == nil
+}
+
+// searchBGM finds the best Bangumi subject for a name: exact title match first,
+// then substring match, with the year as a tie-breaker.
+func (m *Manager) searchBGM(ctx context.Context, query string, year int) (*BgmSubject, error) {
+	q := strings.TrimSpace(query)
+	if q == "" || len([]rune(q)) < 2 {
+		return nil, nil
+	}
+	b := m.bgm()
+	if !b.Enabled() {
+		return nil, nil
+	}
+	throttle()
+	results, err := b.Search(ctx, q, BgmTypeAnime)
+	if err != nil {
+		return nil, err
+	}
+	if len(results) == 0 {
+		return nil, nil
+	}
+	best := pickBGM(q, year, results)
+	if best < 0 {
+		return nil, nil
+	}
+	// Full detail carries rating/tags/summary that search results may omit.
+	if d, err := b.Subject(ctx, results[best].ID); err == nil && d != nil {
+		return d, nil
+	}
+	return &results[best], nil
+}
+
+// pickBGM returns the index of the best matching search result, or -1 when
+// nothing is close enough. Below 60 means neither the Chinese nor the original
+// title really matches — better no metadata than a random anime (a mock or
+// fictional name must not become "Another (2012)").
+func pickBGM(query string, year int, results []BgmSubject) int {
+	nq := normTitle(query)
+	best, bestScore := -1, 0
+	for i, r := range results {
+		score := 20
+		ncn, norig := normTitle(r.NameCN), normTitle(r.Name)
+		switch {
+		case ncn != "" && ncn == nq, norig != "" && norig == nq:
+			score = 100
+		case nearMatch(ncn, nq), nearMatch(norig, nq):
+			score = 60
+		}
+		if year > 0 && r.Year == year {
+			score += 30
+		}
+		if score > bestScore {
+			best, bestScore = i, score
+		}
+	}
+	if bestScore < 60 {
+		return -1
+	}
+	return best
+}
+
+// nearMatch is substring containment with a length-ratio guard, so a short
+// generic title ("Another") cannot swallow a long unrelated one.
+func nearMatch(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	short, long := a, b
+	if len([]rune(a)) > len([]rune(b)) {
+		short, long = b, a
+	}
+	if len([]rune(short)) < 2 || !strings.Contains(long, short) {
+		return false
+	}
+	return float64(len([]rune(short))) >= 0.6*float64(len([]rune(long)))
+}
+
+func (m *Manager) applyBGM(ctx context.Context, it *models.Item, sub *BgmSubject) error {
+	it.BGMID = sub.ID
+	// Chinese title wins for the UI; the original goes to original_title.
+	if name := preferCN(sub.NameCN, sub.Name); name != "" {
+		it.Name = name
+	}
+	if orig := strings.TrimSpace(sub.Name); orig != "" && orig != it.Name {
+		it.OriginalTitle = orig
+	}
+	if sub.Year > 0 {
+		it.Year = sub.Year
+	}
+	if sub.Overview != "" {
+		it.Overview = sub.Overview
+	}
+	if sub.Rating > 0 {
+		it.Rating = sub.Rating
+	}
+	if len(sub.Genres) > 0 {
+		raw, _ := json.Marshal(sub.Genres)
+		it.Genres = string(raw)
+	}
+	if sub.PosterURL != "" && it.PosterPath == "" {
+		it.PosterPath = m.saveBGMImage(ctx, it.ID, "poster", sub.PosterURL)
+	}
+	return m.Store.UpdateItemMeta(it)
+}
+
+// tryEpisodeBGM fills the episode number's Chinese title and air date from the
+// show's Bangumi subject (cached per run, so one fetch serves every episode).
+func (m *Manager) tryEpisodeBGM(ctx context.Context, ep *models.Item, show *models.Item) bool {
+	if show == nil || show.BGMID == 0 || ep.Episode <= 0 {
+		return false
+	}
+	eps, err := m.bgmEpisodes(ctx, show.BGMID)
+	if err != nil || len(eps) == 0 {
+		return false
+	}
+	for _, e := range eps {
+		if e.Number != ep.Episode {
+			continue
+		}
+		if t := strings.TrimSpace(e.Title); t != "" {
+			ep.Name = t
+		}
+		if e.AirDate != "" {
+			ep.AirDate = e.AirDate
+		}
+		_ = m.Store.UpdateItemMeta(ep)
+		return true
+	}
+	return false
+}
+
+func (m *Manager) saveBGMImage(ctx context.Context, itemID int64, kind, rawURL string) string {
+	u := BgmImageProxyURL(rawURL, "l")
+	data, err := m.bgm().DownloadImage(ctx, u)
+	if err != nil || len(data) < 100 {
+		return ""
+	}
+	return m.writeImage(itemID, kind, 0, u, data)
+}
+
+// normTitle lowercases and strips punctuation/spaces so "孤独摇滚！" and
+// "孤独摇滚" compare equal.
+func normTitle(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case ' ', '\t', '　', '!', '！', '?', '？', '.', '。', '·', '・', '、', ',', '，',
+			'-', '_', '—', '～', '~', ':', '：', '\'', '"', '「', '」', '《', '》', '(', ')', '（', '）':
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
 // ---------- images ----------
 
 func (m *Manager) saveTMDBImage(ctx context.Context, itemID int64, kind string, tmdbID int, path, size string) string {
@@ -635,7 +948,7 @@ func (m *Manager) saveTMDBImage(ctx context.Context, itemID int64, kind string, 
 }
 
 func (m *Manager) saveURLImage(ctx context.Context, u string, itemID int64, kind string) string {
-	client := &http.Client{Timeout: 60 * time.Second}
+	client := m.httpClient(60 * time.Second)
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return ""
@@ -718,6 +1031,14 @@ func dirBase(p string) (string, string) {
 		return "", p
 	}
 	return p[:i], p[i+1:]
+}
+
+// fileStem drops the final extension of a file name ("a.b.mkv" → "a.b").
+func fileStem(name string) string {
+	if i := strings.LastIndex(name, "."); i > 0 {
+		return name[:i]
+	}
+	return name
 }
 
 func baseName2(dir string) string {

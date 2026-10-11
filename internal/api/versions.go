@@ -18,8 +18,19 @@ type versionDTO struct {
 // versionsFor lists every file bound to the item as a human-labelled variant.
 // Returns nil when the item has only one file (nothing to choose from).
 func (s *Server) versionsFor(itemID, currentID int64) []versionDTO {
+	return s.versionList(itemID, currentID, false)
+}
+
+// versionsForAll is versionsFor but never empty: list pages need one playable
+// file per episode even when there is only a single release, otherwise the UI
+// reports "no video file" for every single-version episode.
+func (s *Server) versionsForAll(itemID, currentID int64) []versionDTO {
+	return s.versionList(itemID, currentID, true)
+}
+
+func (s *Server) versionList(itemID, currentID int64, keepSingle bool) []versionDTO {
 	files, err := s.Store.FilesByItem(itemID)
-	if err != nil || len(files) < 2 {
+	if err != nil || len(files) == 0 || (len(files) < 2 && !keepSingle) {
 		return nil
 	}
 	labels := make([]string, len(files))

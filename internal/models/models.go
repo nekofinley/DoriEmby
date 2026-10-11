@@ -57,6 +57,7 @@ type Item struct {
 	OriginalTitle string    `json:"original_title,omitempty"`
 	Year          int       `json:"year,omitempty"`
 	TMDBID        int       `json:"tmdb_id,omitempty"`
+	BGMID         int       `json:"bgm_id,omitempty"` // Bangumi (bgm.tv) subject id
 	Overview      string    `json:"overview,omitempty"`
 	PosterPath    string    `json:"poster_path,omitempty"`  // local cache file name
 	BackdropPath  string    `json:"backdrop_path,omitempty"`

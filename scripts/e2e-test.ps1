@@ -1,4 +1,4 @@
-# End-to-end smoke test for Doriya (requires a running server + mock openlist).
+# End-to-end smoke test for DoriyaMedia (requires a running server + mock openlist).
 # Usage: .\scripts\e2e-test.ps1 [-Base "http://127.0.0.1:5666"] [-Password "test1234"]
 param(
   [string]$Base = "http://127.0.0.1:5666",
@@ -36,7 +36,7 @@ $hNoRedir.CookieContainer = $cookieBox
 $hNoRedir.AllowAutoRedirect = $false
 $hcNoRedir = New-Object System.Net.Http.HttpClient($hNoRedir)
 $hcNoRedir.Timeout = [TimeSpan]::FromSeconds(180)
-$cookieBox.Add((New-Object System.Uri($Base)), (New-Object System.Net.Cookie("doriya_token", $token, "/")))
+$cookieBox.Add((New-Object System.Uri($Base)), (New-Object System.Net.Cookie("doriyamedia_token", $token, "/")))
 
 function RawReq($client, $method, $url, $headers) {
   $req = New-Object System.Net.Http.HttpRequestMessage((New-Object System.Net.Http.HttpMethod($method)), $url)

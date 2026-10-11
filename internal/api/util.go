@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"doriya/internal/media"
+	"doriyamedia/internal/media"
 )
 
 func jsonUnmarshal(s string, v any) error { return json.Unmarshal([]byte(s), v) }

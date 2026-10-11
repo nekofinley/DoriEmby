@@ -26,7 +26,7 @@ $tok = $sess.Cookies.GetCookies($Base)[0].Value
 $handler = [System.Net.Http.HttpClientHandler]::new()
 $handler.AllowAutoRedirect = $false
 $handler.CookieContainer = New-Object System.Net.CookieContainer
-$handler.CookieContainer.Add([uri]$Base, (New-Object System.Net.Cookie("doriya_token", $tok, "/", "127.0.0.1")))
+$handler.CookieContainer.Add([uri]$Base, (New-Object System.Net.Cookie("doriyamedia_token", $tok, "/", "127.0.0.1")))
 $hc = [System.Net.Http.HttpClient]::new($handler)
 $hc.Timeout = [timespan]::FromSeconds(120)
 

@@ -4,10 +4,11 @@ import (
 	"net/http"
 	"os/exec"
 	"runtime"
+	"strings"
 	"time"
 
-	"doriya/internal/auth"
-	"doriya/internal/models"
+	"doriyamedia/internal/auth"
+	"doriyamedia/internal/models"
 )
 
 func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
@@ -123,6 +124,7 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request, user *m
 		"scan_concurrency": s.Cfg.ScanConcurrency,
 		"dev_web_dir":      s.Cfg.DevWebDir,
 		"tmdb":             s.Cfg.TMDB,
+		"bgm":              s.Cfg.BGM,
 		"playback":         s.Cfg.Playback,
 	}
 	writeJSON(w, 200, cfg)
@@ -136,6 +138,7 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request, user *m
 		ScanConcurrency *int               `json:"scan_concurrency"`
 		DevWebDir       *string            `json:"dev_web_dir"`
 		TMDB            *configTMDB        `json:"tmdb"`
+		BGM             *configBGM         `json:"bgm"`
 		Playback        *configPlayback    `json:"playback"`
 	}
 	if err := readBody(r, &req); err != nil {
@@ -168,6 +171,24 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request, user *m
 		if req.TMDB.ImgBase != "" {
 			s.Cfg.TMDB.ImgBase = req.TMDB.ImgBase
 		}
+		if req.TMDB.UseProxy != nil {
+			s.Cfg.TMDB.UseProxy = *req.TMDB.UseProxy
+		}
+		if req.TMDB.Proxy != nil && strings.TrimSpace(*req.TMDB.Proxy) != "" {
+			s.Cfg.TMDB.Proxy = strings.TrimSpace(*req.TMDB.Proxy)
+		}
+	}
+	if req.BGM != nil {
+		s.Cfg.BGM.Token = req.BGM.Token
+		if req.BGM.APIBase != "" {
+			s.Cfg.BGM.APIBase = strings.TrimSpace(req.BGM.APIBase)
+		}
+		if req.BGM.UseProxy != nil {
+			s.Cfg.BGM.UseProxy = *req.BGM.UseProxy
+		}
+		if req.BGM.Proxy != nil && strings.TrimSpace(*req.BGM.Proxy) != "" {
+			s.Cfg.BGM.Proxy = strings.TrimSpace(*req.BGM.Proxy)
+		}
 	}
 	if req.Playback != nil {
 		if req.Playback.ForceMode != "" {
@@ -193,6 +214,15 @@ type configTMDB = struct {
 	Language string `json:"language"`
 	APIBase  string `json:"api_base"`
 	ImgBase  string `json:"img_base"`
+	UseProxy *bool  `json:"use_proxy"`
+	Proxy    *string `json:"proxy"`
+}
+
+type configBGM = struct {
+	Token    string  `json:"token"`
+	APIBase  string  `json:"api_base"`
+	UseProxy *bool   `json:"use_proxy"`
+	Proxy    *string `json:"proxy"`
 }
 
 type configPlayback = struct {

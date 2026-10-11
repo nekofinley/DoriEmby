@@ -3,10 +3,13 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
-	"doriya/internal/models"
+	"doriyamedia/internal/models"
 
 	_ "modernc.org/sqlite"
 )
@@ -15,7 +18,42 @@ type Store struct {
 	DB *sql.DB
 }
 
+// legacyDBName is the database file used before the DoriyaMedia rename.
+const legacyDBName = "doriya.db"
+
+// MigrateLegacyDB renames the pre-rename database (data/doriya.db, plus its
+// WAL sidecars) to the current name so an existing library keeps working.
+// It only acts when the new file is missing, and never overwrites data.
+func MigrateLegacyDB(path string) {
+	if filepath.Base(path) == legacyDBName {
+		return
+	}
+	if _, err := os.Stat(path); err == nil {
+		return // already migrated
+	}
+	legacy := filepath.Join(filepath.Dir(path), legacyDBName)
+	if _, err := os.Stat(legacy); err != nil {
+		return // nothing to migrate
+	}
+	moved := 0
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		from, to := legacy+suffix, path+suffix
+		if _, err := os.Stat(from); err != nil {
+			continue
+		}
+		if err := os.Rename(from, to); err != nil {
+			log.Printf("[db] 旧库自动改名失败(%v),继续使用原文件: %s", err, from)
+			return
+		}
+		moved++
+	}
+	if moved > 0 {
+		log.Printf("[db] 已把旧数据库 %s 迁移为 %s(原有媒体库数据保留)", legacyDBName, filepath.Base(path))
+	}
+}
+
 func Open(path string) (*Store, error) {
+	MigrateLegacyDB(path)
 	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -69,6 +107,7 @@ func (s *Store) migrate() error {
 			original_title TEXT DEFAULT '',
 			year INTEGER DEFAULT 0,
 			tmdb_id INTEGER DEFAULT 0,
+			bgm_id INTEGER DEFAULT 0,
 			overview TEXT DEFAULT '',
 			poster_path TEXT DEFAULT '',
 			backdrop_path TEXT DEFAULT '',
@@ -91,7 +130,7 @@ func (s *Store) migrate() error {
 			mtime INTEGER DEFAULT 0,
 			probe TEXT DEFAULT '',
 			added_at TIMESTAMP NOT NULL,
-			UNIQUE(item_id, source_id, path)
+			UNIQUE(source_id, path)
 		)`,
 		`CREATE TABLE IF NOT EXISTS subtitles (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,7 +159,50 @@ func (s *Store) migrate() error {
 			return fmt.Errorf("migrate: %w", err)
 		}
 	}
+	return s.migrateFilesUnique()
+}
+
+// migrateFilesUnique upgrades the files table to "one row per (source, path)".
+// The old schema was UNIQUE(item_id, source_id, path), which meant a rescan
+// could never re-parent a file (the parse fix would duplicate rows instead of
+// moving them) — so collapse duplicates, keeping the newest binding, then add
+// the unique index the new UpsertFile conflicts on.
+func (s *Store) migrateFilesUnique() error {
+	if _, err := s.DB.Exec(`DELETE FROM files WHERE id NOT IN (SELECT MAX(id) FROM files GROUP BY source_id, path)`); err != nil {
+		return fmt.Errorf("dedupe files: %w", err)
+	}
+	if _, err := s.DB.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_files_source_path ON files(source_id, path)`); err != nil {
+		return fmt.Errorf("files index: %w", err)
+	}
+	// Bangumi id column for databases created before the bgm provider existed.
+	has, err := s.hasColumn("items", "bgm_id")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, err := s.DB.Exec(`ALTER TABLE items ADD COLUMN bgm_id INTEGER DEFAULT 0`); err != nil {
+			return fmt.Errorf("items.bgm_id: %w", err)
+		}
+	}
 	return nil
+}
+
+func (s *Store) hasColumn(table, column string) (bool, error) {
+	rows, err := s.DB.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return false, err
+		}
+		if strings.EqualFold(name, column) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // ---------- users ----------
@@ -307,9 +389,9 @@ func (s *Store) Libraries() ([]models.Library, error) {
 
 func (s *Store) InsertItem(it *models.Item) error {
 	res, err := s.DB.Exec(`INSERT INTO items
-		(library_id, type, parent_id, name, original_title, year, tmdb_id, overview, poster_path, backdrop_path, still_path, rating, genres, season, episode, air_date, added_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		it.LibraryID, it.Type, it.ParentID, it.Name, it.OriginalTitle, it.Year, it.TMDBID, it.Overview,
+		(library_id, type, parent_id, name, original_title, year, tmdb_id, bgm_id, overview, poster_path, backdrop_path, still_path, rating, genres, season, episode, air_date, added_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		it.LibraryID, it.Type, it.ParentID, it.Name, it.OriginalTitle, it.Year, it.TMDBID, it.BGMID, it.Overview,
 		it.PosterPath, it.BackdropPath, it.StillPath, it.Rating, it.Genres, it.Season, it.Episode, it.AirDate, time.Now())
 	if err != nil {
 		return err
@@ -319,9 +401,9 @@ func (s *Store) InsertItem(it *models.Item) error {
 }
 
 func (s *Store) UpdateItemMeta(it *models.Item) error {
-	_, err := s.DB.Exec(`UPDATE items SET name=?, original_title=?, year=?, tmdb_id=?, overview=?,
+	_, err := s.DB.Exec(`UPDATE items SET name=?, original_title=?, year=?, tmdb_id=?, bgm_id=?, overview=?,
 		poster_path=?, backdrop_path=?, still_path=?, rating=?, genres=?, season=?, episode=?, air_date=? WHERE id=?`,
-		it.Name, it.OriginalTitle, it.Year, it.TMDBID, it.Overview,
+		it.Name, it.OriginalTitle, it.Year, it.TMDBID, it.BGMID, it.Overview,
 		it.PosterPath, it.BackdropPath, it.StillPath, it.Rating, it.Genres, it.Season, it.Episode, it.AirDate, it.ID)
 	return err
 }
@@ -333,10 +415,10 @@ func (s *Store) DeleteItem(id int64) error {
 
 func (s *Store) ItemByID(id int64) (*models.Item, error) {
 	it := &models.Item{}
-	err := s.DB.QueryRow(`SELECT id, library_id, type, parent_id, name, original_title, year, tmdb_id, overview,
+	err := s.DB.QueryRow(`SELECT id, library_id, type, parent_id, name, original_title, year, tmdb_id, bgm_id, overview,
 		poster_path, backdrop_path, still_path, rating, genres, season, episode, air_date, added_at
 		FROM items WHERE id=?`, id).
-		Scan(&it.ID, &it.LibraryID, &it.Type, &it.ParentID, &it.Name, &it.OriginalTitle, &it.Year, &it.TMDBID,
+		Scan(&it.ID, &it.LibraryID, &it.Type, &it.ParentID, &it.Name, &it.OriginalTitle, &it.Year, &it.TMDBID, &it.BGMID,
 			&it.Overview, &it.PosterPath, &it.BackdropPath, &it.StillPath, &it.Rating, &it.Genres,
 			&it.Season, &it.Episode, &it.AirDate, &it.AddedAt)
 	if err != nil {
@@ -347,7 +429,7 @@ func (s *Store) ItemByID(id int64) (*models.Item, error) {
 
 // ItemChildren returns child items ordered by season/episode or name.
 func (s *Store) ItemChildren(parentID int64) ([]models.Item, error) {
-	rows, err := s.DB.Query(`SELECT id, library_id, type, parent_id, name, original_title, year, tmdb_id, overview,
+	rows, err := s.DB.Query(`SELECT id, library_id, type, parent_id, name, original_title, year, tmdb_id, bgm_id, overview,
 		poster_path, backdrop_path, still_path, rating, genres, season, episode, air_date, added_at
 		FROM items WHERE parent_id=? ORDER BY season, episode, name`, parentID)
 	if err != nil {
@@ -382,7 +464,7 @@ func (s *Store) ItemsByLibrary(libraryID int64, typ string, search string, sort 
 	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM items WHERE `+w, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	q := `SELECT id, library_id, type, parent_id, name, original_title, year, tmdb_id, overview,
+	q := `SELECT id, library_id, type, parent_id, name, original_title, year, tmdb_id, bgm_id, overview,
 		poster_path, backdrop_path, still_path, rating, genres, season, episode, air_date, added_at
 		FROM items WHERE ` + w + ` ORDER BY ` + orderBy + ` LIMIT ? OFFSET ?`
 	args = append(args, limit, offset)
@@ -397,7 +479,7 @@ func (s *Store) ItemsByLibrary(libraryID int64, typ string, search string, sort 
 
 func (s *Store) RecentItems(typ string, limit int) ([]models.Item, error) {
 	// exclude the hidden file-browser scratchpad libraries from home rows
-	rows, err := s.DB.Query(`SELECT id, library_id, type, parent_id, name, original_title, year, tmdb_id, overview,
+	rows, err := s.DB.Query(`SELECT id, library_id, type, parent_id, name, original_title, year, tmdb_id, bgm_id, overview,
 		poster_path, backdrop_path, still_path, rating, genres, season, episode, air_date, added_at
 		FROM items WHERE type=? AND library_id NOT IN (SELECT id FROM libraries WHERE name LIKE '__browse__%')
 		ORDER BY added_at DESC LIMIT ?`, typ, limit)
@@ -419,9 +501,9 @@ func (s *Store) CountItems(typ string) (int64, error) {
 // ItemsNeedingIdent returns items of given types without tmdb id and without custom names,
 // used by the metadata enricher.
 func (s *Store) ItemsNeedingIdent(types []string) ([]models.Item, error) {
-	q := `SELECT id, library_id, type, parent_id, name, original_title, year, tmdb_id, overview,
+	q := `SELECT id, library_id, type, parent_id, name, original_title, year, tmdb_id, bgm_id, overview,
 		poster_path, backdrop_path, still_path, rating, genres, season, episode, air_date, added_at
-		FROM items WHERE tmdb_id = 0 AND overview = '' AND type IN (` + placeholders(len(types)) + `)`
+		FROM items WHERE tmdb_id = 0 AND bgm_id = 0 AND overview = '' AND type IN (` + placeholders(len(types)) + `)`
 	args := make([]any, 0, len(types))
 	for _, t := range types {
 		args = append(args, t)
@@ -443,7 +525,7 @@ func scanItems(rows *sql.Rows) ([]models.Item, error) {
 	for rows.Next() {
 		var it models.Item
 		if err := rows.Scan(&it.ID, &it.LibraryID, &it.Type, &it.ParentID, &it.Name, &it.OriginalTitle, &it.Year,
-			&it.TMDBID, &it.Overview, &it.PosterPath, &it.BackdropPath, &it.StillPath, &it.Rating, &it.Genres,
+			&it.TMDBID, &it.BGMID, &it.Overview, &it.PosterPath, &it.BackdropPath, &it.StillPath, &it.Rating, &it.Genres,
 			&it.Season, &it.Episode, &it.AirDate, &it.AddedAt); err != nil {
 			return nil, err
 		}
@@ -454,17 +536,23 @@ func scanItems(rows *sql.Rows) ([]models.Item, error) {
 
 // ---------- files ----------
 
+// UpsertFile stores a file and (re)binds it to its current item: a rescan that
+// changes how a path is grouped moves the row instead of duplicating it.
+// An empty probe never overwrites a stored probe result.
 func (s *Store) UpsertFile(f *models.MediaFile) (id int64, err error) {
-	res, err := s.DB.Exec(`INSERT INTO files (item_id, source_id, path, size, mtime, probe, added_at)
+	_, err = s.DB.Exec(`INSERT INTO files (item_id, source_id, path, size, mtime, probe, added_at)
 		VALUES (?,?,?,?,?,?,?)
-		ON CONFLICT(item_id, source_id, path) DO UPDATE SET size=excluded.size, mtime=excluded.mtime`,
+		ON CONFLICT(source_id, path) DO UPDATE SET
+			item_id=excluded.item_id,
+			size=excluded.size,
+			mtime=excluded.mtime,
+			probe=CASE WHEN excluded.probe <> '' THEN excluded.probe ELSE files.probe END`,
 		f.ItemID, f.SourceID, f.Path, f.Size, f.MTime, f.Probe, time.Now())
 	if err != nil {
 		return 0, err
 	}
-	id, _ = res.LastInsertId()
-	if n, _ := res.RowsAffected(); n == 1 && id == 0 {
-		id, _ = res.LastInsertId()
+	if err := s.DB.QueryRow(`SELECT id FROM files WHERE source_id=? AND path=?`, f.SourceID, f.Path).Scan(&id); err != nil {
+		return 0, err
 	}
 	return id, nil
 }
@@ -472,6 +560,20 @@ func (s *Store) UpsertFile(f *models.MediaFile) (id int64, err error) {
 func (s *Store) FileByID(id int64) (*models.MediaFile, error) {
 	f := &models.MediaFile{}
 	err := s.DB.QueryRow(`SELECT id, item_id, source_id, path, size, mtime, probe, added_at FROM files WHERE id=?`, id).
+		Scan(&f.ID, &f.ItemID, &f.SourceID, &f.Path, &f.Size, &f.MTime, &f.Probe, &f.AddedAt)
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+// FileBySourcePath finds a file by its driver path regardless of which item
+// owns it — used so the file browser plays an already-scanned file instead of
+// re-binding it to a browse scratchpad item.
+func (s *Store) FileBySourcePath(sourceID int64, path string) (*models.MediaFile, error) {
+	f := &models.MediaFile{}
+	err := s.DB.QueryRow(`SELECT id, item_id, source_id, path, size, mtime, probe, added_at
+		FROM files WHERE source_id = ? AND path = ?`, sourceID, path).
 		Scan(&f.ID, &f.ItemID, &f.SourceID, &f.Path, &f.Size, &f.MTime, &f.Probe, &f.AddedAt)
 	if err != nil {
 		return nil, err

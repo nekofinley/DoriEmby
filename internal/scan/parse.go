@@ -1,6 +1,7 @@
 package scan
 
 import (
+	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -47,7 +48,7 @@ func SkipEntry(name string) bool {
 var (
 	reYear      = regexp.MustCompile(`(?:^|[\s\.\(_\-])((?:19|20)\d{2})(?:[\s\.\)\_\-]|$)`)
 	reSE       = regexp.MustCompile(`(?i)\bs(\d{1,2})[\._ ]?e(\d{1,3})(?:[\._ -]?e(\d{1,3}))?`)
-	reSeasonOnly = regexp.MustCompile(`(?i)^(?:season|series)[\._ ]?(\d{1,2})|^s(\d{1,2})(?:[\s\._\-]|$)|^第(\d{1,2})[季部]`)
+	reSeasonOnly = regexp.MustCompile(`(?i)^(?:season|series)[\._ ]?(\d{1,2})|^s(\d{1,2})(?:[\s\._\-]|$)|^第\s*([0-9]{1,2}|[一二三四五六七八九十]{1,3})\s*[季部]`)
 	reCJKep     = regexp.MustCompile(`第\s*(\d{1,4})\s*[集话話期]`)
 	reEP        = regexp.MustCompile(`(?:^|[\s\._\-\[])(?:EP|E)\.?\s*(\d{1,4})(?:[\s\.\_\-\]]|$)`)
 	reBracketEp = regexp.MustCompile(`[\[【]\s*(\d{1,4}(?:\.\d)?(?:v\d)?)\s*[\]】]`)
@@ -223,19 +224,123 @@ func pickLonger(a, b string) string {
 	return b
 }
 
-// ParseSeasonDir detects "Season 01" / "S01" / "第一季" folder names.
+// reContainerDir matches folder names that group UNRELATED titles
+// (Movie / Anime / 合集 / 未分类 …). A container is never a title and never a
+// season marker — unlike 剧场版, which marks one show's movie.
+var reContainerDir = regexp.MustCompile(`(?i)^(movies?|films?|anime|animations?|tv|series|shows?|cartoons?|music|musics|software|apps?|docs?|others?|misc|collections?|合集|动画|動畫|番剧|番劇|剧集|劇集|电影|電影|音乐|音樂|软件|軟體|其他|其它|未分类|未分類|新建文件夹|新建資料夾|我的|下载|下載)$`)
+
+// IsContainerDir reports whether name is a grouping folder rather than a title.
+func IsContainerDir(name string) bool {
+	return reContainerDir.MatchString(strings.TrimSpace(name))
+}
+
+// IsCategoryDir is IsContainerDir plus theatrical-movie folders: a parent that
+// groups whole titles must never be promoted to a show either.
+func IsCategoryDir(name string) bool {
+	n := strings.TrimSpace(name)
+	return reContainerDir.MatchString(n) ||
+		n == "剧场版" || n == "劇場版" || strings.EqualFold(n, "theatrical")
+}
+
+// ParseSeasonDir detects "Season 01" / "S01" / "第一季" / "第 2 季" folder names.
 func ParseSeasonDir(name string) (int, bool) {
 	m := reSeasonOnly.FindStringSubmatch(strings.TrimSpace(name))
 	if m == nil {
 		return 0, false
 	}
 	for _, g := range m[1:] {
-		if g != "" {
-			n, _ := strconv.Atoi(g)
+		if g == "" {
+			continue
+		}
+		if n, err := strconv.Atoi(g); err == nil {
+			return n, true
+		}
+		if n, ok := cnNumeral(g); ok {
 			return n, true
 		}
 	}
 	return 0, false
+}
+
+// cnNumeral converts 一..九十九 (第一季 / 第十二季 …) to a number.
+func cnNumeral(s string) (int, bool) {
+	digits := map[rune]int{'一': 1, '二': 2, '两': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9}
+	r := []rune(strings.TrimSpace(s))
+	if len(r) == 0 {
+		return 0, false
+	}
+	total := 0
+	if r[0] == '十' {
+		total = 10
+	} else if d, ok := digits[r[0]]; ok {
+		total = d
+	} else {
+		return 0, false
+	}
+	if len(r) > 1 {
+		if r[1] != '十' {
+			return 0, false
+		}
+		total *= 10
+		if len(r) > 2 {
+			d, ok := digits[r[2]]
+			if !ok {
+				return 0, false
+			}
+			total += d
+		}
+	}
+	return total, true
+}
+
+// reSpecialSeason matches collection folders that are *season-level* but carry
+// no season number: 剧名/OAD/…, 剧名/剧场版/…, 剧名/SP/… — the show title must
+// come from their parent, never from the folder itself.
+var reSpecialSeason = regexp.MustCompile(`(?i)^(oad|ova|sps?|specials?|movie|剧场版|劇場版|特别篇|特別篇|特典|番外篇?|总集篇|總集篇|recap)([\s\._\-]?\d{1,2})?$`)
+
+// specialSeasonBase keeps every special collection of one show in its own
+// season slot (regular seasons are 1..90), so "OAD" and "剧场版" become two
+// separate cards instead of colliding into one.
+var specialSeasonBase = map[string]int{
+	"oad": 91, "ova": 92, "movie": 93, "剧场版": 93, "劇場版": 93,
+	"sp": 94, "sps": 94, "special": 94, "specials": 94, "特别篇": 94, "特別篇": 94,
+	"特典": 95, "番外": 96, "番外篇": 96, "总集篇": 97, "總集篇": 97, "recap": 97,
+}
+
+// SpecialSeasonDir reports whether a directory is a special collection and
+// returns its display name plus the synthetic season number to store.
+func SpecialSeasonDir(name string) (string, int, bool) {
+	n := strings.TrimSpace(name)
+	m := reSpecialSeason.FindStringSubmatch(n)
+	if m == nil {
+		return "", 0, false
+	}
+	key := strings.ToLower(m[1])
+	base, ok := specialSeasonBase[key]
+	if !ok {
+		return "", 0, false
+	}
+	display := m[1]
+	switch key {
+	case "sp", "sps", "special", "specials":
+		display = "特别篇"
+	case "movie":
+		display = "剧场版"
+	case "oad":
+		display = "OAD"
+	case "ova":
+		display = "OVA"
+	}
+	// optional trailing number: OAD2 / 剧场版2 → its own slot
+	if m[2] != "" {
+		if k, err := strconv.Atoi(strings.TrimLeft(m[2], " ._-")); err == nil && k > 0 {
+			if k > 1 {
+				display = fmt.Sprintf("%s %d", display, k)
+			}
+			base += k - 1
+		}
+	}
+	return display, base, true
 }
 
 // extractYear finds the last standalone year in the string, returns cleaned title + year.

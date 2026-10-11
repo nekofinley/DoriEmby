@@ -5,15 +5,16 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"doriya/internal/config"
-	"doriya/internal/db"
-	"doriya/internal/models"
-	"doriya/internal/source"
+	"doriyamedia/internal/config"
+	"doriyamedia/internal/db"
+	"doriyamedia/internal/models"
+	"doriyamedia/internal/source"
 )
 
 type fileRec struct {
@@ -372,13 +373,126 @@ func (sc *Scanner) organizeMovies(lib *models.Library, files []fileRec, st *mode
 }
 
 type seriesIndex struct {
-	shows    map[string]int64       // normKey -> show id
-	seasons  map[string]int64       // showID|season -> season id
-	eps      map[string]int64       // seasonID|ep -> episode id
+	shows       map[string]int64 // normKey -> show id
+	seasons     map[string]int64 // showID|season -> season id
+	seasonNames map[string]int64 // showID|normName -> season id (sub-series/arc seasons)
+	eps         map[string]int64 // seasonID|ep -> episode id
+	maxSeason   map[int64]int    // showID -> highest regular season number in use
+}
+
+// nextSeason hands out the next free regular season number (1..90) for a show;
+// 91+ are reserved for special collections (OAD/OVA/剧场版…).
+func (si *seriesIndex) nextSeason(showID int64) int {
+	if si.maxSeason == nil {
+		si.maxSeason = map[int64]int{}
+	}
+	n := si.maxSeason[showID] + 1
+	if n < 1 {
+		n = 1
+	}
+	if n > 90 {
+		n = 90
+	}
+	si.maxSeason[showID] = n
+	return n
+}
+
+// registerSeason keeps every lookup map in sync after a season is created.
+func (si *seriesIndex) registerSeason(showID int64, num int, name string, id int64) {
+	si.seasons[fmt.Sprintf("%d|%d", showID, num)] = id
+	if name != "" {
+		si.seasonNames[fmt.Sprintf("%d|%s", showID, NormalizeKey(name))] = id
+	}
+	if num > 0 && num <= 90 && num > si.maxSeason[showID] {
+		si.maxSeason[showID] = num
+	}
+}
+
+// seasonKeyFor resolves an existing season item for a file, either by number
+// (第 2 季 / OAD slots) or by name (sub-series and arc folders like 化物语).
+func (si *seriesIndex) seasonKeyFor(showID int64, num int, name string) (int64, bool) {
+	if num > 0 {
+		id, ok := si.seasons[fmt.Sprintf("%d|%d", showID, num)]
+		return id, ok
+	}
+	id, ok := si.seasonNames[fmt.Sprintf("%d|%s", showID, NormalizeKey(name))]
+	return id, ok
+}
+
+// dirChildCount counts, for every directory, how many direct child
+// directories hold something. A folder whose children are themselves show-like
+// is a franchise/arc container (物语系列/{化物语,伪物语}), not a show.
+func dirChildCount(files []fileRec) map[string]int {
+	dirs := map[string]bool{}
+	for _, fr := range files {
+		d := strings.TrimSuffix(fr.Dir, "/")
+		// walk up to the root so intermediate folders (the ones that hold no
+		// file themselves) are counted as children of their parent too
+		for d != "" && d != "/" && !dirs[d] {
+			dirs[d] = true
+			d = parentDir(d)
+		}
+	}
+	count := map[string]int{}
+	for d := range dirs {
+		if p := parentDir(d); p != "" {
+			count[p]++
+		}
+	}
+	return count
+}
+
+// planShow resolves one file into (show directory, season number, season
+// label). Season numbers are 0 when the season is identified by name only
+// (a sub-series/arc folder that gets its own slot with a stable label).
+func planShow(childCount map[string]int, libPath, dir, filePath string, parsedSeason int) (showDir string, seasonNum int, seasonLbl string) {
+	showDir = showDirFor(libPath, dir)
+	if showDir == "" {
+		// file at the library root or directly inside a container folder: the
+		// title comes from the file name, and no folder can mark a season
+		return "", 1, "第 1 季"
+	}
+
+	// Franchise container: 物语系列/{化物语,伪物语}, 青之驱魔师/{岛根启明结社篇,…}.
+	// The parent groups several show-like children, so it is the show and each
+	// child becomes its own season, named after the folder.
+	subLabel := ""
+	if showDir != "" {
+		parent := parentDir(showDir)
+		if parent != "" &&
+			strings.TrimSuffix(parent, "/") != strings.TrimSuffix(libPath, "/") &&
+			!isTechDir(baseName(parent)) && !IsCategoryDir(baseName(parent)) &&
+			childCount[parent] >= 2 {
+			subLabel = baseName(showDir)
+			showDir = parent
+		}
+	}
+
+	num, lbl, ok := seasonMetaFor(showDir, filePath)
+	switch {
+	case subLabel != "" && parsedSeason > 0:
+		return showDir, 0, fmt.Sprintf("%s · 第 %d 季", subLabel, parsedSeason)
+	case subLabel != "" && ok:
+		return showDir, 0, subLabel + " · " + lbl
+	case subLabel != "":
+		return showDir, 0, subLabel
+	case parsedSeason > 0:
+		return showDir, parsedSeason, fmt.Sprintf("第 %d 季", parsedSeason)
+	case ok:
+		return showDir, num, lbl
+	default:
+		return showDir, 1, "第 1 季"
+	}
 }
 
 func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, st *models.ScanState) error {
-	idx := &seriesIndex{shows: map[string]int64{}, seasons: map[string]int64{}, eps: map[string]int64{}}
+	idx := &seriesIndex{
+		shows:       map[string]int64{},
+		seasons:     map[string]int64{},
+		seasonNames: map[string]int64{},
+		eps:         map[string]int64{},
+		maxSeason:   map[int64]int{},
+	}
 
 	shows, _, err := sc.Store.ItemsByLibrary(lib.ID, "show", "", "", 0, 100000)
 	if err != nil {
@@ -394,6 +508,12 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, st *mode
 	for _, it := range seasons {
 		if it.ParentID != nil {
 			idx.seasons[fmt.Sprintf("%d|%d", *it.ParentID, it.Season)] = it.ID
+			if it.Name != "" {
+				idx.seasonNames[fmt.Sprintf("%d|%s", *it.ParentID, NormalizeKey(it.Name))] = it.ID
+			}
+			if it.Season > 0 && it.Season <= 90 && it.Season > idx.maxSeason[*it.ParentID] {
+				idx.maxSeason[*it.ParentID] = it.Season
+			}
 		}
 	}
 	episodes, _, err := sc.Store.ItemsByLibrary(lib.ID, "episode", "", "", 0, 500000)
@@ -406,36 +526,51 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, st *mode
 		}
 	}
 
+	childCount := dirChildCount(files)
+
+	// Plan every file first, then insert NUMBERED seasons (第 N 季 / OAD / 剧场版)
+	// before named ones (化物语, 岛根启明结社篇…). Named seasons take the next free
+	// slot, so a sub-series can never squat on "第 1 季" and swallow its episodes
+	// as extra "versions".
+	type planned struct {
+		fr      fileRec
+		show    string
+		season  int
+		label   string
+		episode int
+	}
+	numbered := make([]planned, 0, len(files))
+	named := make([]planned, 0, len(files))
 	for _, fr := range files {
 		p := ParseName(baseName(fr.Path))
-
 		// extras / unparseable files (NCOP, NCED, menus, previews…) have no
 		// episode number — keep them out of the library (still playable via
 		// the file browser)
 		if p.Episode == 0 {
 			continue
 		}
-
 		// Show title: prefer the show DIRECTORY (the season-dir's parent), so
 		// "风夏/Season 1/EP01.mkv" or "风夏/01.mkv" both resolve to show "风夏".
 		// Only fall back to the filename when the file sits at the library root.
+		showDir, season, seasonName := planShow(childCount, lib.Path, fr.Dir, fr.Path, p.Season)
 		showTitle := ""
-		if sd := showDirFor(lib.Path, fr.Dir); sd != "" {
-			dp := ParseName(baseName(sd))
-			showTitle = orDefault(dp.Title, baseName(sd))
+		if showDir != "" {
+			dp := ParseName(baseName(showDir))
+			showTitle = orDefault(dp.Title, baseName(showDir))
 		}
 		if showTitle == "" {
 			showTitle = orDefault(stripTitleYear(p.Title), baseName(fr.Path))
 		}
+		pl := planned{fr: fr, show: showTitle, season: season, label: seasonName, episode: p.Episode}
+		if season > 0 {
+			numbered = append(numbered, pl)
+		} else {
+			named = append(named, pl)
+		}
+	}
 
-		season := p.Season
-		if season == 0 {
-			season = seasonFromPath(fr.Path)
-		}
-		if season == 0 {
-			season = 1
-		}
-		ep := p.Episode
+	for _, pl := range append(numbered, named...) {
+		fr, showTitle, season, seasonName, ep := pl.fr, pl.show, pl.season, pl.label, pl.episode
 
 		showKey := NormalizeKey(showTitle)
 		showID, ok := idx.shows[showKey]
@@ -448,16 +583,39 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, st *mode
 			idx.shows[showKey] = showID
 		}
 
-		seasonKey := fmt.Sprintf("%d|%d", showID, season)
-		seasonID, ok := idx.seasons[seasonKey]
-		if !ok {
+		seasonID, ok := idx.seasonKeyFor(showID, season, seasonName)
+		if ok && season > 0 {
+			// A named season from an older scan may be sitting on this number:
+			// move it out of the way instead of merging two season into one.
+			if old, err := sc.Store.ItemByID(seasonID); err == nil && old.Name != seasonName &&
+				!isNumericSeasonLabel(old.Name) {
+				moved := idx.nextSeason(showID)
+				old.Season = moved
+				if err := sc.Store.UpdateItemMeta(old); err == nil {
+					delete(idx.seasons, fmt.Sprintf("%d|%d", showID, season))
+					idx.registerSeason(showID, moved, old.Name, seasonID)
+					seasonID, ok = 0, false
+				}
+			}
+		}
+		switch {
+		case !ok:
+			if season <= 0 {
+				season = idx.nextSeason(showID)
+			}
 			pid := showID
-			it := &models.Item{LibraryID: lib.ID, Type: "season", ParentID: &pid, Name: fmt.Sprintf("第 %d 季", season), Season: season}
+			it := &models.Item{LibraryID: lib.ID, Type: "season", ParentID: &pid, Name: seasonName, Season: season}
 			if err := sc.Store.InsertItem(it); err != nil {
 				return err
 			}
 			seasonID = it.ID
-			idx.seasons[seasonKey] = seasonID
+			idx.registerSeason(showID, season, seasonName, seasonID)
+		default:
+			if old, err := sc.Store.ItemByID(seasonID); err == nil && old.Name != seasonName {
+				// keep the label in sync on rescans (e.g. "第 91 季" → "OAD")
+				old.Name = seasonName
+				_ = sc.Store.UpdateItemMeta(old)
+			}
 		}
 
 		epKey := fmt.Sprintf("%d|%d", seasonID, ep)
@@ -545,23 +703,31 @@ func baseName(path string) string {
 	return p
 }
 
-func seasonFromPath(path string) int {
-	parts := strings.Split(path, "/")
-	for i := len(parts) - 1; i >= 0; i-- {
-		if n, ok := ParseSeasonDir(parts[i]); ok {
-			return n
-		}
+// parentDir returns the directory above dir, or "" when there is none.
+func parentDir(dir string) string {
+	p := strings.TrimSuffix(dir, "/")
+	i := strings.LastIndex(p, "/")
+	if i <= 0 {
+		return ""
 	}
-	return 0
+	return p[:i]
 }
 
 // showDirFor finds the "show" directory for an episode file at dir.
-// Real collections nest files deep:  剧名/Season1/bdrip/[压制组]/xx.mkv
-// So climb from dir toward the library root:
-//   - stop at the deepest "Season xx"-style segment (show = its parent)
-//   - otherwise skip technical dirs (bdrip/webrip/release-group/CDs/Scans…)
-//     and return the first non-technical ancestor
-//   - fall back to the first segment below the library root
+// Real collections nest files deep:
+//
+//	剧名/第 1 季/bdrip/[压制组]/xx.mkv
+//	剧名/bdrip/第 1 季/xx.mkv
+//	剧名/OAD/xx.mkv
+//
+// so climb from dir toward the library root:
+//   - a season-like segment (第 N 季 / Season N / S01 / OAD / 剧场版 / SP…) marks
+//     the split between show and season: the show is the nearest NON-technical
+//     ancestor above it (skipping bdrip/webrip/1080p/release-group dirs)
+//   - with no season-like segment, skip technical dirs and take the first
+//     non-technical ancestor
+//   - fall back to the first directory below the library root
+//
 // Returns "" when the file sits directly in the library root (title must
 // come from the filename then).
 func showDirFor(libPath, dir string) string {
@@ -575,22 +741,109 @@ func showDirFor(libPath, dir string) string {
 		return ""
 	}
 	segs := strings.Split(strings.TrimPrefix(d, "/"), "/")
+	join := func(n int) string { return "/" + strings.Join(segs[:n], "/") }
+
 	for i := len(segs) - 1; i >= 1; i-- {
-		if _, ok := ParseSeasonDir(segs[i]); ok {
-			return "/" + strings.Join(segs[:i], "/")
+		if IsContainerDir(segs[i]) {
+			continue
 		}
+		_, isSeason := ParseSeasonDir(segs[i])
+		_, _, isSpecial := SpecialSeasonDir(segs[i])
+		if !isSeason && !isSpecial && !isNumericDir(segs[i]) {
+			continue
+		}
+		j := i - 1
+		for j >= 1 && (isTechDir(segs[j]) || isNumericDir(segs[j])) {
+			j--
+		}
+		if j >= 1 {
+			return cleanShowDir(join(j+1), lib)
+		}
+		break
 	}
 	for i := len(segs) - 1; i >= 1; i-- {
-		if !isTechDir(segs[i]) {
-			return "/" + strings.Join(segs[:i+1], "/")
+		if !isTechDir(segs[i]) && !isNumericDir(segs[i]) && !IsContainerDir(segs[i]) {
+			return cleanShowDir(join(i+1), lib)
 		}
 	}
-	return "/" + segs[0]
+	if len(segs) >= 2 {
+		return cleanShowDir(join(2), lib)
+	}
+	return cleanShowDir("/"+segs[0], lib)
+}
+
+// cleanShowDir rejects a "show" that is really the library root or a container
+// folder (a file directly inside /Cartoon/Movie has no show at all): the caller
+// then falls back to the file name instead of inventing a "Cartoon" show.
+func cleanShowDir(showDir, lib string) string {
+	if strings.TrimSuffix(showDir, "/") == lib || IsContainerDir(baseName(showDir)) {
+		return ""
+	}
+	return showDir
+}
+
+// isNumericDir matches structure folders like "1", "01", "0" — used both as
+// bare season markers (剧名/bdrip/0/…) and as per-episode folders
+// (剧名/01/…), so they must never become the show title themselves.
+func isNumericDir(name string) bool {
+	n := strings.TrimSpace(name)
+	if n == "" || len(n) > 3 {
+		return false
+	}
+	for _, r := range n {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// resolveSeason turns the parser's season (0 when the file name carries none)
+// plus the directory structure into the stored season number + display label.
+// A directory that explicitly says "0" keeps season 0 as its own slot instead
+// of being folded into season 1 (剧名/bdrip/0 vs 剧名/bdrip/<2011 release>).
+// seasonMetaFor resolves the season number + display name for an episode file.
+// Only directories *below* showDir are considered (never the show dir itself
+// or the file name), so a show called "86" does not turn into season 86:
+// numeric dirs ("第 2 季"/"Season 2"/"S02"/"0") get a "第 N 季" label, special
+// collections (OAD/OVA/剧场版/SP/特典…) get their own slot and keep their name.
+func seasonMetaFor(showDir, filePath string) (int, string, bool) {
+	segs := strings.Split(strings.Trim(filePath, "/"), "/")
+	start := 0
+	if sd := strings.Trim(showDir, "/"); sd != "" {
+		if n := len(strings.Split(sd, "/")); n < len(segs) {
+			start = n
+		}
+	}
+	for i := len(segs) - 2; i >= start; i-- {
+		if n, ok := ParseSeasonDir(segs[i]); ok {
+			return n, fmt.Sprintf("第 %d 季", n), true
+		}
+		if disp, num, ok := SpecialSeasonDir(segs[i]); ok {
+			return num, disp, true
+		}
+		if isNumericDir(segs[i]) {
+			n, _ := strconv.Atoi(strings.TrimSpace(segs[i]))
+			return n, fmt.Sprintf("第 %d 季", n), true
+		}
+	}
+	return 0, "", false
 }
 
 var reTechDir = regexp.MustCompile(`(?i)(bdrip|web[\.\-_ ]?rip|web[\.\-_ ]?dl|blu[\.\-_ ]?ray|remux|bdmux|\buhd\b|ma10p|hi10p|8bit|10bit|x26[45]|h[\.\-_ ]?26[45]|hevc|\bavc\b|1080[pi]|720p|2160p|4320p|flac|\baac\b)`)
 
-var reJunkDir = regexp.MustCompile(`(?i)^(cds?|sps?|scans?|extras?|specials?|featurettes?|menus?|others?|backup|subs?|subtitles|chapters?|fonts?|ncops?|nceds?|pvs?|cms?|previews?|trailers?|samples?|omake|bonuses?|bonus)$`)
+// reJunkDir also covers subtitle/language folders (简体 / CHS / BIG5 …): they
+// sit next to the video files and must never become a title or a season.
+var reJunkDir = regexp.MustCompile(`(?i)^(cds?|scans?|extras?|featurettes?|menus?|others?|backup|subs?|subtitles|chapters?|fonts?|ncops?|nceds?|pvs?|cms?|previews?|trailers?|samples?|omake|bonuses?|bonus|简体|繁體|繁体|简繁|繁简|简日|繁日|chs|cht|big5|gb|sc|tc)$`)
+
+// reNumericSeasonLabel matches a plain "第 N 季" label: such a season is
+// number-keyed and may be renamed in place, while a sub-series season
+// (化物语 / 岛根启明结社篇) is keyed by its name and gets moved instead.
+var reNumericSeasonLabel = regexp.MustCompile(`^第 \d+ 季$`)
+
+func isNumericSeasonLabel(name string) bool {
+	return reNumericSeasonLabel.MatchString(strings.TrimSpace(name))
+}
 
 // isTechDir: release-group / quality / junk directories that must not be
 // mistaken for the show title.

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"doriya/internal/models"
+	"doriyamedia/internal/models"
 )
 
 // Entry is one row of a directory listing, in driver path space.

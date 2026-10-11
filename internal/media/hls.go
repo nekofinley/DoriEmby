@@ -8,10 +8,10 @@ import (
 	"sync"
 	"time"
 
-	"doriya/internal/config"
-	"doriya/internal/db"
-	"doriya/internal/models"
-	"doriya/internal/source"
+	"doriyamedia/internal/config"
+	"doriyamedia/internal/db"
+	"doriyamedia/internal/models"
+	"doriyamedia/internal/source"
 )
 
 // Engine bundles probe/ffmpeg tooling with the store for probe caching.

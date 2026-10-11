@@ -9,13 +9,13 @@ import (
 	"strings"
 	"time"
 
-	"doriya/internal/auth"
-	"doriya/internal/config"
-	"doriya/internal/db"
-	"doriya/internal/media"
-	"doriya/internal/metadata"
-	"doriya/internal/models"
-	"doriya/internal/scan"
+	"doriyamedia/internal/auth"
+	"doriyamedia/internal/config"
+	"doriyamedia/internal/db"
+	"doriyamedia/internal/media"
+	"doriyamedia/internal/metadata"
+	"doriyamedia/internal/models"
+	"doriyamedia/internal/scan"
 )
 
 type Server struct {
@@ -52,7 +52,7 @@ func readBody(r *http.Request, v any) error {
 
 // ---------- auth ----------
 
-const cookieName = "doriya_token"
+const cookieName = "doriyamedia_token"
 
 func (s *Server) currentUser(r *http.Request) *models.User {
 	token := ""
@@ -179,6 +179,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/system/info", s.requireAuth(s.handleSystemInfo))
 	mux.HandleFunc("GET /api/config", s.requireAdmin(s.handleGetConfig))
 	mux.HandleFunc("PUT /api/config", s.requireAdmin(s.handlePutConfig))
+	mux.HandleFunc("POST /api/metadata/test", s.requireAdmin(s.handleMetadataTest))
 
 	// sources
 	mux.HandleFunc("GET /api/sources", s.requireAuth(s.handleListSources))

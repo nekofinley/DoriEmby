@@ -7,15 +7,15 @@ import (
 	"net/http"
 	"os"
 
-	"doriya/internal/api"
-	"doriya/internal/config"
-	"doriya/internal/db"
-	"doriya/internal/media"
-	"doriya/internal/metadata"
-	"doriya/internal/models"
-	"doriya/internal/scan"
-	"doriya/internal/source"
-	"doriya/internal/web"
+	"doriyamedia/internal/api"
+	"doriyamedia/internal/config"
+	"doriyamedia/internal/db"
+	"doriyamedia/internal/media"
+	"doriyamedia/internal/metadata"
+	"doriyamedia/internal/models"
+	"doriyamedia/internal/scan"
+	"doriyamedia/internal/source"
+	"doriyamedia/internal/web"
 )
 
 func main() {
@@ -54,11 +54,11 @@ func main() {
 	srv.ConfigPath = *cfgPath
 
 	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Port)
-	if os.Getenv("DORIYA_LOCAL") == "1" {
+	if os.Getenv("DORIYAMEDIA_LOCAL") == "1" {
 		addr = fmt.Sprintf("127.0.0.1:%d", cfg.Port) // 仅本机访问
 	}
 	log.Printf("===========================================")
-	log.Printf("  Doriya v0.1.0  →  http://%s", addr)
+	log.Printf("  DoriyaMedia v0.1.0  →  http://%s", addr)
 	log.Printf("  首次使用请先打开网页完成管理员初始化")
 	log.Printf("===========================================")
 	httpServer := &http.Server{Addr: addr, Handler: srv.Handler()}
