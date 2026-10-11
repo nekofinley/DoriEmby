@@ -70,19 +70,27 @@ GitHub Actions 自动构建:
 curl -fsSL https://raw.githubusercontent.com/nekofinley/DoriyaMedia/main/scripts/install.sh | sudo bash
 ```
 
+国内网络 `raw.githubusercontent.com` 常常打不开,那就用镜像把脚本取下来(脚本内部还会自动把
+下载源回退到镜像,所以只要脚本本身能拉下来就行):
+
+```
+curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/nekofinley/DoriyaMedia/main/scripts/install.sh | sudo bash
+```
+
 脚本会依次:安装 ffmpeg → 创建系统用户和数据目录 `/var/lib/doriyamedia` → 生成 `config.json`
-→ 注册 systemd 服务并启动。升级就再跑一次同样命令(会自动覆盖二进制并重启)。
+→ 注册 systemd 服务并启动。下载 Release 时官方不通会**自动按
+`官方 → ghfast.top → ghproxy.net → gh-proxy.com` 的顺序回退**,不用手动指定。
+升级就是再跑一次同样的命令(自动覆盖二进制并重启)。
 
 常用选项:
 
 ```
 # 指定版本
-curl -fsSL https://raw.githubusercontent.com/nekofinley/DoriyaMedia/main/scripts/install.sh \
-  | sudo bash -s -- --version v0.1.0
+curl -fsSL <上面任一脚本地址> | sudo bash -s -- --version v0.1.0
 # 换端口 / 数据目录 / 运行用户
 sudo bash install.sh --port 8080 --data-dir /srv/doriyamedia --user media
-# 国内下载慢,套一层镜像前缀
-sudo bash install.sh --base-url https://ghfast.top/https://github.com
+# 固定用某个镜像源(不走自动回退)
+sudo bash install.sh --base-url https://ghfast.top
 # 只装不启动
 sudo bash install.sh --no-start
 # 卸载(--purge 连数据目录一起删)

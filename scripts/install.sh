@@ -5,8 +5,9 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/nekofinley/DoriyaMedia/main/scripts/install.sh | sudo bash
 #
-# 国内网络下载慢时，可以套一层镜像前缀：
-#   sudo bash install.sh --base-url https://ghfast.top/https://github.com
+# 直连 GitHub 不通时会自动回退到加速镜像，一般不用手动指定；
+# 想固定某个源就加：
+#   sudo bash install.sh --base-url https://ghfast.top
 #
 set -euo pipefail
 
@@ -19,8 +20,17 @@ UNIT_PATH="/etc/systemd/system/${SERVICE}.service"
 SERVICE_USER="doriyamedia"
 PORT="5666"
 
-GITHUB_BASE="${DORIYAMEDIA_GITHUB_BASE:-https://github.com}"
-API_BASE="${DORIYAMEDIA_API_BASE:-https://api.github.com}"
+# 官方地址。镜像是「前缀」形式：<前缀>/https://github.com/...
+GH="https://github.com"
+API="https://api.github.com"
+if [ -n "${DORIYAMEDIA_API_BASE:-}" ]; then
+  API="${DORIYAMEDIA_API_BASE}"
+fi
+
+# 按顺序尝试的下载源前缀；空串 = 直连官方。第一个成功的就是它。
+MIRROR_PREFIXES=("" "https://ghfast.top" "https://ghproxy.net" "https://gh-proxy.com")
+# --base-url / DORIYAMEDIA_GITHUB_BASE：固定用这个前缀，不再回退
+BASE_URL_OPT="${DORIYAMEDIA_GITHUB_BASE:-}"
 
 VERSION=""
 INSTALL_FFMPEG=1
@@ -52,8 +62,9 @@ ${C_B}DoriyaMedia 安装脚本${C_R}
   -p, --port N          监听端口（默认 ${PORT}）
       --data-dir PATH   数据目录（默认 ${DATA_DIR}）
       --user NAME       运行用户（默认 ${SERVICE_USER}）
-      --base-url URL    GitHub 下载前缀，用于镜像加速
-                        例: --base-url https://ghfast.top/https://github.com
+      --base-url URL    固定下载源前缀，不再自动回退
+                        默认顺序: 官方 GitHub → ghfast.top → ghproxy.net → gh-proxy.com
+                        例: --base-url https://ghfast.top
       --no-ffmpeg       不自动安装 ffmpeg
       --no-start        只安装，不启动/不设开机自启
       --uninstall       卸载（保留数据目录）
@@ -75,7 +86,7 @@ while [ $# -gt 0 ]; do
     -p|--port)     PORT="${2:-}"; shift 2 ;;
     --data-dir)    DATA_DIR="${2:-}"; shift 2 ;;
     --user)        SERVICE_USER="${2:-}"; shift 2 ;;
-    --base-url)    GITHUB_BASE="${2:-}"; shift 2 ;;
+    --base-url)    BASE_URL_OPT="${2:-}"; shift 2 ;;
     --no-ffmpeg)   INSTALL_FFMPEG=0; shift ;;
     --no-start)    AUTOSTART=0; shift ;;
     --uninstall)   UNINSTALL=1; shift ;;
@@ -114,19 +125,98 @@ command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 \
 
 fetch_stdout() {
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --retry 3 --connect-timeout 15 "$1"
+    curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 "$1"
   else
-    wget -qO- --tries=3 --timeout=15 "$1"
+    wget -qO- --tries=2 --timeout=10 "$1"
   fi
 }
 
 fetch_file() {
   if command -v curl >/dev/null 2>&1; then
-    curl -fL --retry 3 --connect-timeout 15 --progress-bar -o "$2" "$1"
+    curl -fL --retry 1 --connect-timeout 8 --max-time 900 --progress-bar -o "$2" "$1"
   else
-    wget -q --show-progress --tries=3 --timeout=15 -O "$2" "$1"
+    wget -q --show-progress --tries=2 --timeout=8 -O "$2" "$1"
   fi
 }
+
+# ------------------------------------------------------- 下载源（含镜像回退）
+
+# 空前缀 -> 原样返回官方 URL；非空前缀 -> <前缀>/<官方 URL>
+join_url() {
+  if [ -n "$1" ]; then printf '%s/%s' "${1%/}" "$2"; else printf '%s' "$2"; fi
+}
+
+host_of() {
+  printf '%s' "$1" | sed -e 's|^[A-Za-z][A-Za-z0-9+.-]*://||' -e 's|/.*$||'
+}
+
+PREFIXES=()
+build_prefixes() {
+  if [ -n "$BASE_URL_OPT" ]; then
+    PREFIXES=("$BASE_URL_OPT")
+  else
+    PREFIXES=("${MIRROR_PREFIXES[@]}")
+  fi
+}
+
+# 把上次成功的源提到最前面，后续请求就不用再等官方超时
+prefer_resolved() {
+  [ -n "$RESOLVED_PREFIX" ] || return 0
+  local out=("$RESOLVED_PREFIX") b
+  for b in "${PREFIXES[@]}"; do
+    [ "$b" = "$RESOLVED_PREFIX" ] || out+=("$b")
+  done
+  PREFIXES=("${out[@]}")
+}
+
+RESOLVED_PREFIX=""
+
+# 依次尝试各下载源，成功则记下可用的前缀
+fetch_asset() {  # $1 = 相对路径(owner/repo/...), $2 = 目标文件
+  local rel="$1" dest="$2" p host
+  for p in "${PREFIXES[@]}"; do
+    host="$(host_of "$(join_url "$p" "$GH")")"
+    if [ "${FETCH_QUIET:-0}" != "1" ]; then
+      printf '   源: %s\n' "$host"
+    fi
+    if fetch_file "$(join_url "$p" "$GH/$rel")" "$dest" && [ -s "$dest" ]; then
+      RESOLVED_PREFIX="$p"
+      return 0
+    fi
+    if [ "${FETCH_QUIET:-0}" != "1" ]; then
+      warn "${host} 不可用"
+    fi
+    rm -f "$dest"
+  done
+  return 1
+}
+
+# 解析最新 tag：先试 GitHub API，再退化为跟随 /releases/latest 的跳转
+latest_tag() {
+  local p json tag url
+  for p in "${PREFIXES[@]}"; do
+    printf '   源: %s\n' "$(host_of "$(join_url "$p" "$API")")" >&2
+    json="$(fetch_stdout "$(join_url "$p" "$API/repos/$REPO/releases/latest")" 2>/dev/null || true)"
+    tag="$(printf '%s' "$json" \
+      | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' \
+      | head -n1 | sed 's/.*"\([^"]*\)"$/\1/' || true)"
+    if [ -z "$tag" ] && command -v curl >/dev/null 2>&1; then
+      url="$(curl -sSL -o /dev/null -w '%{url_effective}' --max-time 25 \
+        "$(join_url "$p" "$GH/$REPO/releases/latest")" 2>/dev/null || true)"
+      case "$url" in *"/tag/"*) tag="${url##*/tag/}" ;; esac
+    fi
+    case "$tag" in
+      v[0-9]*)
+        RESOLVED_PREFIX="$p"
+        printf '%s' "$tag"
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+build_prefixes
 
 # ---------------------------------------------------------------- 卸载
 
@@ -159,22 +249,15 @@ uninstall() {
 
 if [ -z "$VERSION" ]; then
   log "查询最新版本"
-  api="${API_BASE}/repos/${REPO}/releases/latest"
-  json="$(fetch_stdout "$api")" \
-    || die "查询最新版本失败：$api
-  如果是网络问题，可改用 --version v0.1.0 直接指定版本，或用 --base-url 走镜像"
-  VERSION="$(printf '%s' "$json" \
-    | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' \
-    | head -n1 | sed 's/.*"\([^"]*\)"$/\1/' || true)"
-  [ -n "$VERSION" ] || die "没能从 GitHub API 解析出版本号"
+  VERSION="$(latest_tag || true)"
+  [ -n "$VERSION" ] || die "查询最新版本失败：官方和镜像都没连上
+  可以跳过这一步直接指定版本： --version v0.1.0"
 fi
 
 case "$VERSION" in v*) : ;; *) VERSION="v${VERSION}" ;; esac
 
 NAME="linux_${ARCH}"
 ARCHIVE="${SERVICE}_${VERSION}_${NAME}.tar.gz"
-URL="${GITHUB_BASE}/${REPO}/releases/download/${VERSION}/${ARCHIVE}"
-SUMS_URL="${GITHUB_BASE}/${REPO}/releases/download/${VERSION}/SHA256SUMS"
 
 log "安装 ${C_B}DoriyaMedia ${VERSION}${C_R} (${ARCH})"
 
@@ -183,12 +266,23 @@ log "安装 ${C_B}DoriyaMedia ${VERSION}${C_R} (${ARCH})"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-log "下载 ${ARCHIVE}"
-fetch_file "$URL" "${TMP}/${ARCHIVE}" \
-  || die "下载失败：$URL
-  国内网络可试： --base-url https://ghfast.top/https://github.com"
+prefer_resolved
+tried=""
+for p in "${PREFIXES[@]}"; do
+  tried="${tried} $(host_of "$(join_url "$p" "$GH")")"
+done
 
-if fetch_file "$SUMS_URL" "${TMP}/SHA256SUMS" 2>/dev/null && [ -s "${TMP}/SHA256SUMS" ]; then
+log "下载 ${ARCHIVE}"
+if ! fetch_asset "${REPO}/releases/download/${VERSION}/${ARCHIVE}" "${TMP}/${ARCHIVE}"; then
+  die "所有下载源都失败，已尝试：${tried}
+  可以手动指定镜像： --base-url https://ghfast.top
+  或在能联网的机器上下载后拷过来：
+    ${GH}/${REPO}/releases/download/${VERSION}/${ARCHIVE}"
+fi
+ok "已从 $(host_of "$(join_url "$RESOLVED_PREFIX" "$GH")") 获取"
+
+if FETCH_QUIET=1 fetch_asset "${REPO}/releases/download/${VERSION}/SHA256SUMS" "${TMP}/SHA256SUMS" 2>/dev/null \
+   && [ -s "${TMP}/SHA256SUMS" ]; then
   # 兼容 sha256sum 的三种写法: "hash  name"、"./name" 和二进制模式的 "hash *name"
   expected="$(awk -v f="$ARCHIVE" '
       { n = $NF; sub(/^\*/, "", n); sub(/^\.\//, "", n); if (n == f) { print $1; exit } }
