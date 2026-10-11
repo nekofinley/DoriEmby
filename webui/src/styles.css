@@ -1,0 +1,158 @@
+/* Doriya design system — adapted from the captured "Linear" dark tokens */
+:root {
+  --bg-0: #08090a;
+  --bg-1: #0f1011;
+  --bg-2: #141516;
+  --bg-3: #191a1b;
+  --bg-panel: #161718;
+  --border-1: #23252a;
+  --border-2: #34343a;
+  --text-1: #f7f8f8;
+  --text-2: #d0d6e0;
+  --text-3: #8a8f98;
+  --text-4: #62666d;
+  --accent: #7170ff;
+  --accent-hover: #828fff;
+  --accent-tint: #18182f;
+  --danger: #eb5757;
+  --ok: #27a644;
+  --warn: #f0bf00;
+  --radius-s: 8px;
+  --radius-m: 12px;
+  --radius-l: 16px;
+  --shadow-1: 0 4px 24px rgba(0, 0, 0, 0.2);
+  --shadow-2: 0 7px 32px rgba(0, 0, 0, 0.35);
+  --header-h: 56px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg-0);
+  color: var(--text-1);
+  font-family: "Inter", "SF Pro Display", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+a { color: inherit; text-decoration: none; }
+button { font: inherit; cursor: pointer; }
+input, select, textarea { font: inherit; }
+
+::selection { background: var(--accent); color: #fff; }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.1); border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.2); }
+::-webkit-scrollbar-track { background: transparent; }
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border-radius: var(--radius-s);
+  border: 1px solid var(--border-1);
+  background: var(--bg-2);
+  color: var(--text-1);
+  transition: background 0.15s, border-color 0.15s, opacity 0.15s;
+  white-space: nowrap;
+}
+.btn:hover { background: var(--bg-3); border-color: var(--border-2); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn.primary {
+  background: var(--accent);
+  border-color: transparent;
+  color: #fff;
+  font-weight: 600;
+}
+.btn.primary:hover { background: var(--accent-hover); }
+.btn.danger { color: var(--danger); }
+.btn.ghost { background: transparent; border-color: transparent; color: var(--text-3); }
+.btn.ghost:hover { color: var(--text-1); background: var(--bg-2); }
+.btn.play {
+  background: #fff;
+  color: #000;
+  border-color: transparent;
+  font-weight: 600;
+  padding: 10px 22px;
+  border-radius: 10px;
+}
+.btn.play:hover { background: #e8e8e8; }
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+.field label { color: var(--text-3); font-size: 12px; }
+.field input, .field select, .field textarea {
+  background: var(--bg-1);
+  border: 1px solid var(--border-1);
+  border-radius: var(--radius-s);
+  color: var(--text-1);
+  padding: 9px 12px;
+  outline: none;
+  transition: border-color 0.15s;
+  width: 100%;
+}
+.field input:focus, .field select:focus, .field textarea:focus { border-color: var(--accent); }
+.field .hint { color: var(--text-4); font-size: 12px; }
+
+.card {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-1);
+  border-radius: var(--radius-m);
+  padding: 18px;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-2);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+.badge.mode-direct { color: #6ee787; background: rgba(39, 166, 68, 0.12); }
+.badge.mode-proxy { color: #79c0ff; background: rgba(88, 166, 255, 0.12); }
+.badge.mode-remux { color: #f0bf00; background: rgba(240, 191, 0, 0.1); }
+.badge.mode-transcode { color: #ff9d66; background: rgba(255, 120, 64, 0.12); }
+
+.toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg-3);
+  border: 1px solid var(--border-2);
+  color: var(--text-1);
+  padding: 10px 18px;
+  border-radius: 10px;
+  box-shadow: var(--shadow-2);
+  z-index: 2000;
+  max-width: 80vw;
+}
+
+.page {
+  max-width: 1320px;
+  margin: 0 auto;
+  padding: 24px 28px 80px;
+}
+
+h1 { font-size: 22px; font-weight: 700; margin: 0 0 4px; }
+h2 { font-size: 17px; font-weight: 650; margin: 0; }
+.muted { color: var(--text-3); }
+.tiny { font-size: 12px; color: var(--text-4); }
+
+@media (max-width: 720px) {
+  .page { padding: 16px 14px 80px; }
+}

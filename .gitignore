@@ -1,0 +1,12 @@
+data/
+config.json
+*.db
+*.db-wal
+*.db-shm
+# build artifacts
+*.exe
+
+node_modules/
+webui/node_modules/
+webui/dist/
+!internal/web/dist/

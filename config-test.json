@@ -1,0 +1,20 @@
+{
+  "port": 5666,
+  "data_dir": "data-test-run",
+  "secret": "74019b3df898da0cc688cb8ea50659e5493cafd787f66f0eed5018c4858b7a8e",
+  "ffmpeg": "ffmpeg",
+  "ffprobe": "ffprobe",
+  "tmdb": {
+    "api_key": "",
+    "language": "zh-CN",
+    "api_base": "https://api.themoviedb.org/3",
+    "img_base": "https://image.tmdb.org/t/p"
+  },
+  "playback": {
+    "force_mode": "auto",
+    "segment_seconds": 4,
+    "transcode_height": 1080
+  },
+  "scan_concurrency": 4,
+  "dev_web_dir": ""
+}

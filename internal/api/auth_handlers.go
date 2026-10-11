@@ -1,0 +1,202 @@
+package api
+
+import (
+	"net/http"
+	"os/exec"
+	"runtime"
+	"time"
+
+	"doriya/internal/auth"
+	"doriya/internal/models"
+)
+
+func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
+	n, err := s.Store.UserCount()
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"setup_needed": n == 0})
+}
+
+func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
+	n, err := s.Store.UserCount()
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	if n > 0 {
+		fail(w, 400, "已初始化,请直接登录")
+		return
+	}
+	var req struct {
+		Name     string `json:"name"`
+		Password string `json:"password"`
+	}
+	if err := readBody(r, &req); err != nil || req.Name == "" || len(req.Password) < 4 {
+		fail(w, 400, "需要用户名和至少 4 位密码")
+		return
+	}
+	hash, salt := auth.HashPassword(req.Password)
+	u := &models.User{Name: req.Name, PassHash: hash, Salt: salt, Role: "admin"}
+	if err := s.Store.CreateUser(u); err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	s.startSession(w, u)
+}
+
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name     string `json:"name"`
+		Password string `json:"password"`
+	}
+	if err := readBody(r, &req); err != nil {
+		fail(w, 400, "参数错误")
+		return
+	}
+	u, err := s.Store.UserByName(req.Name)
+	if err != nil || !auth.Verify(req.Password, u.PassHash, u.Salt) {
+		fail(w, 401, "用户名或密码错误")
+		return
+	}
+	s.startSession(w, u)
+}
+
+func (s *Server) startSession(w http.ResponseWriter, u *models.User) {
+	token := auth.NewToken()
+	exp := time.Now().Add(30 * 24 * time.Hour)
+	if err := s.Store.CreateSession(token, u.ID, exp); err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: cookieName, Value: token, Path: "/", HttpOnly: true,
+		SameSite: http.SameSiteLaxMode, Expires: exp,
+	})
+	writeJSON(w, 200, map[string]any{"token": token, "user": u})
+}
+
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, user *models.User) {
+	token := ""
+	if c, err := r.Cookie(cookieName); err == nil {
+		token = c.Value
+	}
+	if ah := r.Header.Get("Authorization"); token == "" && len(ah) > 7 {
+		token = ah[7:]
+	}
+	_ = s.Store.DeleteSession(token)
+	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: "", Path: "/", MaxAge: -1})
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, user *models.User) {
+	writeJSON(w, 200, map[string]any{"user": user, "setup_needed": false})
+}
+
+func (s *Server) handleSystemInfo(w http.ResponseWriter, r *http.Request, user *models.User) {
+	ffmpegOK := exec.Command(s.Cfg.FFmpeg, "-version").Run() == nil
+	ffprobeOK := exec.Command(s.Cfg.FFProbe, "-version").Run() == nil
+	writeJSON(w, 200, map[string]any{
+		"version":       "0.1.0",
+		"os":            runtime.GOOS,
+		"ffmpeg_ok":     ffmpegOK,
+		"ffprobe_ok":    ffprobeOK,
+		"tmdb_ok":       s.Cfg.TMDB.APIKey != "",
+		"data_dir":      s.Cfg.Abs(),
+		"force_mode":    s.Cfg.Playback.ForceMode,
+	})
+}
+
+func (s *Server) configFile() string {
+	if s.ConfigPath != "" {
+		return s.ConfigPath
+	}
+	return "config.json"
+}
+
+func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request, user *models.User) {
+	cfg := map[string]any{
+		"port":             s.Cfg.Port,
+		"ffmpeg":           s.Cfg.FFmpeg,
+		"ffprobe":          s.Cfg.FFProbe,
+		"scan_concurrency": s.Cfg.ScanConcurrency,
+		"dev_web_dir":      s.Cfg.DevWebDir,
+		"tmdb":             s.Cfg.TMDB,
+		"playback":         s.Cfg.Playback,
+	}
+	writeJSON(w, 200, cfg)
+}
+
+func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request, user *models.User) {
+	var req struct {
+		Port            *int               `json:"port"`
+		FFmpeg          *string            `json:"ffmpeg"`
+		FFProbe         *string            `json:"ffprobe"`
+		ScanConcurrency *int               `json:"scan_concurrency"`
+		DevWebDir       *string            `json:"dev_web_dir"`
+		TMDB            *configTMDB        `json:"tmdb"`
+		Playback        *configPlayback    `json:"playback"`
+	}
+	if err := readBody(r, &req); err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	if req.Port != nil && *req.Port > 0 {
+		s.Cfg.Port = *req.Port
+	}
+	if req.FFmpeg != nil && *req.FFmpeg != "" {
+		s.Cfg.FFmpeg = *req.FFmpeg
+	}
+	if req.FFProbe != nil && *req.FFProbe != "" {
+		s.Cfg.FFProbe = *req.FFProbe
+	}
+	if req.ScanConcurrency != nil && *req.ScanConcurrency > 0 {
+		s.Cfg.ScanConcurrency = *req.ScanConcurrency
+	}
+	if req.DevWebDir != nil {
+		s.Cfg.DevWebDir = *req.DevWebDir
+	}
+	if req.TMDB != nil {
+		s.Cfg.TMDB.APIKey = req.TMDB.APIKey
+		if req.TMDB.Language != "" {
+			s.Cfg.TMDB.Language = req.TMDB.Language
+		}
+		if req.TMDB.APIBase != "" {
+			s.Cfg.TMDB.APIBase = req.TMDB.APIBase
+		}
+		if req.TMDB.ImgBase != "" {
+			s.Cfg.TMDB.ImgBase = req.TMDB.ImgBase
+		}
+	}
+	if req.Playback != nil {
+		if req.Playback.ForceMode != "" {
+			s.Cfg.Playback.ForceMode = req.Playback.ForceMode
+		}
+		if req.Playback.SegmentSeconds > 0 {
+			s.Cfg.Playback.SegmentSeconds = req.Playback.SegmentSeconds
+		}
+		if req.Playback.TranscodeHeight > 0 {
+			s.Cfg.Playback.TranscodeHeight = req.Playback.TranscodeHeight
+		}
+	}
+	if err := s.Cfg.Save(s.configFile()); err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	s.Engine.SetBins(s.Cfg.FFmpeg, s.Cfg.FFProbe)
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+type configTMDB = struct {
+	APIKey   string `json:"api_key"`
+	Language string `json:"language"`
+	APIBase  string `json:"api_base"`
+	ImgBase  string `json:"img_base"`
+}
+
+type configPlayback = struct {
+	ForceMode       string  `json:"force_mode"`
+	SegmentSeconds  float64 `json:"segment_seconds"`
+	TranscodeHeight int     `json:"transcode_height"`
+}
