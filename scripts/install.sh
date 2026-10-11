@@ -147,7 +147,7 @@ uninstall() {
     rm -rf "$DATA_DIR"
     ok "已删除数据目录 $DATA_DIR"
     id -u "$SERVICE_USER" >/dev/null 2>&1 && userdel "$SERVICE_USER" 2>/dev/null || true
-  else
+  elif [ -d "$DATA_DIR" ]; then
     warn "数据目录保留在 $DATA_DIR（要一并删除请用 --purge）"
   fi
   exit 0
@@ -165,7 +165,7 @@ if [ -z "$VERSION" ]; then
   如果是网络问题，可改用 --version v0.1.0 直接指定版本，或用 --base-url 走镜像"
   VERSION="$(printf '%s' "$json" \
     | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' \
-    | head -n1 | sed 's/.*"\([^"]*\)"$/\1/')"
+    | head -n1 | sed 's/.*"\([^"]*\)"$/\1/' || true)"
   [ -n "$VERSION" ] || die "没能从 GitHub API 解析出版本号"
 fi
 
@@ -188,10 +188,13 @@ fetch_file "$URL" "${TMP}/${ARCHIVE}" \
   || die "下载失败：$URL
   国内网络可试： --base-url https://ghfast.top/https://github.com"
 
-if fetch_file "$SUMS_URL" "${TMP}/SHA256SUMS" 2>/dev/null; then
-  expected="$(grep " ${ARCHIVE}\$" "${TMP}/SHA256SUMS" | awk '{print $1}' | head -n1)"
+if fetch_file "$SUMS_URL" "${TMP}/SHA256SUMS" 2>/dev/null && [ -s "${TMP}/SHA256SUMS" ]; then
+  # 兼容 sha256sum 的三种写法: "hash  name"、"./name" 和二进制模式的 "hash *name"
+  expected="$(awk -v f="$ARCHIVE" '
+      { n = $NF; sub(/^\*/, "", n); sub(/^\.\//, "", n); if (n == f) { print $1; exit } }
+    ' "${TMP}/SHA256SUMS" 2>/dev/null || true)"
   if [ -n "$expected" ]; then
-    actual="$(sha256sum "${TMP}/${ARCHIVE}" | awk '{print $1}')"
+    actual="$(sha256sum "${TMP}/${ARCHIVE}" | awk '{print $1}' || true)"
     [ "$expected" = "$actual" ] || die "校验和不匹配，下载可能被篡改或损坏：
   期望 $expected
   实际 $actual"
@@ -205,7 +208,7 @@ fi
 
 log "解包"
 tar -xzf "${TMP}/${ARCHIVE}" -C "$TMP"
-src_bin="$(find "$TMP" -maxdepth 3 -type f -name "$SERVICE" | head -n1)"
+src_bin="$(find "$TMP" -maxdepth 3 -type f -name "$SERVICE" | head -n1 || true)"
 [ -n "$src_bin" ] || die "压缩包里没找到 $SERVICE 可执行文件"
 
 # ---------------------------------------------------------------- ffmpeg
@@ -341,7 +344,7 @@ fi
 
 # ---------------------------------------------------------------- 收尾
 
-ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 [ -n "$ip" ] || ip="<服务器IP>"
 
 cat <<EOF

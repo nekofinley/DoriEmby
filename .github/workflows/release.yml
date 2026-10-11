@@ -180,7 +180,11 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          sha256sum ./* > SHA256SUMS
+          # 用裸文件名，避免 sha256sum 输出 "./" 前缀
+          for f in ./*.tar.gz ./*.zip; do
+            [ -e "$f" ] || continue
+            sha256sum "${f#./}"
+          done > SHA256SUMS
           cat SHA256SUMS
 
       - name: Publish
