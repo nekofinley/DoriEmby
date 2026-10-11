@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -34,13 +35,22 @@ func NewTMDBClient(apiKey, language, apiBase, imgBase string) *TMDBClient {
 
 func (t *TMDBClient) Enabled() bool { return t != nil && t.APIKey != "" }
 
+// authMode: v3 keys are 32-char hex (api_key query param); v4 read access
+// tokens are long JWTs (Authorization: Bearer header). Accept both.
+func (t *TMDBClient) authMode() string {
+	k := strings.TrimSpace(t.APIKey)
+	if strings.HasPrefix(k, "eyJ") || len(k) > 64 {
+		return "bearer"
+	}
+	return "query"
+}
+
 func (t *TMDBClient) get(ctx context.Context, path string, params map[string]string, out any) error {
 	u, err := url.Parse(t.APIBase + path)
 	if err != nil {
 		return err
 	}
 	q := u.Query()
-	q.Set("api_key", t.APIKey)
 	q.Set("language", t.Language)
 	for k, v := range params {
 		if v != "" {
@@ -53,6 +63,13 @@ func (t *TMDBClient) get(ctx context.Context, path string, params map[string]str
 		return err
 	}
 	req.Header.Set("Accept", "application/json")
+	if t.authMode() == "bearer" {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(t.APIKey))
+	} else {
+		q.Set("api_key", strings.TrimSpace(t.APIKey))
+		u.RawQuery = q.Encode()
+		req.URL = u
+	}
 	resp, err := t.client.Do(req)
 	if err != nil {
 		return err

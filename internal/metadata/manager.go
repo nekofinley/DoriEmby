@@ -21,10 +21,33 @@ import (
 type Manager struct {
 	Store *db.Store
 	Cfg   *config.Config
+
+	listMu     sync.Mutex
+	listCache  map[string][]source.Entry // per-EnrichLibrary-run dir listing cache
 }
 
 func NewManager(store *db.Store, cfg *config.Config) *Manager {
 	return &Manager{Store: store, Cfg: cfg}
+}
+
+// cachedList returns the directory listing, deduplicating repeated lookups
+// within one enrichment run (hundreds of episodes often share a few dirs —
+// each remote List costs a public round-trip).
+func (m *Manager) cachedList(ctx context.Context, drv source.Driver, dir string) ([]source.Entry, error) {
+	m.listMu.Lock()
+	defer m.listMu.Unlock()
+	if m.listCache == nil {
+		m.listCache = map[string][]source.Entry{}
+	}
+	if ents, ok := m.listCache[dir]; ok {
+		return ents, nil
+	}
+	ents, err := drv.List(ctx, dir)
+	if err != nil {
+		return nil, err
+	}
+	m.listCache[dir] = ents
+	return ents, nil
 }
 
 func (m *Manager) tmdb() *TMDBClient {
@@ -61,8 +84,32 @@ func throttle() {
 
 // ---------- public API ----------
 
+// SeedListings preloads directory listings gathered during the scan walk so
+// the identify pass does not re-fetch them over the network.
+func (m *Manager) SeedListings(listings map[string][]source.Entry) {
+	m.listMu.Lock()
+	defer m.listMu.Unlock()
+	if len(listings) == 0 {
+		return
+	}
+	if m.listCache == nil {
+		m.listCache = map[string][]source.Entry{}
+	}
+	for k, v := range listings {
+		if _, ok := m.listCache[k]; !ok {
+			m.listCache[k] = v
+		}
+	}
+}
+
 // EnrichLibrary identifies all items in a library that lack metadata.
-func (m *Manager) EnrichLibrary(lib *models.Library) {
+// report is optional progress feedback: report(done, total, human message).
+func (m *Manager) EnrichLibrary(lib *models.Library, report func(done, total int, msg string)) {
+	say := func(done, total int, msg string) {
+		if report != nil {
+			report(done, total, msg)
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
 
@@ -74,16 +121,17 @@ func (m *Manager) EnrichLibrary(lib *models.Library) {
 	if err != nil {
 		return
 	}
+	defer func() { m.listMu.Lock(); m.listCache = nil; m.listMu.Unlock() }()
 
 	switch lib.Type {
 	case "series":
-		m.enrichSeries(ctx, drv, lib)
+		m.enrichSeries(ctx, drv, lib, say)
 	default:
-		m.enrichMovies(ctx, drv, lib)
+		m.enrichMovies(ctx, drv, lib, say)
 	}
 }
 
-func (m *Manager) enrichMovies(ctx context.Context, drv source.Driver, lib *models.Library) {
+func (m *Manager) enrichMovies(ctx context.Context, drv source.Driver, lib *models.Library, say func(done, total int, msg string)) {
 	items, _, err := m.Store.ItemsByLibrary(lib.ID, "movie", "", "", 0, 500000)
 	if err != nil {
 		return
@@ -94,17 +142,29 @@ func (m *Manager) enrichMovies(ctx context.Context, drv source.Driver, lib *mode
 			return
 		default:
 		}
+		say(i, len(items), "识别 "+items[i].Name)
 		m.enrichMovie(ctx, drv, lib, &items[i])
+		say(i+1, len(items), "识别 "+items[i].Name)
 	}
 }
 
-func (m *Manager) enrichSeries(ctx context.Context, drv source.Driver, lib *models.Library) {
+func (m *Manager) enrichSeries(ctx context.Context, drv source.Driver, lib *models.Library, say func(done, total int, msg string)) {
 	shows, _, _ := m.Store.ItemsByLibrary(lib.ID, "show", "", "", 0, 100000)
+	seasons, _, _ := m.Store.ItemsByLibrary(lib.ID, "season", "", "", 0, 200000)
+	// count all episodes for the progress denominator
+	epTotal := 0
+	if all, _, err := m.Store.ItemsByLibrary(lib.ID, "episode", "", "", 0, 500000); err == nil {
+		epTotal = len(all)
+	}
+	total := len(shows) + epTotal
+	done := 0
 	for i := range shows {
+		say(done, total, "识别剧集 "+shows[i].Name)
 		m.enrichShow(ctx, drv, lib, &shows[i])
+		done++
+		say(done, total, "识别剧集 "+shows[i].Name)
 	}
 	// episodes after shows are identified
-	seasons, _, _ := m.Store.ItemsByLibrary(lib.ID, "season", "", "", 0, 200000)
 	showByID := map[int64]models.Item{}
 	for _, s := range shows {
 		showByID[s.ID] = s
@@ -119,9 +179,14 @@ func (m *Manager) enrichSeries(ctx context.Context, drv source.Driver, lib *mode
 		}
 		kids, _ := m.Store.ItemChildren(s.ID)
 		for i := range kids {
+			if done%25 == 0 {
+				say(done, total, "识别剧集 "+show.Name)
+			}
 			m.enrichEpisode(ctx, drv, lib, &kids[i], &show, &s)
+			done++
 		}
 	}
+	say(total, total, "识别完成")
 }
 
 func (m *Manager) enrichMovie(ctx context.Context, drv source.Driver, lib *models.Library, it *models.Item) {
@@ -169,8 +234,8 @@ func (m *Manager) enrichShow(ctx context.Context, drv source.Driver, lib *models
 }
 
 func (m *Manager) enrichEpisode(ctx context.Context, drv source.Driver, lib *models.Library, ep *models.Item, show *models.Item, season *models.Item) {
-	if ep.Name != "" && !strings.HasPrefix(ep.Name, "第 ") && !strings.HasPrefix(ep.Name, "Episode") {
-		// already has a real name (from a previous run) — still refresh stills if missing
+	if ep.Name != "" && !strings.HasPrefix(ep.Name, "绗?") && !strings.HasPrefix(ep.Name, "Episode") {
+		// already has a real name (from a previous run) 鈥?still refresh stills if missing
 		if ep.StillPath != "" {
 			return
 		}
@@ -245,7 +310,7 @@ func (m *Manager) RefreshItem(itemID int64, tmdbID int) error {
 		_ = m.Store.UpdateItemMeta(it)
 		filePath, ok := m.firstEpisodeFile(it.ID)
 		if !ok {
-			return fmt.Errorf("剧集下没有可用的剧集文件")
+			return fmt.Errorf("鍓ч泦涓嬫病鏈夊彲鐢ㄧ殑鍓ч泦鏂囦欢")
 		}
 		if m.tryShowNFO(ctx, drv, it, filePath) {
 			return nil
@@ -253,7 +318,7 @@ func (m *Manager) RefreshItem(itemID int64, tmdbID int) error {
 		m.tryShowTMDB(ctx, it, it.Name, 0)
 		return nil
 	default:
-		return fmt.Errorf("该类型不支持手动识别")
+		return fmt.Errorf("璇ョ被鍨嬩笉鏀寔鎵嬪姩璇嗗埆")
 	}
 }
 
@@ -288,7 +353,7 @@ func (m *Manager) tryMovieNFO(ctx context.Context, drv source.Driver, it *models
 		return false
 	}
 	dir, base := dirBase(f.Path)
-	list, err := drv.List(ctx, dir)
+	list, err := m.cachedList(ctx, drv, dir)
 	if err != nil {
 		return false
 	}
@@ -362,7 +427,7 @@ func (m *Manager) tryEpisodeNFO(ctx context.Context, drv source.Driver, ep *mode
 		return false
 	}
 	dir, base := dirBase(f.Path)
-	list, err := drv.List(ctx, dir)
+	list, err := m.cachedList(ctx, drv, dir)
 	if err != nil {
 		return false
 	}
@@ -412,7 +477,7 @@ func (m *Manager) tryShowNFO(ctx context.Context, drv source.Driver, show *model
 	}
 	dir, _ := dirBase(filePath)
 	for depth := 0; depth < 3 && dir != "" && dir != "/" && dir != "."; depth++ {
-		list, err := drv.List(ctx, dir)
+		list, err := m.cachedList(ctx, drv, dir)
 		if err != nil {
 			return false
 		}

@@ -6,7 +6,8 @@ const routes = [
   { path: '/', component: () => import('./views/Home.vue') },
   { path: '/library/:id', component: () => import('./views/Library.vue') },
   { path: '/item/:id', component: () => import('./views/Detail.vue') },
-  { path: '/play/:fileId', component: () => import('./views/Player.vue'), meta: { fullscreen: true } },
+  { path: '/browse/:id?', component: () => import('./views/Browse.vue') },
+  { path: '/play/:fileId', component: () => import('./views/Player.vue') },
   { path: '/settings', component: () => import('./views/Settings.vue') },
   { path: '/:pathMatch(.*)*', redirect: '/' },
 ]

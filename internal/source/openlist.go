@@ -120,13 +120,35 @@ func (d *OpenListDriver) List(ctx context.Context, dir string) ([]Entry, error) 
 }
 
 type alistGet struct {
-	Name    string            `json:"name"`
-	Size    int64             `json:"size"`
-	Sign    string            `json:"sign"`
-	RawURL  string            `json:"raw_url"`
-	Header  map[string]string `json:"header"`
-	IsDir   bool              `json:"is_dir"`
-	Provider string           `json:"provider"`
+	Name     string          `json:"name"`
+	Size     int64           `json:"size"`
+	Sign     string          `json:"sign"`
+	RawURL   string          `json:"raw_url"`
+	Header   json.RawMessage `json:"header"`
+	IsDir    bool            `json:"is_dir"`
+	Provider string          `json:"provider"`
+}
+
+// parseAlistHeader accepts `header` as either a JSON object or a
+// JSON-encoded string (some OpenList versions return the latter).
+func parseAlistHeader(raw json.RawMessage) map[string]string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var m map[string]string
+	if err := json.Unmarshal(raw, &m); err == nil {
+		return m
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		if strings.TrimSpace(s) == "" {
+			return nil
+		}
+		if err := json.Unmarshal([]byte(s), &m); err == nil {
+			return m
+		}
+	}
+	return nil
 }
 
 // resolve returns a fetchable URL for path plus required headers.
@@ -146,7 +168,7 @@ func (d *OpenListDriver) resolve(ctx context.Context, path string) (string, map[
 	if strings.HasPrefix(raw, "/") {
 		raw = d.Base + raw // openlist proxy link (/p/...)
 	}
-	return raw, g.Header, nil
+	return raw, parseAlistHeader(g.Header), nil
 }
 
 // normalizeURL re-encodes a URL so spaces/CJK are percent-escaped (ffprobe/302 need this).

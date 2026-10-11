@@ -40,6 +40,12 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request, user *models
 		fail(w, 404, "文件不存在")
 		return
 	}
+	s.playFile(w, r, file)
+}
+
+// playFile runs the decision pipeline for a media file and writes the response.
+// Shared by the library player (/api/play) and the file browser (/api/browseplay).
+func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.MediaFile) {
 	ctx, cancel := context.WithTimeout(r.Context(), 150*time.Second)
 	defer cancel()
 
@@ -85,6 +91,40 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request, user *models
 		sq := signedQuery(s.Cfg.Secret, file.ID, sigTTL)
 		dec.URL = fmt.Sprintf("/api/hls/%d/index.m3u8%s&m=%s", file.ID, sq, dec.Mode)
 		dec.MimeType = "application/vnd.apple.mpegurl"
+	}
+
+	// Fallback strategies for the player to auto-try when the primary mode
+	// fails on this client (e.g. HEVC MKV native → cloud transcode).
+	sq := signedQuery(s.Cfg.Secret, file.ID, sigTTL)
+	proxyURL := fmt.Sprintf("/api/stream/%d?proxy=1", file.ID) + strings.Replace(sq, "?", "&", 1)
+	directURL := fmt.Sprintf("/api/stream/%d%s", file.ID, sq)
+	hlsURL := func(m string) string {
+		return fmt.Sprintf("/api/hls/%d/index.m3u8%s&m=%s", file.ID, sq, m)
+	}
+	addAlt := func(mode, url, mime string) {
+		if url == dec.URL {
+			return
+		}
+		for _, a := range dec.Alternates {
+			if a.URL == url {
+				return
+			}
+		}
+		dec.Alternates = append(dec.Alternates, media.DecisionAlt{Mode: mode, URL: url, MimeType: mime})
+	}
+	if hasDirect && len(directHeaders) == 0 && dec.Mode != "direct" {
+		addAlt("direct", directURL, "video/mp4")
+	}
+	if dec.Mode != "proxy" {
+		addAlt("proxy", proxyURL, "video/mp4")
+	}
+	if dec.Duration > 0 {
+		if dec.Mode != "transcode" {
+			addAlt("transcode", hlsURL("transcode"), "application/vnd.apple.mpegurl")
+		}
+		if dec.Mode != "remux" {
+			addAlt("remux", hlsURL("remux"), "application/vnd.apple.mpegurl")
+		}
 	}
 
 	// audio tracks
@@ -155,8 +195,10 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request, user *models
 		"video_codec":  dec.VideoCodec,
 		"audio_codec":  dec.AudioCodec,
 		"resolution":   dec.Resolution,
+		"alternates":   dec.Alternates,
 		"media":        probeSummary(file.Probe),
 		"audio_tracks": tracks,
+		"versions":     s.versionsFor(file.ItemID, file.ID),
 		"subtitles":    subDTOs,
 	})
 }
@@ -404,10 +446,14 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 		audioMode = "aac"
 	}
 
+	videoIndex := -1
+	if v := probe.Video(); v != nil {
+		videoIndex = v.Index
+	}
 	w.Header().Set("Content-Type", "video/mp2t")
 	w.Header().Set("Cache-Control", "no-store")
 	start := float64(segIndex) * segLen
-	if err := s.Engine.Segment(ctx, file, drv, start, segLen, mode, audioMode, audioOrdinal, s.Cfg.Playback.TranscodeHeight, w); err != nil {
+	if err := s.Engine.Segment(ctx, file, drv, start, segLen, mode, audioMode, audioOrdinal, videoIndex, s.Cfg.Playback.TranscodeHeight, w); err != nil {
 		log.Printf("hls segment %d/%d failed: %v", file.ID, segIndex, err)
 	}
 }

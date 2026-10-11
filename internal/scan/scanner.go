@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"doriya/internal/config"
@@ -25,11 +27,21 @@ type fileRec struct {
 type Scanner struct {
 	Store      *db.Store
 	Cfg        *config.Config
-	OnIdentify func(lib *models.Library) // metadata enrichment hook
-	states     sync.Map                  // libraryID -> *models.ScanState
+	OnIdentify func(lib *models.Library, listings map[string][]source.Entry, report func(done, total int, msg string)) // metadata enrichment hook
+	states     sync.Map // libraryID -> *models.ScanState
+	cancels    sync.Map // libraryID -> context.CancelFunc
 
 	queue chan *models.Library
 	once  sync.Once
+}
+
+// Cancel aborts a running scan of the given library (best effort).
+func (sc *Scanner) Cancel(libID int64) bool {
+	if v, ok := sc.cancels.Load(libID); ok {
+		v.(context.CancelFunc)()
+		return true
+	}
+	return false
 }
 
 func (sc *Scanner) State(libID int64) *models.ScanState {
@@ -78,43 +90,81 @@ func (sc *Scanner) runScan(lib *models.Library) error {
 
 	src, err := sc.Store.SourceByID(lib.SourceID)
 	if err != nil {
-		st.Running, st.Error = false, "源不存在: "+err.Error()
+		st.Running, st.Error, st.Phase = false, "源不存在: "+err.Error(), "error"
+		st.FinishedAt = float64(time.Now().UnixMilli()) / 1000
 		return err
 	}
 	drv, err := source.NewDriver(src)
 	if err != nil {
-		st.Running, st.Error = false, err.Error()
+		st.Running, st.Error, st.Phase = false, err.Error(), "error"
+		st.FinishedAt = float64(time.Now().UnixMilli()) / 1000
 		return err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
+	sc.cancels.Store(lib.ID, context.CancelFunc(cancel))
+	defer sc.cancels.Delete(lib.ID)
+	finish := func() {
+		st.Running = false
+		st.FinishedAt = float64(time.Now().UnixMilli()) / 1000
+		sc.setState(lib.ID, st)
+	}
 
-	files, err := walkTree(ctx, drv, lib.Path, sc.Cfg.ScanConcurrency)
+	var stMu sync.Mutex
+	files, listings, err := walkTree(ctx, drv, lib.Path, sc.Cfg.ScanConcurrency, func(dir string, dirs, found, errs int64, firstErr string) {
+		stMu.Lock()
+		st.Current = "扫描 " + dir
+		st.DirsDone, st.FilesFound, st.WalkErrs = int(dirs), int(found), int(errs)
+		if firstErr != "" && st.FirstErr == "" {
+			st.FirstErr = firstErr
+		}
+		stMu.Unlock()
+	})
+	if ctx.Err() != nil {
+		st.Phase, st.Error = "error", "扫描已取消"
+		finish()
+		return ctx.Err()
+	}
 	if err != nil && len(files) == 0 {
-		st.Running, st.Error = false, "遍历失败: "+err.Error()
+		st.Phase, st.Error = "error", "遍历失败: "+err.Error()
+		finish()
 		return err
 	}
 
 	st.Phase = "organize"
 	st.Total = len(files)
+	st.Current = fmt.Sprintf("发现 %d 个视频文件,正在整理…", len(files))
+	sc.setState(lib.ID, st)
 	if err := sc.organize(lib, files, st); err != nil {
-		st.Running, st.Error = false, "整理失败: "+err.Error()
+		st.Phase, st.Error = "error", "整理失败: "+err.Error()
+		finish()
 		return err
 	}
 
 	st.Phase = "identify"
+	st.Done, st.Total = 0, 0
+	sc.setState(lib.ID, st)
 	if sc.OnIdentify != nil {
-		sc.OnIdentify(lib)
+		sc.OnIdentify(lib, listings, func(done, total int, msg string) {
+			stMu.Lock()
+			st.Done, st.Total, st.Current = done, total, msg
+			stMu.Unlock()
+		})
 	}
 	st.Phase = "done"
-	st.Running = false
+	if st.WalkErrs > 0 || st.FirstErr != "" {
+		st.Error = fmt.Sprintf("完成,但有 %d 个目录读取失败(%s)", st.WalkErrs, st.FirstErr)
+	} else {
+		st.Current = fmt.Sprintf("完成,共 %d 个视频文件", st.Total)
+	}
+	finish()
 	return nil
 }
 
 const maxDepth = 8
 
-func walkTree(ctx context.Context, drv source.Driver, root string, concurrency int) ([]fileRec, error) {
+func walkTree(ctx context.Context, drv source.Driver, root string, concurrency int, onDir func(dir string, dirs, files, errs int64, firstErr string)) ([]fileRec, map[string][]source.Entry, error) {
 	if concurrency <= 0 {
 		concurrency = 4
 	}
@@ -122,7 +172,22 @@ func walkTree(ctx context.Context, drv source.Driver, root string, concurrency i
 	var mu sync.Mutex
 	var files []fileRec
 	var firstErr error
+	var dirsDone, filesFound, errCount atomic.Int64
 	var wg sync.WaitGroup
+	listings := map[string][]source.Entry{} // shared with identify to avoid re-listing
+
+	report := func(dir string) {
+		if onDir == nil {
+			return
+		}
+		fe := ""
+		mu.Lock()
+		if firstErr != nil {
+			fe = firstErr.Error()
+		}
+		mu.Unlock()
+		onDir(dir, dirsDone.Load(), filesFound.Load(), errCount.Load(), fe)
+	}
 
 	var walkDir func(dir string, depth int)
 	walkDir = func(dir string, depth int) {
@@ -136,6 +201,8 @@ func walkTree(ctx context.Context, drv source.Driver, root string, concurrency i
 		case sem <- struct{}{}:
 			defer func() { <-sem }()
 		}
+		dirsDone.Add(1)
+		report(dir)
 		entries, err := drv.List(ctx, dir)
 		if err != nil {
 			mu.Lock()
@@ -143,15 +210,24 @@ func walkTree(ctx context.Context, drv source.Driver, root string, concurrency i
 				firstErr = err
 			}
 			mu.Unlock()
+			errCount.Add(1)
 			return
 		}
+		mu.Lock()
+		listings[dir] = entries
+		mu.Unlock()
 		for _, e := range entries {
 			if SkipEntry(e.Name) {
 				continue
 			}
 			if e.IsDir {
+				// prune subtrees that never contain playable video:
+				// audio CDs, artwork scans, fonts, chapters, menus…
+				if reJunkDir.MatchString(e.Name) {
+					continue
+				}
 				wg.Add(1)
-				walkDir(e.Path, depth+1)
+				go walkDir(e.Path, depth+1)
 				continue
 			}
 			low := strings.ToLower(e.Name)
@@ -160,6 +236,7 @@ func walkTree(ctx context.Context, drv source.Driver, root string, concurrency i
 					mu.Lock()
 					files = append(files, fileRec{Path: url, Dir: dir, Strm: true})
 					mu.Unlock()
+					filesFound.Add(1)
 				}
 				continue
 			}
@@ -172,6 +249,7 @@ func walkTree(ctx context.Context, drv source.Driver, root string, concurrency i
 			mu.Lock()
 			files = append(files, fileRec{Path: e.Path, Dir: dir, Size: e.Size, MTime: e.MTime})
 			mu.Unlock()
+			filesFound.Add(1)
 		}
 	}
 
@@ -182,7 +260,7 @@ func walkTree(ctx context.Context, drv source.Driver, root string, concurrency i
 	}
 	walkDir(root, 0)
 	wg.Wait()
-	return files, firstErr
+	return files, listings, firstErr
 }
 
 func readStrm(ctx context.Context, drv source.Driver, path string) string {
@@ -328,23 +406,28 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, st *mode
 		}
 	}
 
-	knownFiles := map[string]int64{} // path -> item id (to avoid churn)
-	for _, ep := range episodes {
-		fls, err := sc.Store.FilesByItem(ep.ID)
-		if err != nil {
-			return err
-		}
-		for _, f := range fls {
-			knownFiles[f.Path] = ep.ID
-		}
-	}
-
 	for _, fr := range files {
-		if itemID, ok := knownFiles[fr.Path]; ok {
-			_ = itemID // file already attached; UpsertFile below will hit conflict by path
-		}
 		p := ParseName(baseName(fr.Path))
-		showTitle := orDefault(p.Title, baseName(fr.Path))
+
+		// extras / unparseable files (NCOP, NCED, menus, previews…) have no
+		// episode number — keep them out of the library (still playable via
+		// the file browser)
+		if p.Episode == 0 {
+			continue
+		}
+
+		// Show title: prefer the show DIRECTORY (the season-dir's parent), so
+		// "风夏/Season 1/EP01.mkv" or "风夏/01.mkv" both resolve to show "风夏".
+		// Only fall back to the filename when the file sits at the library root.
+		showTitle := ""
+		if sd := showDirFor(lib.Path, fr.Dir); sd != "" {
+			dp := ParseName(baseName(sd))
+			showTitle = orDefault(dp.Title, baseName(sd))
+		}
+		if showTitle == "" {
+			showTitle = orDefault(stripTitleYear(p.Title), baseName(fr.Path))
+		}
+
 		season := p.Season
 		if season == 0 {
 			season = seasonFromPath(fr.Path)
@@ -470,6 +553,53 @@ func seasonFromPath(path string) int {
 		}
 	}
 	return 0
+}
+
+// showDirFor finds the "show" directory for an episode file at dir.
+// Real collections nest files deep:  剧名/Season1/bdrip/[压制组]/xx.mkv
+// So climb from dir toward the library root:
+//   - stop at the deepest "Season xx"-style segment (show = its parent)
+//   - otherwise skip technical dirs (bdrip/webrip/release-group/CDs/Scans…)
+//     and return the first non-technical ancestor
+//   - fall back to the first segment below the library root
+// Returns "" when the file sits directly in the library root (title must
+// come from the filename then).
+func showDirFor(libPath, dir string) string {
+	norm := func(p string) string {
+		p = strings.TrimSuffix(p, "/")
+		return strings.TrimSuffix(p, "\\")
+	}
+	lib := norm(libPath)
+	d := norm(dir)
+	if d == "" || d == "." || d == lib {
+		return ""
+	}
+	segs := strings.Split(strings.TrimPrefix(d, "/"), "/")
+	for i := len(segs) - 1; i >= 1; i-- {
+		if _, ok := ParseSeasonDir(segs[i]); ok {
+			return "/" + strings.Join(segs[:i], "/")
+		}
+	}
+	for i := len(segs) - 1; i >= 1; i-- {
+		if !isTechDir(segs[i]) {
+			return "/" + strings.Join(segs[:i+1], "/")
+		}
+	}
+	return "/" + segs[0]
+}
+
+var reTechDir = regexp.MustCompile(`(?i)(bdrip|web[\.\-_ ]?rip|web[\.\-_ ]?dl|blu[\.\-_ ]?ray|remux|bdmux|\buhd\b|ma10p|hi10p|8bit|10bit|x26[45]|h[\.\-_ ]?26[45]|hevc|\bavc\b|1080[pi]|720p|2160p|4320p|flac|\baac\b)`)
+
+var reJunkDir = regexp.MustCompile(`(?i)^(cds?|sps?|scans?|extras?|specials?|featurettes?|menus?|others?|backup|subs?|subtitles|chapters?|fonts?|ncops?|nceds?|pvs?|cms?|previews?|trailers?|samples?|omake|bonuses?|bonus)$`)
+
+// isTechDir: release-group / quality / junk directories that must not be
+// mistaken for the show title.
+func isTechDir(name string) bool {
+	if reJunkDir.MatchString(name) || reTechDir.MatchString(name) {
+		return true
+	}
+	// release-group style: two or more bracketed groups
+	return len(reBracketGroups.FindAllString(name, -1)) >= 2
 }
 
 func orDefault(s, def string) string {

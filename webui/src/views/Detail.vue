@@ -42,8 +42,20 @@ onMounted(load)
 function play() {
   if (selectedFile.value) router.push(`/play/${selectedFile.value}`)
 }
-function playEpisode(ep) {
-  router.push(`/item/${ep.id}`)
+
+// 点集即播:直接取该集的主文件进入播放页,不再绕道集详情
+async function playEpisode(ep) {
+  try {
+    const d = await api.get(`/api/items/${ep.id}`)
+    const files = (d && d.files) || []
+    if (files.length) {
+      router.push(`/play/${files[0].id}`)
+    } else {
+      error.value = `「${ep.name || '第 ' + ep.episode + ' 集'}」没有关联的视频文件——请对媒体库重新扫描(设置 → 媒体库)。`
+    }
+  } catch (e) {
+    error.value = e.message
+  }
 }
 
 async function refresh() {
@@ -124,7 +136,7 @@ const backTarget = computed(() => {
               <label>版本</label>
               <select v-model="selectedFile">
                 <option v-for="f in data.files" :key="f.id" :value="f.id">
-                  #{{ f.id }} · {{ fmtSize(f.size) }}
+                  {{ f.label || '默认' }} · {{ fmtSize(f.size) }}
                 </option>
               </select>
             </div>

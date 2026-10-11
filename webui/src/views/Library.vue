@@ -9,6 +9,7 @@ const items = ref([])
 const total = ref(0)
 const libraries = ref([])
 const search = ref('')
+const type = ref(String(route.query.type || ''))
 const sort = ref('added')
 const loading = ref(false)
 
@@ -16,7 +17,7 @@ async function load() {
   loading.value = true
   try {
     const q = new URLSearchParams({
-      library_id: libId.value, search: search.value, sort: sort.value, limit: '500',
+      library_id: libId.value, type: type.value, search: search.value, sort: sort.value, limit: '500',
     })
     const r = await api.get(`/api/items?${q}`)
     items.value = r.items
@@ -30,7 +31,7 @@ onMounted(async () => {
   libraries.value = await api.get('/api/libraries')
   await load()
 })
-watch([libId, sort], load)
+watch([libId, sort, type], load)
 let deb
 watch(search, () => { clearTimeout(deb); deb = setTimeout(load, 300) })
 </script>
@@ -41,6 +42,11 @@ watch(search, () => { clearTimeout(deb); deb = setTimeout(load, 300) })
       <h1>{{ libraries.find(l => l.id == libId)?.name || '媒体库' }}</h1>
       <div class="lib-tools">
         <input v-model="search" class="search" placeholder="搜索…" />
+        <select v-model="type" class="sort">
+          <option value="">全部类型</option>
+          <option value="movie">电影</option>
+          <option value="show">剧集</option>
+        </select>
         <select v-model="sort" class="sort">
           <option value="added">最近添加</option>
           <option value="name">名称</option>

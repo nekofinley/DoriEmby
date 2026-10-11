@@ -148,8 +148,10 @@ func (e *Engine) RegisterEmbeddedSubs(file *models.MediaFile, probe *Probe) {
 // start: seconds into the media; length: nominal segment length.
 // videoMode: remux (copy) | transcode (h264). audioMode: copy | aac.
 // audioOrdinal: which audio stream (ordinal among audio streams, -1 = none).
+// videoIndex: absolute ffmpeg stream index of the real video stream
+// (cover-art attachments excluded by the prober); -1 falls back to 0:v:0.
 func (e *Engine) Segment(ctx context.Context, file *models.MediaFile, drv source.Driver,
-	start, length float64, videoMode, audioMode string, audioOrdinal int, transcodeHeight int, out io.Writer) error {
+	start, length float64, videoMode, audioMode string, audioOrdinal, videoIndex, transcodeHeight int, out io.Writer) error {
 
 	target, headers, err := e.ProbeTarget(ctx, file, drv)
 	if err != nil {
@@ -163,14 +165,24 @@ func (e *Engine) Segment(ctx context.Context, file *models.MediaFile, drv source
 	}
 	args = append(args, "-ss", fmt.Sprintf("%.3f", start), "-i", target)
 
-	if audioOrdinal >= 0 {
-		args = append(args, "-map", "0:v:0", "-map", fmt.Sprintf("0:a:%d", audioOrdinal))
+	// Map by absolute index: 0:v:0 would pick an attached cover image when
+	// present, producing garbage/error segments.
+	if videoIndex >= 0 {
+		args = append(args, "-map", fmt.Sprintf("0:%d", videoIndex))
 	} else {
-		args = append(args, "-map", "0:v:0", "-an")
+		args = append(args, "-map", "0:v:0")
+	}
+	if audioOrdinal >= 0 {
+		args = append(args, "-map", fmt.Sprintf("0:a:%d", audioOrdinal))
+	} else {
+		args = append(args, "-an")
 	}
 
 	if videoMode == "transcode" {
 		args = append(args, "-c:v", "libx264", "-preset", "veryfast", "-crf", "21")
+		// 10-bit sources (HEVC Main10 / Hi10P) must be converted to 8-bit
+		// yuv420p — MSE hardware paths cannot handle anything else.
+		args = append(args, "-pix_fmt", "yuv420p")
 		args = append(args, "-vf", fmt.Sprintf("scale=-2:min(ih\\,%d)", transcodeHeight))
 		args = append(args, "-c:a", "aac", "-b:a", "192k", "-ac", "2")
 	} else {

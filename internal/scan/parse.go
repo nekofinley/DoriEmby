@@ -47,11 +47,12 @@ func SkipEntry(name string) bool {
 var (
 	reYear      = regexp.MustCompile(`(?:^|[\s\.\(_\-])((?:19|20)\d{2})(?:[\s\.\)\_\-]|$)`)
 	reSE       = regexp.MustCompile(`(?i)\bs(\d{1,2})[\._ ]?e(\d{1,3})(?:[\._ -]?e(\d{1,3}))?`)
-	reSeasonOnly = regexp.MustCompile(`(?i)^s(\d{1,2})$|season[\._ ]?(\d{1,2})$|第(\d{1,2})季$`)
+	reSeasonOnly = regexp.MustCompile(`(?i)^(?:season|series)[\._ ]?(\d{1,2})|^s(\d{1,2})(?:[\s\._\-]|$)|^第(\d{1,2})[季部]`)
 	reCJKep     = regexp.MustCompile(`第\s*(\d{1,4})\s*[集话話期]`)
 	reEP        = regexp.MustCompile(`(?:^|[\s\._\-\[])(?:EP|E)\.?\s*(\d{1,4})(?:[\s\.\_\-\]]|$)`)
 	reBracketEp = regexp.MustCompile(`[\[【]\s*(\d{1,4}(?:\.\d)?(?:v\d)?)\s*[\]】]`)
 	reDashEp    = regexp.MustCompile(`(?:^|[\s_])-[\s_]*(\d{1,4})(?:[\s_\-\[]|$)`)
+	rePureNum   = regexp.MustCompile(`^(\d{1,4})(?:v\d)?$`)
 	reBracketGroups = regexp.MustCompile(`[\[【]([^\]】]*)[\]】]`)
 )
 
@@ -172,6 +173,12 @@ func ParseName(filename string) Parsed {
 			}
 			return p
 		}
+	}
+
+	// bare number: "01.mkv" / "12v2.mkv" (episode inside a show folder)
+	if m := rePureNum.FindStringSubmatch(base); m != nil {
+		applyNum(&p, m[1])
+		return p // Title left empty — callers fall back to the directory name
 	}
 
 	// movie

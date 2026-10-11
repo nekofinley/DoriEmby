@@ -104,10 +104,18 @@ type Progress struct {
 type ScanState struct {
 	LibraryID int64   `json:"library_id"`
 	Running   bool    `json:"running"`
-	Phase     string  `json:"phase"` // walk | identify | done
+	Phase     string  `json:"phase"` // walk | organize | identify | done | error
 	Total     int     `json:"total"`
 	Done      int     `json:"done"`
 	Current   string  `json:"current"`
 	Error     string  `json:"error,omitempty"`
 	StartedAt float64 `json:"started_at"`
+
+	// walk progress
+	DirsDone   int    `json:"dirs_done"`
+	FilesFound int    `json:"files_found"`
+	WalkErrs   int    `json:"walk_errors,omitempty"`
+	FirstErr   string `json:"first_error,omitempty"`
+
+	FinishedAt float64 `json:"finished_at,omitempty"`
 }

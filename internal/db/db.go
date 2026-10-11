@@ -265,6 +265,27 @@ func (s *Store) LibraryByID(id int64) (*models.Library, error) {
 	return lib, nil
 }
 
+// EnsureBrowseLibrary returns the hidden scratchpad library used by the file
+// browser (one per source). Items played directly from the browser land here.
+func (s *Store) EnsureBrowseLibrary(sourceID int64) (*models.Library, error) {
+	name := fmt.Sprintf("__browse__-%d", sourceID)
+	lib := &models.Library{}
+	err := s.DB.QueryRow(`SELECT id, name, type, source_id, path, providers, created_at
+		FROM libraries WHERE name = ? AND source_id = ?`, name, sourceID).
+		Scan(&lib.ID, &lib.Name, &lib.Type, &lib.SourceID, &lib.Path, &lib.Providers, &lib.CreatedAt)
+	if err == nil {
+		return lib, nil
+	}
+	if err != sql.ErrNoRows {
+		return nil, err
+	}
+	lib = &models.Library{Name: name, Type: "movie", SourceID: sourceID, Path: "/", Providers: "[]"}
+	if err := s.CreateLibrary(lib); err != nil {
+		return nil, err
+	}
+	return lib, nil
+}
+
 func (s *Store) Libraries() ([]models.Library, error) {
 	rows, err := s.DB.Query(`SELECT id, name, type, source_id, path, providers, created_at FROM libraries ORDER BY id`)
 	if err != nil {
@@ -375,14 +396,24 @@ func (s *Store) ItemsByLibrary(libraryID int64, typ string, search string, sort 
 }
 
 func (s *Store) RecentItems(typ string, limit int) ([]models.Item, error) {
+	// exclude the hidden file-browser scratchpad libraries from home rows
 	rows, err := s.DB.Query(`SELECT id, library_id, type, parent_id, name, original_title, year, tmdb_id, overview,
 		poster_path, backdrop_path, still_path, rating, genres, season, episode, air_date, added_at
-		FROM items WHERE type=? ORDER BY added_at DESC LIMIT ?`, typ, limit)
+		FROM items WHERE type=? AND library_id NOT IN (SELECT id FROM libraries WHERE name LIKE '__browse__%')
+		ORDER BY added_at DESC LIMIT ?`, typ, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	return scanItems(rows)
+}
+
+// CountItems totals one item type across all visible libraries (home "查看全部").
+func (s *Store) CountItems(typ string) (int64, error) {
+	var n int64
+	err := s.DB.QueryRow(`SELECT COUNT(*) FROM items
+		WHERE type=? AND library_id NOT IN (SELECT id FROM libraries WHERE name LIKE '__browse__%')`, typ).Scan(&n)
+	return n, err
 }
 
 // ItemsNeedingIdent returns items of given types without tmdb id and without custom names,
@@ -441,6 +472,18 @@ func (s *Store) UpsertFile(f *models.MediaFile) (id int64, err error) {
 func (s *Store) FileByID(id int64) (*models.MediaFile, error) {
 	f := &models.MediaFile{}
 	err := s.DB.QueryRow(`SELECT id, item_id, source_id, path, size, mtime, probe, added_at FROM files WHERE id=?`, id).
+		Scan(&f.ID, &f.ItemID, &f.SourceID, &f.Path, &f.Size, &f.MTime, &f.Probe, &f.AddedAt)
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+// FileByPath finds an existing file row (within one library) by its driver path.
+func (s *Store) FileByPath(libraryID int64, path string) (*models.MediaFile, error) {
+	f := &models.MediaFile{}
+	err := s.DB.QueryRow(`SELECT f.id, f.item_id, f.source_id, f.path, f.size, f.mtime, f.probe, f.added_at
+		FROM files f JOIN items i ON i.id = f.item_id WHERE i.library_id = ? AND f.path = ?`, libraryID, path).
 		Scan(&f.ID, &f.ItemID, &f.SourceID, &f.Path, &f.Size, &f.MTime, &f.Probe, &f.AddedAt)
 	if err != nil {
 		return nil, err

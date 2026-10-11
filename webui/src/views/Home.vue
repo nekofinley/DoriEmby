@@ -1,9 +1,14 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { api, imgUrl } from '../api.js'
 
 const home = ref(null)
 const error = ref('')
+
+const seriesLib = computed(() => (home.value?.libraries || []).find(l => l.type === 'series'))
+const movieLib = computed(() => (home.value?.libraries || []).find(l => l.type === 'movie'))
+const showMore = computed(() => seriesLib.value && (home.value?.show_total || 0) > (home.value?.recent_shows?.length || 0))
+const movieMore = computed(() => movieLib.value && (home.value?.movie_total || 0) > (home.value?.recent_movies?.length || 0))
 
 onMounted(async () => {
   try {
@@ -34,7 +39,10 @@ onMounted(async () => {
       </section>
 
       <section class="row">
-        <h2>最近添加的电影</h2>
+        <div class="row-head">
+          <h2>最近添加的电影</h2>
+          <router-link v-if="movieMore" :to="`/library/${movieLib.id}?type=movie`" class="see-all">全部 {{ home.movie_total }} 部 →</router-link>
+        </div>
         <div v-if="!home.recent_movies.length" class="muted empty-hint">
           还没有电影。到 设置 → 存储源/媒体库 添加并扫描你的网盘目录。
         </div>
@@ -48,7 +56,10 @@ onMounted(async () => {
       </section>
 
       <section class="row">
-        <h2>最近添加的剧集</h2>
+        <div class="row-head">
+          <h2>最近添加的剧集</h2>
+          <router-link v-if="showMore" :to="`/library/${seriesLib.id}?type=show`" class="see-all">全部 {{ home.show_total }} 部 →</router-link>
+        </div>
         <div v-if="!home.recent_shows.length" class="muted empty-hint">还没有剧集。</div>
         <div class="grid">
           <router-link v-for="s in home.recent_shows" :key="s.id" :to="`/item/${s.id}`" class="poster-card">
@@ -65,6 +76,9 @@ onMounted(async () => {
 <style scoped>
 .row { margin-bottom: 34px; }
 .row h2 { margin-bottom: 14px; }
+.row-head { display: flex; align-items: baseline; justify-content: space-between; }
+.see-all { color: var(--accent); font-size: 13px; font-weight: 600; text-decoration: none; }
+.see-all:hover { text-decoration: underline; }
 .hscroll {
   display: flex;
   gap: 14px;

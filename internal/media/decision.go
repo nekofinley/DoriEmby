@@ -47,6 +47,17 @@ type Decision struct {
 	AudioIndex int     `json:"audio_index"`
 	Container  string  `json:"container,omitempty"`
 	Resolution string  `json:"resolution,omitempty"`
+
+	// Alternates are fallback strategies the client may auto-try when the
+	// primary one fails (e.g. native MKV/HEVC unsupported → cloud transcode).
+	Alternates []DecisionAlt `json:"alternates,omitempty"`
+}
+
+// DecisionAlt is one fallback playback strategy.
+type DecisionAlt struct {
+	Mode     string `json:"mode"`
+	URL      string `json:"url"`
+	MimeType string `json:"mime_type,omitempty"`
 }
 
 var (
@@ -120,10 +131,11 @@ func CanDirectPlay(probe *Probe, path string, client ClientKind) (bool, string) 
 			return false, "容器不是 MP4"
 		}
 	case ClientChrome:
-		if ext == ".mkv" {
-			return false, "浏览器 <video> 不支持 MKV 容器"
-		}
-		if !containerMatches(probe.Format.FormatName, true) {
+		// Chromium ≥110 demuxes Matroska in <video> (Edge shipped it even
+		// earlier). Whether the codec inside actually decodes (HEVC needs an
+		// OS/extension decoder) is re-checked client-side — the player falls
+		// back to cloud transcode automatically when it can't.
+		if !containerMatches(probe.Format.FormatName, true) && ext != ".mkv" {
 			return false, "容器不支持直连"
 		}
 	case ClientFirefox:
@@ -135,6 +147,13 @@ func CanDirectPlay(probe *Probe, path string, client ClientKind) (bool, string) 
 	v := probe.Video()
 	var videoOK, audioOK bool
 	var audioFail string
+
+	// 10-bit H.264 (Hi10P) has no consumer hardware decode path — no client
+	// can direct-play it; everything else is gated per client below.
+	if v != nil && v.CodecName == "h264" && strings.Contains(strings.ToLower(v.Profile), "10") {
+		return false, "10bit H.264(Hi10P)无硬件解码,需转码"
+	}
+
 	switch client {
 	case ClientSafari:
 		if v.CodecName == "hevc" {
@@ -184,6 +203,26 @@ func CanDirectPlay(probe *Probe, path string, client ClientKind) (bool, string) 
 		return false, audioFail
 	}
 	return true, ""
+}
+
+// hlsVideoCopyOK reports whether the video stream may be *copied* into the
+// HLS output (mpegts) and still be decoded by this client's playback stack.
+//
+// Safari (AVPlayer native HLS) can decode HEVC in TS. hls.js (Chrome/Edge/
+// Firefox via MSE) cannot demux HEVC from MPEG-TS at all, and Hi10P H.264 is
+// undecodable by consumer hardware paths — both need real transcode to H.264.
+func hlsVideoCopyOK(v *ProbeStream, client ClientKind) bool {
+	if v == nil {
+		return false
+	}
+	switch v.CodecName {
+	case "h264":
+		// "High 10" / "Main 10" profiles are 10-bit — not playable via MSE
+		return !strings.Contains(strings.ToLower(v.Profile), "10")
+	case "hevc":
+		return client == ClientSafari
+	}
+	return false
 }
 
 func firstAudio(p *Probe) *ProbeStream {
@@ -244,13 +283,14 @@ func Decide(probe *Probe, path string, client ClientKind, hasDirect bool, direct
 		return d
 	}
 
-	// audio-only failure but video fine: remux fixes it (video copy + audio aac)
-	if v != nil && (v.CodecName == "h264" || v.CodecName == "hevc") {
+	// Video copy is only possible when the client's HLS stack can actually
+	// decode the copied stream; otherwise fall through to real transcode.
+	if v != nil && hlsVideoCopyOK(v, client) {
 		d.Mode, d.Kind = "remux", "hls"
 		d.Reason = why + " → HLS 转封装(视频流直拷)"
 		return d
 	}
 	d.Mode, d.Kind = "transcode", "hls"
-	d.Reason = why + " → HLS 转码"
+	d.Reason = why + " → HLS 转码(视频转 H.264,音频直拷)"
 	return d
 }

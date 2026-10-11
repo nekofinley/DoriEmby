@@ -84,15 +84,18 @@ func (p *Probe) Duration() float64 {
 }
 
 // IsCoverArt filters mjpeg/png cover attachments inside mkv/mp4.
+// Covers are usually flagged attached_pic=1 by ffprobe, but some muxes skip
+// the flag — treat bare mjpeg/png/bmp/gif video streams as covers regardless.
 func (s *ProbeStream) IsCoverArt() bool {
-	if s.CodecName == "mjpeg" || s.CodecName == "png" || s.CodecName == "bmp" || s.CodecName == "gif" {
-		if s.Disposition != nil {
-			var d map[string]int
-			if err := json.Unmarshal(s.Disposition, &d); err == nil && d["attached_pic"] == 1 {
-				return true
-			}
+	if s.Disposition != nil {
+		var d map[string]int
+		if err := json.Unmarshal(s.Disposition, &d); err == nil && d["attached_pic"] == 1 {
+			return true
 		}
-		return false
+	}
+	switch s.CodecName {
+	case "mjpeg", "png", "bmp", "gif":
+		return true
 	}
 	return false
 }

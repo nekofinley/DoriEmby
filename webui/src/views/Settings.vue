@@ -41,6 +41,55 @@ async function loadAll() {
   }
 }
 
+const editing = ref(null)
+const editForm = ref({})
+
+function startEdit(lib) {
+  editing.value = lib.id
+  let provs = []
+  try { provs = JSON.parse(lib.providers || '[]') } catch {}
+  if (!provs.length) provs = ['nfo', 'tmdb']
+  editForm.value = { name: lib.name, type: lib.type, path: lib.path, providers: provs }
+}
+function toggleProvider(p) {
+  const a = editForm.value.providers
+  const i = a.indexOf(p)
+  i >= 0 ? a.splice(i, 1) : a.push(p)
+}
+async function saveEdit(id) {
+  try {
+    const f = editForm.value
+    await api.put(`/api/libraries/${id}`, {
+      name: f.name, type: f.type, path: f.path || '/', providers: JSON.stringify(f.providers.length ? f.providers : ['nfo', 'tmdb']),
+    })
+    editing.value = null
+    await loadAll()
+    flash('媒体库已更新(改路径后记得重新扫描)')
+  } catch (e) { flash(e.message, true) }
+}
+
+async function stopScan(id) {
+  try { await api.post(`/api/libraries/${id}/scan/stop`) } catch (e) { flash(e.message, true) }
+}
+
+function stFor(id) {
+  return (scanStates.value || []).find(s => s.library_id === id)
+}
+function pct(st) {
+  if (!st || !st.total) return null
+  return Math.min(100, Math.round((st.done / st.total) * 100))
+}
+function phaseText(st) {
+  if (st.phase === 'walk') return `遍历中 · ${st.dirs_done || 0} 目录 / ${st.files_found || 0} 文件${st.walk_errors ? ' · ' + st.walk_errors + ' 失败' : ''}`
+  if (st.phase === 'organize') return `整理 ${st.done}/${st.total}`
+  if (st.phase === 'identify') return `识别刮削 ${st.done}/${st.total}`
+  return st.phase
+}
+function fmtClock(ts) {
+  if (!ts) return ''
+  return new Date(ts * 1000).toLocaleTimeString('zh-CN', { hour12: false })
+}
+
 onMounted(async () => {
   await loadAll()
   pollTimer = setInterval(async () => {
@@ -219,18 +268,64 @@ async function saveConfig() {
         <button class="btn primary" @click="addLibrary" :disabled="!libForm.source_id || !libForm.name">创建媒体库</button>
       </div>
 
-      <div v-for="lib in libraries" :key="lib.id" class="card row-item">
-        <div>
-          <div class="ri-name">{{ lib.name }} <span class="badge">{{ lib.type === 'movie' ? '电影' : '剧集' }}</span></div>
-          <div class="tiny">源 #{{ lib.source_id }} · 路径 {{ lib.path }} · 刮削 {{ lib.providers }}</div>
-        </div>
-        <div class="spacer"></div>
-        <span v-if="stateOf(lib.id) && stateOf(lib.id).running" class="tiny scanning">
-          {{ stateOf(lib.id).phase }} {{ stateOf(lib.id).done }}/{{ stateOf(lib.id).total }}
-        </span>
-        <span v-else-if="stateOf(lib.id)" class="tiny">{{ stateOf(lib.id).phase }}</span>
-        <button class="btn" @click="scanLibrary(lib.id)">扫描</button>
-        <button class="btn danger" @click="delLibrary(lib.id)">删除</button>
+      <div v-for="lib in libraries" :key="lib.id" class="card lib-card">
+        <!-- edit mode -->
+        <template v-if="editing === lib.id">
+          <div class="form-grid">
+            <div class="field"><label>名称</label><input v-model="editForm.name" /></div>
+            <div class="field">
+              <label>类型</label>
+              <select v-model="editForm.type">
+                <option value="movie">电影</option>
+                <option value="series">剧集</option>
+              </select>
+            </div>
+            <div class="field"><label>路径(源内路径)</label><input v-model="editForm.path" placeholder="/movies" /></div>
+          </div>
+          <div class="field">
+            <label>刮削来源(按优先级)</label>
+            <div class="type-picker">
+              <button class="chip" :class="{ on: editForm.providers.includes('nfo') }" @click="toggleProvider('nfo')">本地 nfo/海报</button>
+              <button class="chip" :class="{ on: editForm.providers.includes('tmdb') }" @click="toggleProvider('tmdb')">TMDB</button>
+            </div>
+          </div>
+          <div class="btn-row">
+            <button class="btn primary" @click="saveEdit(lib.id)">保存</button>
+            <button class="btn" @click="editing = null">取消</button>
+          </div>
+        </template>
+
+        <!-- display mode -->
+        <template v-else>
+          <div class="lib-line1">
+            <div>
+              <div class="ri-name">{{ lib.name }} <span class="badge">{{ lib.type === 'movie' ? '电影' : '剧集' }}</span></div>
+              <div class="tiny">源 #{{ lib.source_id }} · 路径 {{ lib.path }} · 刮削 {{ lib.providers }}</div>
+            </div>
+            <div class="spacer"></div>
+            <button v-if="stFor(lib.id) && stFor(lib.id).running" class="btn" @click="stopScan(lib.id)">停止</button>
+            <button v-else class="btn" @click="scanLibrary(lib.id)">扫描</button>
+            <button class="btn" @click="startEdit(lib)">编辑</button>
+            <button class="btn danger" @click="delLibrary(lib.id)">删除</button>
+          </div>
+
+          <div v-if="stFor(lib.id) && stFor(lib.id).running" class="scan-live">
+            <div class="scan-bar" :class="{ indet: pct(stFor(lib.id)) === null }">
+              <i :style="pct(stFor(lib.id)) !== null ? { width: pct(stFor(lib.id)) + '%' } : {}"></i>
+            </div>
+            <div class="scan-line tiny">
+              <span class="scan-phase">{{ phaseText(stFor(lib.id)) }}</span>
+              <span v-if="stFor(lib.id).current" class="scan-cur">{{ stFor(lib.id).current }}</span>
+            </div>
+          </div>
+          <div v-else-if="stFor(lib.id) && stFor(lib.id).phase === 'done'" class="tiny scan-done">
+            ✓ 上次扫描完成:{{ stFor(lib.id).total }} 个文件 · {{ fmtClock(stFor(lib.id).finished_at) }}
+            <span v-if="stFor(lib.id).error" class="scan-warn"> · {{ stFor(lib.id).error }}</span>
+          </div>
+          <div v-else-if="stFor(lib.id) && stFor(lib.id).phase === 'error'" class="scan-err">
+            ✗ 扫描失败:{{ stFor(lib.id).error || stFor(lib.id).first_error || '未知错误' }}
+          </div>
+        </template>
       </div>
     </section>
 
@@ -240,8 +335,9 @@ async function saveConfig() {
         <h2>TMDB 刮削</h2>
         <div class="form-grid">
           <div class="field">
-            <label>API Key (v3)</label>
-            <input v-model="cfg.tmdb.api_key" placeholder="在 themoviedb.org 免费申请" />
+            <label>API Key</label>
+            <input v-model="cfg.tmdb.api_key" placeholder="API 密钥(v3)或 API 读访问令牌(v4)均可" />
+            <span class="hint">设置→刮削与播放 里保存后立即生效,无需重启;国内网络可把下面两个地址换成镜像。</span>
           </div>
           <div class="field"><label>语言</label><input v-model="cfg.tmdb.language" placeholder="zh-CN" /></div>
           <div class="field">
@@ -333,6 +429,21 @@ async function saveConfig() {
 .ri-name { font-weight: 600; margin-bottom: 3px; }
 .spacer { flex: 1; }
 .scanning { color: var(--accent); }
+.lib-card { padding: 14px 18px; margin-bottom: 12px; }
+.lib-line1 { display: flex; align-items: center; gap: 10px; }
+.lib-line1 .spacer { flex: 1; }
+.scan-live { margin-top: 12px; }
+.scan-bar { height: 5px; background: var(--bg-3); border-radius: 4px; overflow: hidden; }
+.scan-bar i { display: block; height: 100%; background: var(--accent); transition: width 0.4s; }
+.scan-bar.indet i { width: 30%; animation: scanIndet 1.3s ease-in-out infinite; }
+@keyframes scanIndet { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }
+.scan-line { margin-top: 7px; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+.scan-phase { color: var(--accent); font-weight: 600; }
+.scan-cur { color: var(--text-4); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 62%; direction: rtl; text-align: left; }
+.scan-warn { color: var(--warn); }
+.scan-done { margin-top: 9px; color: var(--text-3); }
+.scan-err { margin-top: 9px; color: var(--danger); font-weight: 600; }
+.btn-row { display: flex; gap: 10px; }
 .flash {
   border-radius: var(--radius-s);
   padding: 10px 14px;

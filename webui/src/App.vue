@@ -29,6 +29,7 @@ async function logout() {
       </router-link>
       <nav class="nav">
         <router-link to="/">首页</router-link>
+        <router-link to="/browse">文件</router-link>
       </nav>
       <div class="spacer"></div>
       <router-link v-if="isAdmin" to="/settings" class="btn ghost">设置</router-link>

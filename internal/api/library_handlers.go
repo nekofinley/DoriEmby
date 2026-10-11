@@ -156,10 +156,17 @@ func (s *Server) handleListLibraries(w http.ResponseWriter, r *http.Request, use
 		fail(w, 500, err.Error())
 		return
 	}
-	if libs == nil {
-		libs = []models.Library{}
+	// hide the file-browser scratchpad libraries
+	visible := libs[:0]
+	for _, lib := range libs {
+		if !strings.HasPrefix(lib.Name, "__browse__") {
+			visible = append(visible, lib)
+		}
 	}
-	writeJSON(w, 200, libs)
+	if visible == nil {
+		visible = []models.Library{}
+	}
+	writeJSON(w, 200, visible)
 }
 
 func (s *Server) handleCreateLibrary(w http.ResponseWriter, r *http.Request, user *models.User) {
@@ -237,6 +244,12 @@ func (s *Server) handleScanLibrary(w http.ResponseWriter, r *http.Request, user 
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
+func (s *Server) handleStopScan(w http.ResponseWriter, r *http.Request, user *models.User) {
+	id, _ := pathID(r)
+	stopped := s.Scanner.Cancel(id)
+	writeJSON(w, 200, map[string]bool{"ok": true, "stopped": stopped})
+}
+
 func (s *Server) handleScanStatus(w http.ResponseWriter, r *http.Request, user *models.User) {
 	writeJSON(w, 200, s.Scanner.AllStates())
 }
@@ -294,6 +307,7 @@ func (s *Server) handleItemDetail(w http.ResponseWriter, r *http.Request, user *
 		for _, f := range files {
 			dto := map[string]any{
 				"id": f.ID, "size": f.Size, "mtime": f.MTime, "path": f.Path,
+				"label": VersionLabel(f.Path),
 			}
 			if f.Probe != "" {
 				if sum := probeSummary(f.Probe); sum != nil {
@@ -371,6 +385,12 @@ func (s *Server) handleHome(w http.ResponseWriter, r *http.Request, user *models
 		recentShows = []models.Item{}
 	}
 	resp["recent_shows"] = recentShows
+	if n, err := s.Store.CountItems("movie"); err == nil {
+		resp["movie_total"] = n
+	}
+	if n, err := s.Store.CountItems("show"); err == nil {
+		resp["show_total"] = n
+	}
 	libs, _ := s.Store.Libraries()
 	resp["libraries"] = libs
 	writeJSON(w, 200, resp)

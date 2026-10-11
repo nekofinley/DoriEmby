@@ -193,6 +193,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/libraries/{id}", s.requireAdmin(s.handleUpdateLibrary))
 	mux.HandleFunc("DELETE /api/libraries/{id}", s.requireAdmin(s.handleDeleteLibrary))
 	mux.HandleFunc("POST /api/libraries/{id}/scan", s.requireAdmin(s.handleScanLibrary))
+	mux.HandleFunc("POST /api/libraries/{id}/scan/stop", s.requireAdmin(s.handleStopScan))
 	mux.HandleFunc("GET /api/scan/status", s.requireAuth(s.handleScanStatus))
 
 	// items
@@ -204,6 +205,8 @@ func (s *Server) Handler() http.Handler {
 
 	// playback
 	mux.HandleFunc("GET /api/play/{id}", s.requireAuth(s.handlePlay))
+	mux.HandleFunc("GET /api/browse/{id}", s.requireAuth(s.handleBrowse))
+	mux.HandleFunc("GET /api/browseplay/{id}", s.requireAuth(s.handleBrowsePlay))
 	mux.HandleFunc("GET /api/stream/{id}", s.allowPlayerAuth(s.handleStream))
 	mux.HandleFunc("HEAD /api/stream/{id}", s.allowPlayerAuth(s.handleStream))
 	mux.HandleFunc("GET /api/hls/{id}/{rest...}", s.allowPlayerAuth(s.handleHLS))

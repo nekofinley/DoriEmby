@@ -44,6 +44,10 @@ scripts\build.ps1              # 构建前端 + 嵌入,产出 doriya.exe
 3. 点该媒体库的 **扫描**,等状态变为 `done`;
 4. 首页出现海报,点进详情 → 播放。用 iPhone Safari 打开同一个地址即可直接播放。
 
+**不想刮削/不想整理结构?** 直接用顶部导航的 **「文件」**:浏览任意存储源的目录,点视频就播
+(同样经过决策引擎:该 302 直连就 302,iOS 播不了的自动转封装,并支持断点续播)。
+也可以只建库不填 TMDB key —— 扫描后照样能播,只是没有海报和简介。
+
 环境变量:`DORIYA_LOCAL=1` 只监听 127.0.0.1。
 
 ## 接入 OpenList(天翼云盘)
@@ -82,10 +86,19 @@ WebDAV 源的直链通常需要鉴权头,浏览器拿不到,所以 Doriya 对 We
 | 端点 | 说明 |
 | --- | --- |
 | `GET /api/play/{fileId}?client=ios&force=auto` | 返回播放决策(模式、URL、字幕、音轨) |
+| `GET /api/browse/{sourceId}?path=/` | 文件浏览器:列出存储源目录(免建库免扫描) |
+| `GET /api/browseplay/{sourceId}?path=...` | 浏览器里点开即播(注册到隐藏库,完整走决策管线) |
+| `PUT /api/libraries/{id}` | 编辑媒体库(改名/类型/**路径**/刮削源) |
+| `POST /api/libraries/{id}/scan` | 触发扫描;`GET /api/scan/status` 实时返回阶段/目录/文件数/错误 |
+| `POST /api/libraries/{id}/scan/stop` | 中止正在进行的扫描 |
 | `GET /api/stream/{fileId}` | 302 直连或 Range 代理(带签名) |
 | `GET /api/hls/{fileId}/index.m3u8` | 按需生成的 HLS(VOD 播放列表 + 每片段实时 ffmpeg) |
 | `GET /api/subs/{fileId}/{subId}.vtt` | 外挂/内嵌字幕转 WebVTT |
 | `GET /api/img/{itemId}/{poster\|backdrop\|still}` | 海报/背景图 |
+
+扫描全程可见:遍历阶段实时显示"目录数/文件数/当前路径",整理阶段按文件计数,
+识别刮削阶段按条目计数;读取失败的目录会计数并给出首个错误;扫描完成后保留
+"上次结果",失败会以红色展示原因(如 OpenList 路径不存在 `object not found`)。
 
 HLS 分片是**按需生成**的(每个片段请求时现场 `ffmpeg -ss`,转封装直拷),不写临时文件、
 不预转整部片,seek 到哪生成到哪。播放 URL 都带 HMAC 签名,播放器无需带 Cookie。
@@ -97,6 +110,7 @@ webui\        Vue3 + Vite 前端(pnpm dev 热更新,代理 /api → 5666)
 cmd\doriya\   服务端入口
 cmd\mockopenlist\  OpenList v3 API 的本地 mock(测试 302 链路用)
 scripts\e2e-test.ps1   端到端冒烟测试(先启动 doriya + mockopenlist + testdata)
+scripts\browse-live-test.ps1   对真实 OpenList 跑浏览→决策→302/转封装链路
 testdata\     ffmpeg 生成的测试片源(h264/hvc1/hev1/mkv-eac3/剧集+字幕)
 ```
 

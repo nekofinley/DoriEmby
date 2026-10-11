@@ -14,6 +14,7 @@ import (
 	"doriya/internal/metadata"
 	"doriya/internal/models"
 	"doriya/internal/scan"
+	"doriya/internal/source"
 	"doriya/internal/web"
 )
 
@@ -43,8 +44,9 @@ func main() {
 	scanner := &scan.Scanner{
 		Store: store,
 		Cfg:   cfg,
-		OnIdentify: func(lib *models.Library) {
-			manager.EnrichLibrary(lib)
+		OnIdentify: func(lib *models.Library, listings map[string][]source.Entry, report func(done, total int, msg string)) {
+			manager.SeedListings(listings)
+			manager.EnrichLibrary(lib, report)
 		},
 	}
 
