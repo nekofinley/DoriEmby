@@ -1,5 +1,8 @@
 name: CI
 
+# 注意：这里用的 action 跑在 Node 24 上，要求 runner >= v2.327.1。
+# GitHub 托管的 ubuntu-latest 已满足；自建 runner 需要先升级。
+
 on:
   push:
     branches: [main]
@@ -18,9 +21,9 @@ jobs:
     name: 构建与测试
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true

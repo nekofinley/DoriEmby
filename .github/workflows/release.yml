@@ -2,6 +2,9 @@ name: Release
 
 # 打 tag（v*）自动构建并发布；也可以在 Actions 页面手动触发。
 # 手动触发时留空 tag 表示只构建、不发布。
+#
+# 注意：这里用的 action 都跑在 Node 24 上，要求 runner >= v2.327.1。
+# GitHub 托管的 ubuntu-latest 已满足；自建 runner 需要先升级。
 
 on:
   push:
@@ -74,22 +77,22 @@ jobs:
           - { name: linux_armv7,   goos: linux,   goarch: arm,   goarm: '7', archive: tar.gz }
           - { name: windows_amd64, goos: windows, goarch: amd64, archive: zip }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
 
       # 顺序不能反：setup-node 的 cache: pnpm 需要 pnpm 先存在
       - name: Set up pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           version: 9
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
@@ -154,7 +157,7 @@ jobs:
 
           ls -lh dist/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}
           path: dist/*
@@ -171,7 +174,7 @@ jobs:
       TAG: ${{ needs.prepare.outputs.tag }}
       TARGET: ${{ needs.prepare.outputs.target }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
