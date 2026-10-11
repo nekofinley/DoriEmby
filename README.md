@@ -54,6 +54,79 @@ scripts\build.ps1              # 构建前端 + 嵌入,产出 doriyamedia.exe
 
 环境变量:`DORIYAMEDIA_LOCAL=1` 只监听 127.0.0.1。
 
+## 部署到 Linux(Debian / Ubuntu)
+
+不想在服务器上装 Go 和 Node?直接下预编译包 —— 纯静态、无 CGO 依赖,Release 由
+GitHub Actions 自动构建:
+
+| 平台 | 架构 |
+| --- | --- |
+| linux | amd64 / arm64 / armv7 |
+| windows | amd64 |
+
+一键安装(Debian 12/13、Ubuntu 22.04/24.04 及衍生版):
+
+```
+curl -fsSL https://raw.githubusercontent.com/nekofinley/DoriyaMedia/main/scripts/install.sh | sudo bash
+```
+
+脚本会依次:安装 ffmpeg → 创建系统用户和数据目录 `/var/lib/doriyamedia` → 生成 `config.json`
+→ 注册 systemd 服务并启动。升级就再跑一次同样命令(会自动覆盖二进制并重启)。
+
+常用选项:
+
+```
+# 指定版本
+curl -fsSL https://raw.githubusercontent.com/nekofinley/DoriyaMedia/main/scripts/install.sh \
+  | sudo bash -s -- --version v0.1.0
+# 换端口 / 数据目录 / 运行用户
+sudo bash install.sh --port 8080 --data-dir /srv/doriyamedia --user media
+# 国内下载慢,套一层镜像前缀
+sudo bash install.sh --base-url https://ghfast.top/https://github.com
+# 只装不启动
+sudo bash install.sh --no-start
+# 卸载(--purge 连数据目录一起删)
+sudo bash install.sh --uninstall
+```
+
+装完的日常操作:
+
+```
+systemctl status doriyamedia
+systemctl restart doriyamedia
+journalctl -u doriyamedia -f        # 看日志
+doriyamedia -version                # 看当前版本
+```
+
+也可以在服务器上自己编译(需要 Go 1.26+,`go.mod` 里写的就是 1.26.0;
+前端产物 `internal/web/dist` 已随仓库提交,所以**不需要 Node**):
+
+```
+CGO_ENABLED=0 go build -ldflags "-s -w" -o doriyamedia ./cmd/doriyamedia
+./doriyamedia                       # 前台运行,数据落在 ./data
+```
+
+> Linux 上的几个注意点:
+> - `data/` 和 `config.json` 都相对**当前工作目录**,systemd 单元里已经设好了 `WorkingDirectory`;
+>   手动跑的话记得在自己想要的目录里启动,否则数据会落在奇怪的地方;
+> - ffmpeg / ffprobe 按 PATH 查找,也可以在配置里改成绝对路径;
+> - **代理默认值是 Windows 上的本地代理**:Bangumi 的 `use_proxy` 默认 `true` 且指向
+>   `socks5://127.0.0.1:7890`,在服务器上必然超时 —— 安装脚本会预置成直连。TMDB 默认直连。
+>   国内网络两者都需要在 设置 → 刮削与播放 里勾选代理并填自己的地址;
+> - 端口 5666 是非特权端口,服务以专用用户 `doriyamedia` 运行,不需要 root。
+
+## 发布新版本
+
+打 tag 即自动构建并发布 Release:
+
+```
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` 会:构建前端 → 交叉编译 4 个平台 → 打包 `tar.gz`/`zip`
+→ 生成 `SHA256SUMS` → 创建 Release。版本号通过 `-ldflags "-X main.version=<tag>"` 注入。
+`ci.yml` 在推送到 main 和 PR 时跑 `go vet` / `go test` / 编译校验。
+
 ## 接入 OpenList(天翼云盘)
 
 1. 部署 [OpenList](https://github.com/OpenListTeam/OpenList),添加 **天翼云盘** 存储并填入账号

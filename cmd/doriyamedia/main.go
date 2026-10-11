@@ -18,10 +18,21 @@ import (
 	"doriyamedia/internal/web"
 )
 
+// version 由构建时注入：
+//
+//	go build -ldflags "-X main.version=v1.2.3" ./cmd/doriyamedia
+var version = "dev"
+
 func main() {
 	cfgPath := flag.String("config", "config.json", "config file path")
 	port := flag.Int("port", 0, "override listen port")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("doriyamedia " + version)
+		return
+	}
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
@@ -58,7 +69,7 @@ func main() {
 		addr = fmt.Sprintf("127.0.0.1:%d", cfg.Port) // 仅本机访问
 	}
 	log.Printf("===========================================")
-	log.Printf("  DoriyaMedia v0.1.0  →  http://%s", addr)
+	log.Printf("  DoriyaMedia %s  →  http://%s", version, addr)
 	log.Printf("  首次使用请先打开网页完成管理员初始化")
 	log.Printf("===========================================")
 	httpServer := &http.Server{Addr: addr, Handler: srv.Handler()}

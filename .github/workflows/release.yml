@@ -1,0 +1,200 @@
+name: Release
+
+# 打 tag（v*）自动构建并发布；也可以在 Actions 页面手动触发。
+# 手动触发时留空 tag 表示只构建、不发布。
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（例如 v0.1.0）。留空则只构建产物、不创建 Release'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: 解析版本
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      publish: ${{ steps.resolve.outputs.publish }}
+      target: ${{ steps.resolve.outputs.target }}
+    steps:
+      - name: Resolve tag
+        id: resolve
+        shell: bash
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          tag=""
+          publish="false"
+          target=""
+
+          if [ "$REF_TYPE" = "tag" ]; then
+            tag="$REF_NAME"
+            publish="true"
+          elif [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+            publish="true"
+            target="$SHA"
+          fi
+
+          if [ -n "$tag" ]; then
+            echo "版本: $tag（发布=$publish）"
+          else
+            echo "未指定版本，仅构建产物，不发布 Release"
+          fi
+
+          {
+            echo "tag=$tag"
+            echo "publish=$publish"
+            echo "target=$target"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: 构建 ${{ matrix.name }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux_amd64,   goos: linux,   goarch: amd64, archive: tar.gz }
+          - { name: linux_arm64,   goos: linux,   goarch: arm64, archive: tar.gz }
+          - { name: linux_armv7,   goos: linux,   goarch: arm,   goarm: '7', archive: tar.gz }
+          - { name: windows_amd64, goos: windows, goarch: amd64, archive: zip }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # 顺序不能反：setup-node 的 cache: pnpm 需要 pnpm 先存在
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: webui/pnpm-lock.yaml
+
+      # 前端产物会被 go:embed 打进二进制，所以必须先构建，
+      # 否则发布出去的 UI 是仓库里那份可能过期的 dist。
+      - name: Build web UI
+        working-directory: webui
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      - name: Build
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: '0'
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ext=""
+          [ "$GOOS" = "windows" ] && ext=".exe"
+          ver="${TAG:-dev}"
+
+          # 纯静态、无 CGO，可直接交叉编译
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${ver}" \
+            -o "build/doriyamedia${ext}" ./cmd/doriyamedia
+
+          # 只有和 runner 同架构时才真的能跑起来自检
+          if [ "$GOOS" = "linux" ] && [ "$GOARCH" = "amd64" ]; then
+            ./build/doriyamedia -version
+          fi
+
+      - name: Package
+        shell: bash
+        env:
+          NAME: ${{ matrix.name }}
+          ARCHIVE: ${{ matrix.archive }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ver="${TAG:-dev}"
+          base="doriyamedia_${ver}_${NAME}"
+          stage="pkg/${base}"
+          mkdir -p "$stage" dist
+
+          bin="build/doriyamedia"
+          [ -f "build/doriyamedia.exe" ] && bin="build/doriyamedia.exe"
+          cp "$bin" "$stage/"
+          cp README.md "$stage/"
+
+          if [ "$ARCHIVE" = "zip" ]; then
+            (cd pkg && zip -qr "../dist/${base}.zip" "$base")
+          else
+            tar -czf "dist/${base}.tar.gz" -C pkg "$base"
+          fi
+
+          ls -lh dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: 发布 Release
+    needs: [prepare, build]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      TARGET: ${{ needs.prepare.outputs.target }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum ./* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，覆盖上传产物"
+            gh release upload "$TAG" ./dist/* --clobber
+          else
+            args=(--title "$TAG" --generate-notes)
+            if [ -n "$TARGET" ]; then
+              args+=(--target "$TARGET")
+            fi
+            gh release create "$TAG" ./dist/* "${args[@]}"
+          fi
+          gh release view "$TAG" --json url,assets \
+            --jq '"\(.url)\n" + ([.assets[].name] | join("\n"))'
