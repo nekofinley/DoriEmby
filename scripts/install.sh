@@ -9,11 +9,14 @@
 # 想固定某个源就加：
 #   sudo bash install.sh --base-url https://ghfast.top
 #
+# 装好后会同时安装 dm 管理命令（类似宝塔的 bt）：dm 进菜单，dm update 更新。
+#
 set -euo pipefail
 
 REPO="nekofinley/DoriyaMedia"
 SERVICE="doriyamedia"
 BIN_PATH="/usr/local/bin/${SERVICE}"
+DM_PATH="/usr/local/bin/dm"
 DATA_DIR="/var/lib/doriyamedia"
 CONFIG_PATH="${DATA_DIR}/config.json"
 UNIT_PATH="/etc/systemd/system/${SERVICE}.service"
@@ -75,6 +78,8 @@ ${C_B}DoriyaMedia 安装脚本${C_R}
   DORIYAMEDIA_GITHUB_BASE  同 --base-url
   DORIYAMEDIA_API_BASE     覆盖 GitHub API 地址
   NO_COLOR=1               关闭彩色输出
+
+装好后在任意终端输入 ${C_B}dm${C_R} 即可进入管理菜单（更新/启停/日志/卸载）。
 EOF
 }
 
@@ -230,7 +235,8 @@ uninstall() {
   if [ "$HAVE_SYSTEMD" -eq 1 ]; then
     systemctl daemon-reload || true
   fi
-  rm -f "$BIN_PATH"
+  rm -f "$BIN_PATH" "$DM_PATH"
+  rm -rf /etc/doriyamedia
   ok "已移除服务与二进制"
 
   if [ "$PURGE" -eq 1 ]; then
@@ -330,10 +336,394 @@ install_ffmpeg() {
 # ---------------------------------------------------------------- 安装文件
 
 log "安装二进制到 ${BIN_PATH}"
-install -m 0755 "$src_bin" "$BIN_PATH"
+# 先写临时文件再原子替换：直接覆盖正在运行的二进制会报 Text file busy
+install -m 0755 "$src_bin" "${BIN_PATH}.new"
+mv -f "${BIN_PATH}.new" "$BIN_PATH"
 
 cur="$("$BIN_PATH" -version 2>/dev/null || echo 'doriyamedia ?')"
 ok "已安装: ${cur}"
+
+# ---------------------------------------------------------------- dm 管理命令
+
+# 生成 dm（类似宝塔的 bt）：菜单 + update/check/status/log/uninstall。
+# dm.env 记录本次安装的实际路径，dm update 时原样传回，避免自定义
+# --data-dir/--user 的机器更新后指向默认路径。
+write_dm() {
+  local no_ffmpeg=0
+  if [ "$INSTALL_FFMPEG" -eq 0 ]; then no_ffmpeg=1; fi
+
+  mkdir -p /etc/doriyamedia
+  cat > /etc/doriyamedia/dm.env <<DORIYA_DM_ENV
+# 由 install.sh 生成，供 dm 命令读取；删除后 dm 会退回默认路径
+DATA_DIR="${DATA_DIR}"
+SERVICE_USER="${SERVICE_USER}"
+NO_FFMPEG=${no_ffmpeg}
+DORIYA_DM_ENV
+
+  cat > "${DM_PATH}.new" <<'DORIYA_DM_SCRIPT'
+#!/usr/bin/env bash
+#
+# DoriyaMedia 管理命令（由 install.sh 生成，卸载时一并移除）
+#
+#   dm               进入管理菜单
+#   dm update        更新到最新版；dm update v0.2.1 更新到指定版本
+#   dm check         只检查有没有新版本
+#   dm status        服务状态    dm start / stop / restart  启停
+#   dm log           跟随日志    dm version   已装版本
+#   dm uninstall     卸载（保留数据）    dm purge   卸载并删数据
+#
+set -u
+
+SERVICE="doriyamedia"
+REPO="nekofinley/DoriyaMedia"
+BIN_PATH="/usr/local/bin/doriyamedia"
+DATA_DIR="/var/lib/doriyamedia"
+SERVICE_USER="doriyamedia"
+NO_FFMPEG=0
+
+ENV_FILE="/etc/doriyamedia/dm.env"
+if [ -f "$ENV_FILE" ]; then
+  . "$ENV_FILE"
+fi
+CONFIG_PATH="${DATA_DIR}/config.json"
+UNIT_PATH="/etc/systemd/system/${SERVICE}.service"
+
+GH="https://github.com"
+RAW="https://raw.githubusercontent.com"
+API="https://api.github.com"
+PREFIXES=("" "https://ghfast.top" "https://ghproxy.net" "https://gh-proxy.com")
+
+if [ -t 1 ] && [ "${NO_COLOR:-}" = "" ]; then
+  C_R=$'\033[0m'; C_B=$'\033[1m'; C_G=$'\033[32m'; C_Y=$'\033[33m'; C_E=$'\033[31m'; C_C=$'\033[36m'
+else
+  C_R=""; C_B=""; C_G=""; C_Y=""; C_E=""; C_C=""
+fi
+log()  { printf '%s==>%s %s\n' "$C_C$C_B" "$C_R" "$*"; }
+ok()   { printf '%s  ✓%s %s\n' "$C_G" "$C_R" "$*"; }
+warn() { printf '%s  !%s %s\n' "$C_Y" "$C_R" "$*" >&2; }
+die()  { printf '%s  错误:%s %s\n' "$C_E$C_B" "$C_R" "$*" >&2; exit 1; }
+
+HAVE_SYSTEMD=0
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+  HAVE_SYSTEMD=1
+fi
+
+installed_version() {
+  [ -x "$BIN_PATH" ] || return 0
+  "$BIN_PATH" -version 2>/dev/null | awk '{print $2}'
+}
+
+svc_state() {
+  if [ "$HAVE_SYSTEMD" -eq 1 ]; then
+    if systemctl is-active --quiet "$SERVICE" 2>/dev/null; then echo "running"; else echo "inactive"; fi
+  elif pgrep -x "$SERVICE" >/dev/null 2>&1; then
+    echo "running"
+  else
+    echo "stopped"
+  fi
+}
+
+config_port() {
+  grep -o '"port"[[:space:]]*:[[:space:]]*[0-9][0-9]*' "$CONFIG_PATH" 2>/dev/null \
+    | grep -o '[0-9][0-9]*$' | head -n1
+}
+
+# $1=url  $2=目标文件（留空则打到 stdout）
+http_get() {
+  if command -v curl >/dev/null 2>&1; then
+    if [ -n "$2" ]; then
+      curl -fsSL --retry 1 --connect-timeout 8 --max-time 300 "$1" -o "$2"
+    else
+      curl -fsSL --retry 2 --connect-timeout 10 --max-time 30 "$1"
+    fi
+  elif [ -n "$2" ]; then
+    wget -q --tries=2 --timeout=15 -O "$2" "$1"
+  else
+    wget -qO- --tries=2 --timeout=15 "$1"
+  fi
+}
+
+join_prefix() {
+  if [ -n "$1" ]; then printf '%s/%s' "${1%/}" "$2"; else printf '%s' "$2"; fi
+}
+
+latest_version() {
+  local p json tag url
+  for p in "${PREFIXES[@]}"; do
+    json="$(http_get "$(join_prefix "$p" "$API")/repos/$REPO/releases/latest" "" 2>/dev/null || true)"
+    tag="$(printf '%s' "$json" \
+      | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' \
+      | head -n1 | sed 's/.*"\([^"]*\)"$/\1/' || true)"
+    if [ -z "$tag" ] && command -v curl >/dev/null 2>&1; then
+      url="$(curl -sSL -o /dev/null -w '%{url_effective}' --max-time 25 \
+        "$(join_prefix "$p" "$GH/$REPO/releases/latest")" 2>/dev/null || true)"
+      case "$url" in *"/tag/"*) tag="${url##*/tag/}" ;; esac
+    fi
+    case "$tag" in
+      v[0-9]*) printf '%s' "$tag"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+fetch_installer() {  # $1 = 目标文件
+  local p
+  for p in "${PREFIXES[@]}"; do
+    if http_get "$(join_prefix "$p" "$RAW")/$REPO/main/scripts/install.sh" "$1" 2>/dev/null \
+       && [ -s "$1" ]; then
+      return 0
+    fi
+    rm -f "$1"
+  done
+  return 1
+}
+
+cmd_check() {
+  local cur latest
+  cur="$(installed_version)"
+  [ -n "$cur" ] || die "没找到已安装的 $SERVICE"
+  log "当前版本 ${cur}，查询最新版..."
+  latest="$(latest_version || true)"
+  if [ -z "$latest" ]; then
+    warn "查询失败：官方和镜像都不通，稍后再试"
+    return 1
+  fi
+  if [ "$latest" = "$cur" ]; then
+    ok "已是最新版 ${cur}"
+  else
+    printf '  有新版本: %s%s%s   （dm update 更新）\n' "$C_G$C_B" "$latest" "$C_R"
+  fi
+}
+
+cmd_update() {
+  local want="${1:-}" cur latest
+  cur="$(installed_version)"
+  [ -n "$cur" ] || die "没找到已安装的 $SERVICE（先跑安装脚本）"
+  if [ -z "$want" ]; then
+    log "查询最新版本"
+    latest="$(latest_version || true)"
+    if [ -z "$latest" ]; then
+      warn "查询失败：官方和镜像都不通。稍后再试，或 dm update <tag> 指定版本"
+      return 1
+    fi
+    if [ "$latest" = "$cur" ]; then
+      ok "已是最新版 ${cur}"
+      return 0
+    fi
+    want="$latest"
+  fi
+  log "更新: ${cur} → ${want}"
+  # 注意用全局 DM_TMP：EXIT trap 在函数返回后触发，局部变量已出栈
+  DM_TMP="$(mktemp -d)"
+  trap 'rm -rf "$DM_TMP"' EXIT
+  fetch_installer "$DM_TMP/install.sh" || { warn "下载安装脚本失败：官方和镜像都不通"; return 1; }
+  local args=(--version "$want" --data-dir "$DATA_DIR" --user "$SERVICE_USER")
+  if [ "$NO_FFMPEG" -eq 1 ]; then
+    args+=(--no-ffmpeg)
+  fi
+  if ! bash "$DM_TMP/install.sh" "${args[@]}"; then
+    rm -rf "$DM_TMP"
+    die "更新失败，旧版本未受影响（二进制是原子替换，服务配置也没动）"
+  fi
+  rm -rf "$DM_TMP"
+  trap - EXIT
+  ok "更新完成，现在版本: $(installed_version)"
+}
+
+cmd_status() {
+  local ver state port
+  ver="$(installed_version)"
+  state="$(svc_state)"
+  port="$(config_port)"
+  [ -n "$ver" ] || ver="未安装"
+  [ -n "$port" ] || port="-"
+  if [ "$state" = "running" ]; then
+    state="${C_G}运行中${C_R}"
+  else
+    state="${C_E}已停止${C_R}"
+  fi
+  printf '%s服务%s   %b\n' "$C_B" "$C_R" "$state"
+  printf '%s版本%s   %s\n' "$C_B" "$C_R" "$ver"
+  printf '%s端口%s   %s\n' "$C_B" "$C_R" "$port"
+  printf '%s程序%s   %s\n' "$C_B" "$C_R" "$BIN_PATH"
+  printf '%s数据%s   %s\n' "$C_B" "$C_R" "$DATA_DIR"
+  if [ "$HAVE_SYSTEMD" -eq 1 ]; then
+    printf '\n'
+    systemctl status "$SERVICE" --no-pager -l 2>/dev/null | head -n 12 || true
+  fi
+}
+
+bg_start() {
+  cd "$DATA_DIR" 2>/dev/null || true
+  if command -v runuser >/dev/null 2>&1; then
+    runuser -u "$SERVICE_USER" -- nohup "$BIN_PATH" -config "$CONFIG_PATH" >/dev/null 2>&1 &
+  else
+    su -s /bin/sh -c "nohup '$BIN_PATH' -config '$CONFIG_PATH' >/dev/null 2>&1 &" "$SERVICE_USER"
+  fi
+}
+
+cmd_start() {
+  if [ "$HAVE_SYSTEMD" -eq 1 ]; then
+    systemctl start "$SERVICE" && ok "已启动"
+  else
+    bg_start
+    ok "已在后台启动（前台运行: sudo -u $SERVICE_USER $BIN_PATH -config $CONFIG_PATH）"
+  fi
+}
+
+cmd_stop() {
+  if [ "$HAVE_SYSTEMD" -eq 1 ]; then
+    systemctl stop "$SERVICE" && ok "已停止"
+  elif pkill -x "$SERVICE" 2>/dev/null; then
+    ok "已停止"
+  else
+    warn "没有运行中的进程"
+  fi
+}
+
+cmd_restart() {
+  if [ "$HAVE_SYSTEMD" -eq 1 ]; then
+    systemctl restart "$SERVICE" && ok "已重启"
+  else
+    pkill -x "$SERVICE" 2>/dev/null || true
+    sleep 1
+    bg_start
+    ok "已重启"
+  fi
+}
+
+cmd_log() {
+  if [ "$HAVE_SYSTEMD" -eq 1 ]; then
+    exec journalctl -u "$SERVICE" -n 200 -f
+  fi
+  warn "无 systemd，没有持久日志；前台运行可以直接看到输出"
+}
+
+cmd_log_brief() {
+  if [ "$HAVE_SYSTEMD" -eq 1 ]; then
+    journalctl -u "$SERVICE" -n 50 --no-pager 2>/dev/null || true
+  else
+    warn "无 systemd，没有持久日志"
+  fi
+}
+
+do_uninstall() {  # $1 = 是否连数据一起删
+  log "卸载 DoriyaMedia"
+  if [ "$HAVE_SYSTEMD" -eq 1 ]; then
+    systemctl stop "$SERVICE" 2>/dev/null || true
+    systemctl disable "$SERVICE" 2>/dev/null || true
+    rm -f "$UNIT_PATH"
+    systemctl daemon-reload || true
+  else
+    pkill -x "$SERVICE" 2>/dev/null || true
+  fi
+  rm -f "$BIN_PATH"
+  if [ "$1" -eq 1 ]; then
+    rm -rf "$DATA_DIR"
+    id -u "$SERVICE_USER" >/dev/null 2>&1 && userdel "$SERVICE_USER" 2>/dev/null || true
+    ok "已删除数据目录 $DATA_DIR"
+  elif [ -d "$DATA_DIR" ]; then
+    warn "数据目录保留在 $DATA_DIR（要一并删除用 dm purge）"
+  fi
+  rm -rf /etc/doriyamedia
+  ok "已卸载，dm 命令一并移除"
+  rm -f -- "$0"
+  exit 0
+}
+
+menu() {
+  local c ver state port sc ans
+  while :; do
+    clear 2>/dev/null || true
+    ver="$(installed_version)"; [ -n "$ver" ] || ver="未安装"
+    port="$(config_port)";        [ -n "$port" ] || port="-"
+    if [ "$(svc_state)" = "running" ]; then sc="${C_G}● 运行中${C_R}"; else sc="${C_E}○ 已停止${C_R}"; fi
+    printf '\n'
+    printf '  %s──────────────────────────────────────%s\n' "$C_C" "$C_R"
+    printf '  %s DoriyaMedia 管理面板%s\n' "$C_B$C_C" "$C_R"
+    printf '  %s──────────────────────────────────────%s\n' "$C_C" "$C_R"
+    printf '   服务 %s   版本 %s   端口 %s\n' "$sc" "$ver" "$port"
+    printf '  %s──────────────────────────────────────%s\n' "$C_C" "$C_R"
+    printf '    1) 检查更新          2) 更新到最新版\n'
+    printf '    3) 重启服务          4) 启动服务\n'
+    printf '    5) 停止服务          6) 查看日志\n'
+    printf '    7) 服务详情          8) 卸载\n'
+    printf '    0) 退出\n'
+    printf '  %s──────────────────────────────────────%s\n' "$C_C" "$C_R"
+    printf '  请输入: '
+    read -r c || exit 0
+    case "$c" in
+      1) cmd_check || true ;;
+      2) cmd_update || true ;;
+      3) cmd_restart || true ;;
+      4) cmd_start || true ;;
+      5) cmd_stop || true ;;
+      6) cmd_log_brief ;;
+      7) cmd_status ;;
+      8) printf '  确定卸载？数据会保留；输入 y 确认: '
+         read -r ans || exit 0
+         if [ "$ans" = "y" ]; then do_uninstall 0; fi ;;
+      0) exit 0 ;;
+      *) ;;
+    esac
+    printf '\n  按回车返回菜单...'
+    read -r _ || exit 0
+  done
+}
+
+usage() {
+  cat <<DM_HELP
+DoriyaMedia 管理命令
+
+用法: dm [命令]
+
+命令:
+                不带参数进入管理菜单
+  update [TAG]  更新到最新版，或指定版本（如 dm update v0.2.1）
+  check         只检查有没有新版本，不安装
+  status        服务状态（版本/端口/路径/systemd 详情）
+  start         启动服务            stop      停止服务
+  restart       重启服务            log       跟随日志（Ctrl+C 退出）
+  version       已安装版本
+  uninstall     卸载（保留数据）    purge     卸载并删除数据
+  help          显示本帮助
+
+下载源和安装脚本一样支持自动镜像回退；也可用环境变量
+DORIYAMEDIA_GITHUB_BASE / DORIYAMEDIA_API_BASE 覆盖。
+DM_HELP
+}
+
+case "${1:-menu}" in
+  menu|"")
+    if [ "$(id -u)" -ne 0 ]; then
+      command -v sudo >/dev/null 2>&1 || die "需要 root 权限，请用 sudo 运行"
+      exec sudo bash "$0"
+    fi
+    menu ;;
+  update|start|stop|restart|uninstall|purge)
+    if [ "$(id -u)" -ne 0 ]; then exec sudo bash "$0" "$@"; fi
+    case "$1" in
+      update)    shift; cmd_update "$@" || exit 1 ;;
+      start)     cmd_start ;;
+      stop)      cmd_stop ;;
+      restart)   cmd_restart ;;
+      uninstall) do_uninstall 0 ;;
+      purge)     do_uninstall 1 ;;
+    esac ;;
+  check)         cmd_check || exit 1 ;;
+  status)        cmd_status ;;
+  log)           cmd_log ;;
+  version)       installed_version || echo "未安装" ;;
+  help|-h|--help) usage ;;
+  *)             die "未知命令: $1（dm help 查看用法）" ;;
+esac
+DORIYA_DM_SCRIPT
+  chmod 0755 "${DM_PATH}.new"
+  mv -f "${DM_PATH}.new" "$DM_PATH"
+}
+
+write_dm
+ok "已安装管理命令 ${C_B}dm${C_R}（输入 dm 进菜单，dm update 更新）"
 
 if [ "$INSTALL_FFMPEG" -eq 1 ]; then
   install_ffmpeg
@@ -449,7 +839,7 @@ ${C_G}${C_B}安装完成${C_R}
   程序      ${BIN_PATH}
   数据      ${DATA_DIR}   （配置 ${CONFIG_PATH}）
   监听      ${PORT}
-  管理      systemctl {status|restart|stop} ${SERVICE}
+  管理      ${C_B}dm${C_R}（管理菜单：更新/启停/日志）或 systemctl {status|restart|stop} ${SERVICE}
   日志      journalctl -u ${SERVICE} -f
 
   打开      ${C_B}http://${ip}:${PORT}${C_R}   首次进入会让你创建管理员账号

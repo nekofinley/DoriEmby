@@ -80,7 +80,7 @@ curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/nekofinley/Doriy
 脚本会依次:安装 ffmpeg → 创建系统用户和数据目录 `/var/lib/doriyamedia` → 生成 `config.json`
 → 注册 systemd 服务并启动。下载 Release 时官方不通会**自动按
 `官方 → ghfast.top → ghproxy.net → gh-proxy.com` 的顺序回退**,不用手动指定。
-升级就是再跑一次同样的命令(自动覆盖二进制并重启)。
+升级就是再跑一次同样的命令(自动覆盖二进制并重启);或者装好后直接用下面的 `dm` 命令。
 
 常用选项:
 
@@ -97,7 +97,19 @@ sudo bash install.sh --no-start
 sudo bash install.sh --uninstall
 ```
 
-装完的日常操作:
+装完的日常操作,直接用安装附带的 **`dm` 管理命令**(类似宝塔的 `bt`,输入 `dm` 回车进菜单):
+
+```
+dm                  # 管理菜单:检查更新 / 更新 / 启停 / 日志 / 卸载
+dm update           # 更新到最新版(dm update v0.2.1 可指定版本,也能用来降级)
+dm check            # 只看看有没有新版本
+dm status           # 版本 / 端口 / 运行状态
+dm restart          # 启停(start / stop / restart)
+dm log              # 跟随日志(Ctrl+C 退出)
+dm uninstall        # 卸载(保留数据);dm purge 连数据一起删
+```
+
+不用 dm 的话,等价的 systemd 操作:
 
 ```
 systemctl status doriyamedia
