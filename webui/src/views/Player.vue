@@ -34,6 +34,10 @@ const scrubbing = ref(false)
 const scrubTime = ref(0)
 const hoverTime = ref(null)
 const hoverX = ref(0)
+const forceMode = ref('')      // current override, reapplied when re-fetching
+const probeElapsed = ref(0)    // seconds the background probe has been running
+const stallSeconds = ref(0)    // seconds spent waiting on data mid-playback
+const streamStatus = ref(null) // segment-generation progress from the server
 
 const isIOS = computed(() => {
   const ua = navigator.userAgent
@@ -55,6 +59,43 @@ const shownTime = computed(() => (scrubbing.value ? scrubTime.value : position.v
 const progressPct = computed(() => (duration.value > 0 ? Math.min(100, (shownTime.value / duration.value) * 100) : 0))
 const bufferedPct = computed(() => (duration.value > 0 ? Math.min(100, (buffered.value / duration.value) * 100) : 0))
 const volumePct = computed(() => (muted.value ? 0 : volume.value * 100))
+
+/** Seconds of timeline the player needs buffered before it will start. */
+const streamNeeded = 12
+
+const streamPct = computed(() => {
+  const s = streamStatus.value
+  if (!s || !s.generated_seconds) return 0
+  return Math.min(100, (s.generated_seconds / streamNeeded) * 100)
+})
+
+/** Timeline seconds per wall second: below 1 the server cannot keep up. */
+const streamRate = computed(() => {
+  const r = streamStatus.value?.realtime_factor
+  return r && isFinite(r) ? r : null
+})
+
+const encoderTooSlow = computed(() => {
+  const r = streamRate.value
+  return r !== null && r < 0.9 && stallSeconds.value >= 20
+})
+
+/** What the spinner should say — never leave the user guessing. */
+const loadingText = computed(() => {
+  if (play.value?.state === 'probing') {
+    return `正在探测媒体信息(容器 / 编码 / 音轨)… ${probeElapsed.value.toFixed(0)}s`
+  }
+  const s = streamStatus.value
+  if (s && s.generated_seconds > 0) {
+    const rate = streamRate.value
+    const speed = rate !== null ? ` · 编码速度 ${rate.toFixed(2)}× 实时` : ''
+    return `正在生成分片 · 已就绪 ${s.generated_seconds.toFixed(0)}s / ${streamNeeded}s${speed}`
+  }
+  if (stallSeconds.value >= 3) return `正在缓冲… 已等待 ${stallSeconds.value.toFixed(0)}s`
+  return modeLabel.value ? `正在准备播放 · ${modeLabel.value}` : '正在准备播放…'
+})
+/** Long enough that the source is clearly the problem, not a slow start. */
+const slowHint = computed(() => play.value?.state !== 'probing' && stallSeconds.value >= 25)
 const rates = [0.5, 0.75, 1, 1.25, 1.5, 2]
 const forceModes = [
   { value: '', label: '自动决策', hint: '按客户端能力自动选择' },
@@ -66,6 +107,11 @@ const forceModes = [
 
 let lastSave = 0
 let hideTimer = null
+let probeTimer = null
+let streamTimer = null
+let stallTimer = null
+let stallSince = 0
+let disposed = false
 
 /* ------------------------------------------------------------------ playback */
 
@@ -73,17 +119,136 @@ async function loadDecision(force) {
   error.value = ''
   fatal.value = ''
   isLoading.value = true
-  const params = new URLSearchParams({ client: detectClient() })
-  if (force) params.set('force', force)
-  if (currentAudio.value) params.set('a', String(currentAudio.value))
+  forceMode.value = force || ''
+  stopProbePoll()
   try {
-    play.value = await api.get(`/api/play/${route.params.fileId}?${params}`)
-    await nextTick()
-    attachSource()
+    play.value = await fetchPlay()
   } catch (e) {
     fatal.value = e.message
     isLoading.value = false
+    return
   }
+  if (play.value?.state === 'probing') {
+    startProbePoll()
+    return
+  }
+  await nextTick()
+  attachSource()
+}
+
+function fetchPlay() {
+  const params = new URLSearchParams({ client: detectClient() })
+  if (forceMode.value) params.set('force', forceMode.value)
+  if (currentAudio.value) params.set('a', String(currentAudio.value))
+  return api.get(`/api/play/${route.params.fileId}?${params}`)
+}
+
+/*
+ * Probing is the slowest step of starting playback and happens in the
+ * background on the server, so poll its state instead of hanging on one
+ * request. This is what turns an opaque spinner into "探测媒体信息… 12s".
+ */
+function startProbePoll() {
+  stopProbePoll()
+  probeElapsed.value = 0
+  const started = Date.now()
+  let idleRetries = 0
+
+  const tick = async () => {
+    if (disposed) return
+    probeElapsed.value = (Date.now() - started) / 1000
+    let st = null
+    try { st = await api.get(`/api/play/${route.params.fileId}/status`) } catch { /* transient */ }
+    if (disposed) return
+
+    if (st && st.state === 'failed') {
+      fatal.value = `媒体探测失败:${st.error || '未知原因'}`
+      isLoading.value = false
+      return
+    }
+    if (st && st.state === 'ready') {
+      try { play.value = await fetchPlay() } catch (e) { fatal.value = e.message; isLoading.value = false; return }
+      if (disposed) return
+      if (play.value?.state === 'probing') { probeTimer = setTimeout(tick, 800); return }
+      await nextTick()
+      attachSource()
+      return
+    }
+    // idle: no job registered anymore (server restart, or a failed probe inside
+    // its cooldown). Ask /api/play again to (re)start it, but never loop.
+    if (st && st.state === 'idle') {
+      if (++idleRetries > 2) {
+        fatal.value = '媒体探测未能启动,请重试'
+        isLoading.value = false
+        return
+      }
+      try { play.value = await fetchPlay() } catch { /* handled below */ }
+      if (disposed) return
+      if (play.value?.url) { await nextTick(); attachSource(); return }
+      if (play.value?.state !== 'probing') {
+        fatal.value = '媒体探测未能启动,请重试'
+        isLoading.value = false
+        return
+      }
+    }
+    probeTimer = setTimeout(tick, probeElapsed.value < 5 ? 700 : 1500)
+  }
+  probeTimer = setTimeout(tick, 500)
+}
+
+function stopProbePoll() {
+  if (probeTimer) { clearTimeout(probeTimer); probeTimer = null }
+}
+
+/*
+ * Segment generation progress. Preparing HLS can take a minute (the server must
+ * reach the source, seek, decode and re-encode every 4s of video), so poll the
+ * status endpoint and show how much timeline is ready plus the encoder's
+ * realtime factor — which is what tells the user whether it will ever catch up.
+ */
+function startStreamPoll() {
+  stopStreamPoll()
+  const tick = async () => {
+    if (disposed) return
+    // The probe poller already owns the endpoint while a probe is running.
+    if (play.value?.state !== 'probing') {
+      let st = null
+      try { st = await api.get(`/api/play/${route.params.fileId}/status`) } catch { /* transient */ }
+      if (disposed) return
+      if (st && st.stream) streamStatus.value = st.stream
+      else if (st && !st.stream && !isLoading.value) streamStatus.value = null
+    }
+    streamTimer = setTimeout(tick, isLoading.value ? 1200 : 5000)
+  }
+  streamTimer = setTimeout(tick, 800)
+}
+
+function stopStreamPoll() {
+  if (streamTimer) { clearTimeout(streamTimer); streamTimer = null }
+}
+
+/* Stall clock: while the player waits on data, show how long we have waited —
+   that is the difference between "still loading" and "dead". */
+function onWaiting() {
+  isLoading.value = true
+  if (stallSince) return
+  stallSince = Date.now()
+  stallSeconds.value = 0
+  clearInterval(stallTimer)
+  stallTimer = setInterval(() => {
+    stallSeconds.value = (Date.now() - stallSince) / 1000
+  }, 500)
+}
+
+function onPlaying() {
+  isLoading.value = false
+  clearStall()
+}
+
+function clearStall() {
+  stallSince = 0
+  stallSeconds.value = 0
+  if (stallTimer) { clearInterval(stallTimer); stallTimer = null }
 }
 
 const cands = ref([])
@@ -140,6 +305,7 @@ async function startCand(i) {
   const v = videoEl.value
   if (!v) return
   destroyHls()
+  startStreamPoll()
   v.removeAttribute('src')
   activeSub.value = null
 
@@ -418,8 +584,12 @@ onMounted(() => {
   videoEl.value?.addEventListener('leavepictureinpicture', onPipChange)
 })
 onBeforeUnmount(() => {
+  disposed = true
   saveProgress()
   destroyHls()
+  stopProbePoll()
+  stopStreamPoll()
+  clearStall()
   clearTimeout(hideTimer)
   window.removeEventListener('beforeunload', saveProgress)
   window.removeEventListener('keydown', onKey)
@@ -446,8 +616,8 @@ onBeforeUnmount(() => {
         @progress="onTimeUpdate"
         @pause="saveProgress(); isPlaying = false; showControls()"
         @play="isPlaying = true; showControls()"
-        @waiting="isLoading = true"
-        @playing="isLoading = false"
+        @waiting="onWaiting"
+        @playing="onPlaying"
         @click="!nativeControls && togglePlay()"
         @ratechange="rate = videoEl?.playbackRate || 1"
       >
@@ -485,7 +655,28 @@ onBeforeUnmount(() => {
       <Transition name="fade">
         <div v-if="isLoading && !error && !fatal" class="center-state">
           <span class="ring" />
-          <div class="cs-text">正在准备播放 · {{ modeLabel }}</div>
+          <div class="cs-text">{{ loadingText }}</div>
+          <div v-if="streamPct > 0" class="cs-bar" role="progressbar" :aria-valuenow="Math.round(streamPct)" aria-valuemin="0" aria-valuemax="100">
+            <i :style="{ width: streamPct + '%' }"></i>
+          </div>
+          <div v-if="encoderTooSlow" class="cs-hint">
+            <div class="cs-hint-t">
+              服务器编码速度只有实时速度的 {{ streamRate.toFixed(2) }} 倍,追不上播放。
+              把「转码最高高度」降到 720p 通常就能追上。
+            </div>
+            <div class="cs-actions">
+              <button class="btn sm" @click="loadDecision('remux')">强制转封装</button>
+              <button class="btn sm" @click="loadDecision()">重试自动</button>
+            </div>
+          </div>
+          <div v-else-if="slowHint" class="cs-hint">
+            <div class="cs-hint-t">这个片源读取得慢,当前方式追不上播放速度。</div>
+            <div class="cs-actions">
+              <button class="btn sm" @click="loadDecision('remux')">强制转封装</button>
+              <button class="btn sm" @click="loadDecision('transcode')">强制转码</button>
+              <button class="btn sm" @click="loadDecision()">重试自动</button>
+            </div>
+          </div>
         </div>
       </Transition>
 
@@ -707,6 +898,26 @@ video { width: 100%; height: 100%; object-fit: contain; background: #000; displa
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 .cs-text { font-size: var(--fs-13); color: var(--text-2); background: rgba(0, 0, 0, 0.5); padding: 6px 14px; border-radius: var(--r-pill); }
+.cs-bar {
+  width: min(260px, 62vw);
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: rgba(255, 255, 255, 0.18);
+  overflow: hidden;
+}
+.cs-bar i { display: block; height: 100%; background: var(--brand); border-radius: inherit; transition: width 0.4s ease; }
+.cs-hint {
+  pointer-events: auto;
+  max-width: min(420px, 86vw);
+  padding: 14px 16px;
+  border-radius: var(--r-m);
+  background: rgba(14, 16, 21, 0.94);
+  border: 1px solid var(--line-2);
+  box-shadow: var(--sh-4);
+  text-align: center;
+}
+.cs-hint-t { font-size: var(--fs-12); color: var(--text-2); line-height: 1.6; }
+.cs-actions { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin-top: 10px; }
 
 .error-panel {
   position: relative;

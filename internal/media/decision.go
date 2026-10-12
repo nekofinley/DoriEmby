@@ -206,12 +206,17 @@ func CanDirectPlay(probe *Probe, path string, client ClientKind) (bool, string) 
 }
 
 // hlsVideoCopyOK reports whether the video stream may be *copied* into the
-// HLS output (mpegts) and still be decoded by this client's playback stack.
+// HLS output and still be decoded by this client's playback stack.
 //
-// Safari (AVPlayer native HLS) can decode HEVC in TS. hls.js (Chrome/Edge/
-// Firefox via MSE) cannot demux HEVC from MPEG-TS at all, and Hi10P H.264 is
-// undecodable by consumer hardware paths — both need real transcode to H.264.
-func hlsVideoCopyOK(v *ProbeStream, client ClientKind) bool {
+// hls.js (Chrome/Edge/Firefox via MSE) cannot demux HEVC from MPEG-TS at all,
+// and Hi10P H.264 is undecodable by consumer hardware paths — both need a real
+// transcode to H.264.
+//
+// HEVC for Apple is gated on appleHEVCCopy because Apple's HLS stack does not
+// decode HEVC carried in MPEG-TS: the copy plays audio with no picture at all.
+// Copying HEVC for Apple needs fMP4, which the on-demand segmenter cannot emit
+// correctly yet (docs/ios-safari-playback-redesign.md §11.3).
+func hlsVideoCopyOK(v *ProbeStream, client ClientKind, appleHEVCCopy bool) bool {
 	if v == nil {
 		return false
 	}
@@ -220,9 +225,16 @@ func hlsVideoCopyOK(v *ProbeStream, client ClientKind) bool {
 		// "High 10" / "Main 10" profiles are 10-bit — not playable via MSE
 		return !strings.Contains(strings.ToLower(v.Profile), "10")
 	case "hevc":
-		return client == ClientSafari
+		return client == ClientSafari && appleHEVCCopy
 	}
 	return false
+}
+
+// hevcCopyBlockedForApple reports the one case where the video *could* be copied
+// but Apple's player will not decode it, so the caller can explain itself
+// instead of silently transcoding.
+func hevcCopyBlockedForApple(v *ProbeStream, client ClientKind, appleHEVCCopy bool) bool {
+	return v != nil && v.CodecName == "hevc" && client == ClientSafari && !appleHEVCCopy
 }
 
 func firstAudio(p *Probe) *ProbeStream {
@@ -233,11 +245,28 @@ func firstAudio(p *Probe) *ProbeStream {
 	return nil
 }
 
+// DecideOptions carries the inputs to a decision that are not properties of the
+// file itself.
+type DecideOptions struct {
+	// Force is the user's manual override: "" | direct | proxy | remux | transcode.
+	Force string
+	// HasDirect: the source driver can produce a 302-able URL.
+	HasDirect bool
+	// DirectHeaders: required headers for the direct link (non-empty means the
+	// browser cannot fetch it and we must not 302).
+	DirectHeaders map[string]string
+	// AppleHEVCCopy allows copying HEVC into MPEG-TS for Apple clients. Off by
+	// default: Apple's HLS stack does not decode HEVC from MPEG-TS, so such a
+	// stream plays audio with no picture. Turn it on only for a device verified
+	// to play HEVC-in-TS.
+	AppleHEVCCopy bool
+}
+
 // Decide produces the playback plan.
-// hasDirect: the source driver can produce a 302-able URL.
-// directHeaders: required headers for the direct link (non-empty means the browser
-// cannot fetch it and we must not 302).
-func Decide(probe *Probe, path string, client ClientKind, hasDirect bool, directHeaders map[string]string, force string) *Decision {
+func Decide(probe *Probe, path string, client ClientKind, opts DecideOptions) *Decision {
+	force := opts.Force
+	hasDirect := opts.HasDirect
+	directHeaders := opts.DirectHeaders
 	d := &Decision{VideoIndex: -1, AudioIndex: -1}
 	if probe == nil {
 		d.Mode, d.Kind, d.Reason = "transcode", "hls", "探测失败,强制转码"
@@ -268,8 +297,30 @@ func Decide(probe *Probe, path string, client ClientKind, hasDirect bool, direct
 		d.Mode, d.Kind, d.Reason = "proxy", "mp4", "手动指定代理"
 		return d
 	}
-	if force == "remux" || force == "transcode" {
-		d.Mode, d.Kind, d.Reason = force, "hls", "手动指定 " + force
+	if force == "transcode" {
+		d.Mode, d.Kind, d.Reason = "transcode", "hls", "手动指定转码"
+		return d
+	}
+	if force == "remux" {
+		// A remux only copies the video stream, which is only useful when this
+		// client can actually decode what gets copied. Honouring the request for
+		// a codec it cannot decode (AV1 / VP9 / MPEG-2 / 10-bit H.264 …) produced
+		// a stream with working audio and no picture at all — on every client —
+		// so fall back to a real transcode and say why.
+		if hlsVideoCopyOK(v, client, opts.AppleHEVCCopy) {
+			d.Mode, d.Kind, d.Reason = "remux", "hls", "手动指定转封装"
+			return d
+		}
+		d.Mode, d.Kind = "transcode", "hls"
+		if hevcCopyBlockedForApple(v, client, opts.AppleHEVCCopy) {
+			d.Reason = "手动指定转封装,但 Apple 不解码 MPEG-TS 里的 HEVC(只有声音没有画面),已改为转码"
+		} else {
+			codec := "该视频编码"
+			if v != nil && v.CodecName != "" {
+				codec = strings.ToUpper(v.CodecName)
+			}
+			d.Reason = fmt.Sprintf("手动指定转封装,但 %s 无法被本机解码(只有声音没有画面),已改为转码", codec)
+		}
 		return d
 	}
 
@@ -285,12 +336,16 @@ func Decide(probe *Probe, path string, client ClientKind, hasDirect bool, direct
 
 	// Video copy is only possible when the client's HLS stack can actually
 	// decode the copied stream; otherwise fall through to real transcode.
-	if v != nil && hlsVideoCopyOK(v, client) {
+	if hlsVideoCopyOK(v, client, opts.AppleHEVCCopy) {
 		d.Mode, d.Kind = "remux", "hls"
 		d.Reason = why + " → HLS 转封装(视频流直拷)"
 		return d
 	}
 	d.Mode, d.Kind = "transcode", "hls"
-	d.Reason = why + " → HLS 转码(视频转 H.264,音频直拷)"
+	if hevcCopyBlockedForApple(v, client, opts.AppleHEVCCopy) {
+		d.Reason = why + " → HLS 转码(Apple 不解码 MPEG-TS 里的 HEVC,直拷会只有声音没有画面)"
+	} else {
+		d.Reason = why + " → HLS 转码(视频转 H.264,音频直拷)"
+	}
 	return d
 }

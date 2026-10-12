@@ -8,12 +8,26 @@
     "api_key": "",
     "language": "zh-CN",
     "api_base": "https://api.themoviedb.org/3",
-    "img_base": "https://image.tmdb.org/t/p"
+    "img_base": "https://image.tmdb.org/t/p",
+    "use_proxy": false,
+    "proxy": "socks5://127.0.0.1:7890"
+  },
+  "bgm": {
+    "token": "",
+    "api_base": "https://api.bgm.tv",
+    "use_proxy": true,
+    "proxy": "socks5://127.0.0.1:7890"
   },
   "playback": {
     "force_mode": "auto",
     "segment_seconds": 4,
-    "transcode_height": 1080
+    "transcode_height": 1080,
+    "probe_size_mb": 8,
+    "probe_analyze_sec": 4,
+    "preprobe_after_scan": true,
+    "preprobe_max_files": 50,
+    "preprobe_concurrency": 2,
+    "apple_hevc_copy": false
   },
   "scan_concurrency": 4,
   "dev_web_dir": ""

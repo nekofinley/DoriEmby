@@ -135,20 +135,43 @@ func (s *ProbeStream) Title() string {
 
 type Prober struct {
 	FFProbe string
+	// ProbeSizeMB / AnalyzeSec bound how much of the source is read before
+	// streams are known. Zero falls back to the historical deep window.
+	ProbeSizeMB int
+	AnalyzeSec  int
 }
 
-func NewProber(ffprobe string) *Prober { return &Prober{FFProbe: ffprobe} }
+// deepProbeSizeMB / deepProbeAnalyzeSec are the historical fixed window. They
+// read ~60MB per file, so they are only used as the automatic fallback for
+// muxes whose streams sit past a small probe window.
+const (
+	deepProbeSizeMB     = 50
+	deepProbeAnalyzeSec = 20
+)
+
+func NewProber(ffprobe string) *Prober {
+	return &Prober{FFProbe: ffprobe, ProbeSizeMB: 8, AnalyzeSec: 4}
+}
 
 // ProbeFile runs ffprobe against a local path or a URL with optional headers.
 func (p *Prober) ProbeFile(ctx context.Context, target string, headers map[string]string) (*Probe, error) {
 	cctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
 
+	sizeMB, analyzeSec := p.ProbeSizeMB, p.AnalyzeSec
+	if sizeMB <= 0 {
+		sizeMB = deepProbeSizeMB
+	}
+	if analyzeSec <= 0 {
+		analyzeSec = deepProbeAnalyzeSec
+	}
+
 	args := []string{
 		"-v", "quiet",
 		"-print_format", "json",
 		"-show_format", "-show_streams",
-		"-analyzeduration", "20000000", "-probesize", "50000000",
+		"-analyzeduration", strconv.Itoa(analyzeSec * 1_000_000),
+		"-probesize", strconv.Itoa(sizeMB << 20),
 	}
 	if len(headers) > 0 {
 		var b strings.Builder

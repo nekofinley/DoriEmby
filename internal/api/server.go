@@ -206,6 +206,7 @@ func (s *Server) Handler() http.Handler {
 
 	// playback
 	mux.HandleFunc("GET /api/play/{id}", s.requireAuth(s.handlePlay))
+	mux.HandleFunc("GET /api/play/{id}/status", s.requireAuth(s.handlePlayStatus))
 	mux.HandleFunc("GET /api/browse/{id}", s.requireAuth(s.handleBrowse))
 	mux.HandleFunc("GET /api/browseplay/{id}", s.requireAuth(s.handleBrowsePlay))
 	mux.HandleFunc("GET /api/stream/{id}", s.allowPlayerAuth(s.handleStream))

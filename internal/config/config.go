@@ -40,6 +40,29 @@ type Playback struct {
 	ForceMode       string  `json:"force_mode"` // auto | direct | proxy | remux | transcode
 	SegmentSeconds  float64 `json:"segment_seconds"`
 	TranscodeHeight int     `json:"transcode_height"`
+
+	// ProbeSizeMB / ProbeAnalyzeSec bound how much of the source ffprobe pulls
+	// before playback can be decided. The historical fixed 50MB/20s values cost
+	// roughly 60MB per file, which on a cloud drive meant minutes of waiting
+	// before the decision even came back (and every first play paid it again).
+	// A small window resolves container/codecs for virtually all real files;
+	// the deep values are still used as an automatic fallback when it doesn't.
+	ProbeSizeMB     int `json:"probe_size_mb"`
+	ProbeAnalyzeSec int `json:"probe_analyze_sec"`
+
+	// PreProbeAfterScan warms the probe cache in the background after a library
+	// scan, so opening a file is already decided. PreProbeMaxFiles caps how many
+	// files one scan warms (0 = unlimited); PreProbeConcurrency bounds parallel
+	// probes so the cloud drive is not hammered.
+	PreProbeAfterScan   bool `json:"preprobe_after_scan"`
+	PreProbeMaxFiles    int  `json:"preprobe_max_files"`
+	PreProbeConcurrency int  `json:"preprobe_concurrency"`
+
+	// AppleHEVCCopy lets Apple clients copy HEVC into MPEG-TS instead of
+	// transcoding. It is OFF by default because Apple's HLS stack does not decode
+	// HEVC carried in MPEG-TS: such a copy plays audio with no picture. Enable it
+	// only on a device that has been verified to play HEVC-in-TS.
+	AppleHEVCCopy bool `json:"apple_hevc_copy"`
 }
 
 type Config struct {
@@ -74,9 +97,14 @@ func Defaults() *Config {
 			Proxy:    DefaultTMDBProxy,
 		},
 		Playback: Playback{
-			ForceMode:       "auto",
-			SegmentSeconds:  4,
-			TranscodeHeight: 1080,
+			ForceMode:           "auto",
+			SegmentSeconds:      4,
+			TranscodeHeight:     1080,
+			ProbeSizeMB:         8,
+			ProbeAnalyzeSec:     4,
+			PreProbeAfterScan:   true,
+			PreProbeMaxFiles:    100,
+			PreProbeConcurrency: 1,
 		},
 		ScanConcurrency: 4,
 	}
@@ -135,6 +163,27 @@ func (c *Config) normalize() {
 	}
 	if c.Playback.TranscodeHeight <= 0 {
 		c.Playback.TranscodeHeight = 1080
+	}
+	if c.Playback.ProbeSizeMB <= 0 {
+		c.Playback.ProbeSizeMB = 8
+	}
+	if c.Playback.ProbeSizeMB > 512 {
+		c.Playback.ProbeSizeMB = 512
+	}
+	if c.Playback.ProbeAnalyzeSec <= 0 {
+		c.Playback.ProbeAnalyzeSec = 4
+	}
+	if c.Playback.ProbeAnalyzeSec > 120 {
+		c.Playback.ProbeAnalyzeSec = 120
+	}
+	if c.Playback.PreProbeMaxFiles < 0 {
+		c.Playback.PreProbeMaxFiles = 0
+	}
+	if c.Playback.PreProbeConcurrency <= 0 {
+		c.Playback.PreProbeConcurrency = 1
+	}
+	if c.Playback.PreProbeConcurrency > 8 {
+		c.Playback.PreProbeConcurrency = 8
 	}
 	if c.ScanConcurrency <= 0 {
 		c.ScanConcurrency = 4

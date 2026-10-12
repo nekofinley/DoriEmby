@@ -60,6 +60,20 @@ func main() {
 			manager.EnrichLibrary(lib, report)
 		},
 	}
+	// Probe is the slowest step of starting playback on a cloud drive. Warm the
+	// cache in the background after each scan so opening a file is already
+	// decided; bounded and rate-limited so it never competes with playback.
+	scanner.OnScanned = func(lib *models.Library) {
+		if !cfg.Playback.PreProbeAfterScan {
+			return
+		}
+		files, err := store.FilesWithoutProbe(lib.ID, cfg.Playback.PreProbeMaxFiles)
+		if err != nil {
+			log.Printf("pre-probe: list files for library %d failed: %v", lib.ID, err)
+			return
+		}
+		engine.PreProbeFiles(files)
+	}
 
 	srv := api.New(store, cfg, scanner, manager, engine, web.Dist())
 	srv.ConfigPath = *cfgPath

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,28 @@ type Engine struct {
 
 	resolveMu    sync.Mutex
 	resolveCache map[string]resolveEntry
+	// resolveLocks serialises link resolution per file (see resolveTarget).
+	resolveLocks map[string]*sync.Mutex
+
+	// probe job registry: one job per file, shared by the async path
+	// (/api/play → polling) and the synchronous fallback (HLS/subtitles).
+	probeMu   sync.Mutex
+	probeJobs map[int64]*probeJob
+
+	// background pre-probe queue (cache warming after a scan)
+	pre preProbeQueue
+
+	// per-file segment generation counters (see progress.go)
+	streamMu sync.Mutex
+	stream   map[int64]*streamProgress
+
+	// execProbe runs one ffprobe pass with a given window. Indirection so tests
+	// can drive the probe lifecycle without the ffprobe binary.
+	execProbe func(ctx context.Context, p *Prober, target string, headers map[string]string) (*Probe, error)
+
+	// runStream runs one ffmpeg command. Indirection so tests can drive segment
+	// generation (including source failures) without the ffmpeg binary.
+	runStream func(ctx context.Context, args []string, out io.Writer) error
 }
 
 type resolveEntry struct {
@@ -36,29 +59,94 @@ type resolveEntry struct {
 }
 
 func NewEngine(store *db.Store, cfg *config.Config) *Engine {
-	return &Engine{
+	prober := NewProber(cfg.FFProbe)
+	if cfg.Playback.ProbeSizeMB > 0 {
+		prober.ProbeSizeMB = cfg.Playback.ProbeSizeMB
+	}
+	if cfg.Playback.ProbeAnalyzeSec > 0 {
+		prober.AnalyzeSec = cfg.Playback.ProbeAnalyzeSec
+	}
+	e := &Engine{
 		Store:        store,
 		Cfg:          cfg,
-		prober:       NewProber(cfg.FFProbe),
+		prober:       prober,
 		ffmpeg:       &FFMpeg{Path: cfg.FFmpeg},
 		subCache:     map[string][]byte{},
 		resolveCache: map[string]resolveEntry{},
+		resolveLocks: map[string]*sync.Mutex{},
+		probeJobs:    map[int64]*probeJob{},
+		pre:          preProbeQueue{queued: map[int64]bool{}},
+		stream:       map[int64]*streamProgress{},
+		execProbe: func(ctx context.Context, p *Prober, target string, headers map[string]string) (*Probe, error) {
+			return p.ProbeFile(ctx, target, headers)
+		},
 	}
+	// Resolved through e so a hot-reloaded ffmpeg path (SetBins) is picked up.
+	e.runStream = func(ctx context.Context, args []string, out io.Writer) error {
+		return e.ffmpeg.RunStream(ctx, args, out)
+	}
+	return e
 }
 
 // SetBins updates tool paths after config changes (hot reload).
 func (e *Engine) SetBins(ffmpeg, ffprobe string) {
-	e.prober = NewProber(ffprobe)
+	prober := NewProber(ffprobe)
+	if e.Cfg != nil {
+		if e.Cfg.Playback.ProbeSizeMB > 0 {
+			prober.ProbeSizeMB = e.Cfg.Playback.ProbeSizeMB
+		}
+		if e.Cfg.Playback.ProbeAnalyzeSec > 0 {
+			prober.AnalyzeSec = e.Cfg.Playback.ProbeAnalyzeSec
+		}
+	}
+	e.prober = prober
 	e.ffmpeg = &FFMpeg{Path: ffmpeg}
 }
 
-// ProbeTarget resolves a file into an ffprobe-able target (cached, TTL 10 min).
+// resolveTTL is how long one minted source link is reused before a new one is
+// requested. Cloud-drive links (OpenList / 天翼云盘) are signed and long-lived
+// (~hours), but they can still be refused early — see resolveTarget.
+const resolveTTL = 10 * time.Minute
+
+func resolveKey(file *models.MediaFile) string {
+	return fmt.Sprintf("%d|%s", file.SourceID, file.Path)
+}
+
+// ProbeTarget resolves a file into an ffprobe-able target (cached, TTL resolveTTL).
 func (e *Engine) ProbeTarget(ctx context.Context, file *models.MediaFile, drv source.Driver) (string, map[string]string, error) {
-	key := fmt.Sprintf("%d|%s", file.SourceID, file.Path)
+	return e.resolveTarget(ctx, file, drv, "")
+}
+
+// resolveTarget returns a usable source URL for a file.
+//
+// rejected is the target the caller just saw the source refuse: the cache entry
+// is then dropped and a new link minted. Signed cloud links can be refused while
+// still nominally valid (rotated session, per-link use limit, account
+// concurrency), and reusing a dead link forever is what kills playback
+// mid-stream.
+//
+// Resolution for one file is serialised and re-checked after taking the lock, so
+// a burst of failing segment requests mints one fresh link between them instead
+// of one each — the drive may invalidate the previous link whenever a new one is
+// issued, so a stampede would make things worse.
+func (e *Engine) resolveTarget(ctx context.Context, file *models.MediaFile, drv source.Driver, rejected string) (string, map[string]string, error) {
+	key := resolveKey(file)
+	mu := e.resolveLock(key)
+	mu.Lock()
+	defer mu.Unlock()
+
 	e.resolveMu.Lock()
-	if ent, ok := e.resolveCache[key]; ok && time.Since(ent.at) < 10*time.Minute {
-		e.resolveMu.Unlock()
-		return ent.target, ent.headers, nil
+	if ent, ok := e.resolveCache[key]; ok {
+		switch {
+		case rejected == "" && time.Since(ent.at) < resolveTTL:
+			e.resolveMu.Unlock()
+			return ent.target, ent.headers, nil
+		case rejected != "" && ent.target != rejected:
+			// Somebody already refreshed this link while we waited for the lock.
+			e.resolveMu.Unlock()
+			return ent.target, ent.headers, nil
+		}
+		delete(e.resolveCache, key)
 	}
 	e.resolveMu.Unlock()
 
@@ -82,6 +170,21 @@ func (e *Engine) ProbeTarget(ctx context.Context, file *models.MediaFile, drv so
 	return target, headers, nil
 }
 
+// resolveLock returns the mutex guarding one file's link resolution.
+func (e *Engine) resolveLock(key string) *sync.Mutex {
+	e.resolveMu.Lock()
+	defer e.resolveMu.Unlock()
+	if mu, ok := e.resolveLocks[key]; ok {
+		return mu
+	}
+	if len(e.resolveLocks) > 1024 {
+		e.resolveLocks = map[string]*sync.Mutex{}
+	}
+	mu := &sync.Mutex{}
+	e.resolveLocks[key] = mu
+	return mu
+}
+
 // DriverFor resolves the right driver for a file (URL files use URLDriver).
 func (e *Engine) DriverFor(file *models.MediaFile) (source.Driver, error) {
 	if isHTTPPath(file.Path) {
@@ -98,28 +201,9 @@ func isHTTPPath(p string) bool {
 	return strings.HasPrefix(p, "http://") || strings.HasPrefix(p, "https://")
 }
 
-// EnsureProbe returns a cached probe or probes the file (and persists result).
-func (e *Engine) EnsureProbe(ctx context.Context, file *models.MediaFile, drv source.Driver) (*Probe, error) {
-	if file.Probe != "" {
-		var p Probe
-		if err := jsonUnmarshal(file.Probe, &p); err == nil && (p.Video() != nil || len(p.Streams) == 0) {
-			return &p, nil
-		}
-	}
-	target, headers, err := e.ProbeTarget(ctx, file, drv)
-	if err != nil {
-		return nil, err
-	}
-	probe, err := e.prober.ProbeFile(ctx, target, headers)
-	if err != nil {
-		return nil, err
-	}
-	raw, _ := jsonMarshal(probe)
-	_ = e.Store.UpdateFileProbe(file.ID, string(raw))
-	file.Probe = string(raw)
-	e.RegisterEmbeddedSubs(file, probe)
-	return probe, nil
-}
+// EnsureProbe lives in probe_tasks.go: it joins an in-flight background probe
+// when one exists, so the async (/api/play) and synchronous (HLS/subtitles)
+// paths never probe the same file twice.
 
 func (e *Engine) RegisterEmbeddedSubs(file *models.MediaFile, probe *Probe) {
 	for i, s := range probe.SubtitleStreams() {
@@ -144,19 +228,76 @@ func (e *Engine) RegisterEmbeddedSubs(file *models.MediaFile, probe *Probe) {
 
 // ---------- HLS segment generation ----------
 
-// Segment writes one MPEG-TS HLS segment for the file.
+// countWriter counts how many bytes reached the client, so a failed ffmpeg run
+// can tell "produced nothing" (safe to retry) from "already partly sent".
+type countWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// Segment writes one MPEG-TS HLS segment for the file and reports how many bytes
+// it delivered.
+//
+// When ffmpeg fails without emitting anything, the source link itself is the
+// likely culprit: signed cloud links get refused while still nominally valid
+// (rotated session, per-link use limit, account concurrency). Every segment
+// opens its own connection with the cached link, so one dead link would
+// otherwise break the rest of the stream — a fresh link is minted and the
+// segment retried once.
+//
 // start: seconds into the media; length: nominal segment length.
 // videoMode: remux (copy) | transcode (h264). audioMode: copy | aac.
 // audioOrdinal: which audio stream (ordinal among audio streams, -1 = none).
 // videoIndex: absolute ffmpeg stream index of the real video stream
 // (cover-art attachments excluded by the prober); -1 falls back to 0:v:0.
 func (e *Engine) Segment(ctx context.Context, file *models.MediaFile, drv source.Driver,
-	start, length float64, videoMode, audioMode string, audioOrdinal, videoIndex, transcodeHeight int, out io.Writer) error {
+	start, length float64, videoMode, audioMode string, audioOrdinal, videoIndex, transcodeHeight int, out io.Writer) (n int64, err error) {
+
+	e.noteSegmentStart(file.ID)
+	began := time.Now()
+	defer func() { e.noteSegmentDone(file.ID, length, time.Since(began), n, err) }()
 
 	target, headers, err := e.ProbeTarget(ctx, file, drv)
 	if err != nil {
-		return err
+		return 0, err
 	}
+
+	cw := &countWriter{w: out}
+	runErr := e.runStream(ctx, segmentArgs(target, headers, start, length, videoMode, audioMode, audioOrdinal, videoIndex, transcodeHeight), cw)
+	if runErr == nil {
+		return cw.n, nil
+	}
+	// A partly written segment cannot be retried into the same response, and a
+	// cancelled request must not start more work against the source.
+	if cw.n > 0 || ctx.Err() != nil {
+		return cw.n, runErr
+	}
+
+	retryTarget, retryHeaders, rerr := e.resolveTarget(ctx, file, drv, target)
+	if rerr != nil || retryTarget == target {
+		return cw.n, runErr
+	}
+	log.Printf("hls segment %d @%.0fs: source refused the link, retrying with a fresh one: %v",
+		file.ID, start, runErr)
+
+	cw2 := &countWriter{w: out}
+	if err2 := e.runStream(ctx, segmentArgs(retryTarget, retryHeaders, start, length, videoMode, audioMode, audioOrdinal, videoIndex, transcodeHeight), cw2); err2 != nil {
+		return cw2.n, fmt.Errorf("attempt 1: %w; attempt 2 with a fresh source link: %v", runErr, err2)
+	}
+	log.Printf("hls segment %d @%.0fs: recovered with a fresh source link", file.ID, start)
+	return cw2.n, nil
+}
+
+// segmentArgs builds the ffmpeg command line for one segment.
+func segmentArgs(target string, headers map[string]string, start, length float64,
+	videoMode, audioMode string, audioOrdinal, videoIndex, transcodeHeight int) []string {
+
 	args := []string{"-hide_banner", "-loglevel", "error"}
 	args = HeaderArgs(args, headers)
 	if isHTTPPath(target) {
@@ -199,7 +340,7 @@ func (e *Engine) Segment(ctx context.Context, file *models.MediaFile, drv source
 		"-t", fmt.Sprintf("%.3f", length),
 		"pipe:1",
 	)
-	return e.ffmpeg.RunStream(ctx, args, out)
+	return args
 }
 
 // Playlist renders the VOD HLS playlist for a file.

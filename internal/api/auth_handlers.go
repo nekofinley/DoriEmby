@@ -200,6 +200,24 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request, user *m
 		if req.Playback.TranscodeHeight > 0 {
 			s.Cfg.Playback.TranscodeHeight = req.Playback.TranscodeHeight
 		}
+		if req.Playback.ProbeSizeMB != nil && *req.Playback.ProbeSizeMB > 0 {
+			s.Cfg.Playback.ProbeSizeMB = *req.Playback.ProbeSizeMB
+		}
+		if req.Playback.ProbeAnalyzeSec != nil && *req.Playback.ProbeAnalyzeSec > 0 {
+			s.Cfg.Playback.ProbeAnalyzeSec = *req.Playback.ProbeAnalyzeSec
+		}
+		if req.Playback.PreProbeAfterScan != nil {
+			s.Cfg.Playback.PreProbeAfterScan = *req.Playback.PreProbeAfterScan
+		}
+		if req.Playback.PreProbeMaxFiles != nil && *req.Playback.PreProbeMaxFiles >= 0 {
+			s.Cfg.Playback.PreProbeMaxFiles = *req.Playback.PreProbeMaxFiles
+		}
+		if req.Playback.PreProbeConcurrency != nil && *req.Playback.PreProbeConcurrency > 0 {
+			s.Cfg.Playback.PreProbeConcurrency = *req.Playback.PreProbeConcurrency
+		}
+		if req.Playback.AppleHEVCCopy != nil {
+			s.Cfg.Playback.AppleHEVCCopy = *req.Playback.AppleHEVCCopy
+		}
 	}
 	if err := s.Cfg.Save(s.configFile()); err != nil {
 		fail(w, 500, err.Error())
@@ -229,4 +247,11 @@ type configPlayback = struct {
 	ForceMode       string  `json:"force_mode"`
 	SegmentSeconds  float64 `json:"segment_seconds"`
 	TranscodeHeight int     `json:"transcode_height"`
+	// pointers so "not sent" is distinguishable from an explicit false/0
+	ProbeSizeMB         *int  `json:"probe_size_mb"`
+	ProbeAnalyzeSec     *int  `json:"probe_analyze_sec"`
+	PreProbeAfterScan   *bool `json:"preprobe_after_scan"`
+	PreProbeMaxFiles    *int  `json:"preprobe_max_files"`
+	PreProbeConcurrency *int  `json:"preprobe_concurrency"`
+	AppleHEVCCopy       *bool `json:"apple_hevc_copy"`
 }

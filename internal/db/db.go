@@ -615,6 +615,35 @@ func (s *Store) UpdateFileProbe(id int64, probe string) error {
 	return err
 }
 
+// FilesWithoutProbe returns playable files of a library that have no cached
+// probe yet, newest first. Used to warm the probe cache after a scan so the
+// first play of a file does not pay the (slow) probe. limit <= 0 means no limit.
+func (s *Store) FilesWithoutProbe(libraryID int64, limit int) ([]*models.MediaFile, error) {
+	q := `SELECT f.id, f.item_id, f.source_id, f.path, f.size, f.mtime, f.added_at
+		FROM files f JOIN items i ON i.id = f.item_id
+		WHERE i.library_id = ? AND (f.probe IS NULL OR f.probe = '')
+		ORDER BY f.id DESC`
+	args := []any{libraryID}
+	if limit > 0 {
+		q += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := s.DB.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*models.MediaFile
+	for rows.Next() {
+		f := &models.MediaFile{}
+		if err := rows.Scan(&f.ID, &f.ItemID, &f.SourceID, &f.Path, &f.Size, &f.MTime, &f.AddedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) DeleteFilesNotIn(itemID int64, keep map[string]bool) error {
 	rows, err := s.DB.Query(`SELECT id, path FROM files WHERE item_id=?`, itemID)
 	if err != nil {

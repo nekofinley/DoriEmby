@@ -46,21 +46,26 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request, user *models
 // playFile runs the decision pipeline for a media file and writes the response.
 // Shared by the library player (/api/play) and the file browser (/api/browseplay).
 func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.MediaFile) {
-	ctx, cancel := context.WithTimeout(r.Context(), 150*time.Second)
-	defer cancel()
-
 	drv, err := s.Engine.DriverFor(file)
 	if err != nil {
 		fail(w, 500, "存储源错误: "+err.Error())
 		return
 	}
 
-	probe, err := s.Engine.EnsureProbe(ctx, file, drv)
-	if err != nil {
-		log.Printf("probe failed for file %d (%s): %v", file.ID, file.Path, err)
-		fail(w, 500, "媒体探测失败: "+err.Error())
+	// The decision needs a probe, and probing a cloud-drive file is slow (ffprobe
+	// must pull a window of it). Instead of holding the response for minutes, a
+	// missing probe starts a background job and the request answers immediately
+	// with state=probing; the player polls /api/play/{id}/status and re-requests
+	// once the probe is ready.
+	probe := media.ProbeFromCache(file)
+	if probe == nil {
+		s.Engine.StartProbe(file, drv)
+		writeJSON(w, 200, s.playPreparingPayload(r, file))
 		return
 	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 150*time.Second)
+	defer cancel()
 
 	client := s.clientKind(r)
 	force := r.URL.Query().Get("force")
@@ -77,7 +82,12 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		}
 	}
 
-	dec := media.Decide(probe, file.Path, client, hasDirect, directHeaders, force)
+	dec := media.Decide(probe, file.Path, client, media.DecideOptions{
+		Force:         force,
+		HasDirect:     hasDirect,
+		DirectHeaders: directHeaders,
+		AppleHEVCCopy: s.Cfg.Playback.AppleHEVCCopy,
+	})
 
 	switch dec.Mode {
 	case "direct":
@@ -162,18 +172,7 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 	}
 
 	// item context
-	item, _ := s.Store.ItemByID(file.ItemID)
-	title := ""
-	if item != nil {
-		title = item.Name
-		if item.Type == "episode" {
-			if season, err := s.Store.ItemByID(deref(item.ParentID)); err == nil && season.ParentID != nil {
-				if show, err := s.Store.ItemByID(*season.ParentID); err == nil {
-					title = fmt.Sprintf("%s · S%02dE%02d · %s", show.Name, item.Season, item.Episode, item.Name)
-				}
-			}
-		}
-	}
+	title := s.playTitle(file)
 
 	srcName := ""
 	if src, err := s.Store.SourceByID(file.SourceID); err == nil {
@@ -181,6 +180,7 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 	}
 
 	writeJSON(w, 200, map[string]any{
+		"state":        "ready",
 		"file_id":      file.ID,
 		"item_id":      file.ItemID,
 		"title":        title,
@@ -200,6 +200,81 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		"audio_tracks": tracks,
 		"versions":     s.versionsFor(file.ItemID, file.ID),
 		"subtitles":    subDTOs,
+	})
+}
+
+// playTitle resolves the display title for a file ("剧名 · S01E02 · 标题").
+func (s *Server) playTitle(file *models.MediaFile) string {
+	item, _ := s.Store.ItemByID(file.ItemID)
+	if item == nil {
+		return ""
+	}
+	title := item.Name
+	if item.Type == "episode" {
+		if season, err := s.Store.ItemByID(deref(item.ParentID)); err == nil && season.ParentID != nil {
+			if show, err := s.Store.ItemByID(*season.ParentID); err == nil {
+				title = fmt.Sprintf("%s · S%02dE%02d · %s", show.Name, item.Season, item.Episode, item.Name)
+			}
+		}
+	}
+	return title
+}
+
+// playPreparingPayload is the answer while the first probe of a file runs.
+// It carries only what the player needs to render its "preparing" state —
+// no URL, because the mode cannot be decided yet.
+func (s *Server) playPreparingPayload(r *http.Request, file *models.MediaFile) map[string]any {
+	srcName := ""
+	if src, err := s.Store.SourceByID(file.SourceID); err == nil {
+		srcName = src.Name
+	}
+	return map[string]any{
+		"state":        "probing",
+		"file_id":      file.ID,
+		"item_id":      file.ItemID,
+		"title":        s.playTitle(file),
+		"source":       srcName,
+		"client":       s.clientKind(r),
+		"mode":         "",
+		"kind":         "",
+		"url":          "",
+		"mime_type":    "",
+		"reason":       "正在探测媒体信息(容器 / 编码 / 音轨)…",
+		"duration":     0,
+		"alternates":   []any{},
+		"audio_tracks": []any{},
+		"subtitles":    []any{},
+		"versions":     s.versionsFor(file.ItemID, file.ID),
+	}
+}
+
+// ---------- /api/play/{id}/status ----------
+
+// handlePlayStatus reports the probe state for a file so the player can show
+// real progress instead of an indistinguishable spinner.
+func (s *Server) handlePlayStatus(w http.ResponseWriter, r *http.Request, user *models.User) {
+	id, ok := pathID(r)
+	if !ok {
+		fail(w, 400, "bad id")
+		return
+	}
+	file, err := s.Store.FileByID(id)
+	if err != nil {
+		fail(w, 404, "文件不存在")
+		return
+	}
+	st := s.Engine.ProbeStatus(id)
+	if media.ProbeFromCache(file) != nil {
+		st = media.ProbeStatus{State: "ready"}
+	}
+	// stream carries segment-generation progress once playback starts, so the
+	// player can show how much is ready and whether the server keeps up.
+	writeJSON(w, 200, map[string]any{
+		"file_id": id,
+		"state":   st.State, // idle | probing | ready | failed
+		"elapsed": st.Elapsed,
+		"error":   st.Error,
+		"stream":  s.Engine.StreamStatus(id),
 	})
 }
 
@@ -450,11 +525,19 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 	if v := probe.Video(); v != nil {
 		videoIndex = v.Index
 	}
+	start := float64(segIndex) * segLen
 	w.Header().Set("Content-Type", "video/mp2t")
 	w.Header().Set("Cache-Control", "no-store")
-	start := float64(segIndex) * segLen
-	if err := s.Engine.Segment(ctx, file, drv, start, segLen, mode, audioMode, audioOrdinal, videoIndex, s.Cfg.Playback.TranscodeHeight, w); err != nil {
-		log.Printf("hls segment %d/%d failed: %v", file.ID, segIndex, err)
+	written, err := s.Engine.Segment(ctx, file, drv, start, segLen, mode, audioMode, audioOrdinal, videoIndex, s.Cfg.Playback.TranscodeHeight, w)
+	if err != nil {
+		log.Printf("hls segment %d/%d @%.0fs failed: %v", file.ID, segIndex, start, err)
+		// Nothing reached the client yet, so the status is still ours to choose.
+		// A real error makes the player retry the segment; answering 200 with an
+		// empty body looks like a corrupt segment and can stop playback for good.
+		if written == 0 {
+			w.Header().Set("Retry-After", "2")
+			http.Error(w, "分片生成失败,请重试", http.StatusBadGateway)
+		}
 	}
 }
 

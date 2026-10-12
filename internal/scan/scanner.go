@@ -29,8 +29,11 @@ type Scanner struct {
 	Store      *db.Store
 	Cfg        *config.Config
 	OnIdentify func(lib *models.Library, listings map[string][]source.Entry, report func(done, total int, msg string)) // metadata enrichment hook
-	states     sync.Map // libraryID -> *models.ScanState
-	cancels    sync.Map // libraryID -> context.CancelFunc
+	// OnScanned fires after a library scan finishes, so the caller can warm
+	// caches (e.g. pre-probe new files) without blocking the scan itself.
+	OnScanned func(lib *models.Library)
+	states    sync.Map // libraryID -> *models.ScanState
+	cancels   sync.Map // libraryID -> context.CancelFunc
 
 	queue chan *models.Library
 	once  sync.Once
@@ -160,6 +163,9 @@ func (sc *Scanner) runScan(lib *models.Library) error {
 		st.Current = fmt.Sprintf("完成,共 %d 个视频文件", st.Total)
 	}
 	finish()
+	if sc.OnScanned != nil {
+		sc.OnScanned(lib)
+	}
 	return nil
 }
 

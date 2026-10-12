@@ -598,6 +598,45 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
               </div>
               <div class="field"><label>HLS 分片时长(秒)</label><input v-model="cfg.playback.segment_seconds" type="number" step="1" min="2" max="10" /></div>
               <div class="field"><label>转码最高高度(像素)</label><input v-model="cfg.playback.transcode_height" type="number" step="80" min="480" max="2160" /></div>
+              <div class="field">
+                <label>探测读取上限(MB)</label>
+                <input v-model="cfg.playback.probe_size_mb" type="number" step="1" min="1" max="256" />
+                <span class="hint">决定起播前要从网盘读多少数据来识别容器/编码。默认 8MB,越小起播越快;读不出来时会自动用 50MB 深度探测兜底。</span>
+              </div>
+              <div class="field">
+                <label>探测分析时长(秒)</label>
+                <input v-model="cfg.playback.probe_analyze_sec" type="number" step="1" min="1" max="60" />
+                <span class="hint">探测时分析多少秒的数据流,默认 4 秒。音轨/字幕流很靠后的片源可以调大。</span>
+              </div>
+              <div class="field wide">
+                <label>扫描后预探测</label>
+                <label class="check-line">
+                  <input type="checkbox" v-model="cfg.playback.preprobe_after_scan" />
+                  扫描完成后在后台预探测新文件(打开即播,不用等)
+                </label>
+                <span class="hint">只探测文件名未缓存过的文件,限流串行执行,不会与播放抢带宽。</span>
+              </div>
+              <div class="field">
+                <label>预探测文件数上限</label>
+                <input v-model="cfg.playback.preprobe_max_files" type="number" step="10" min="0" :disabled="!cfg.playback.preprobe_after_scan" />
+                <span class="hint">每次扫描最多预探测多少个文件,0 表示不限。大库建议限量,避免把网盘读限速。</span>
+              </div>
+              <div class="field">
+                <label>预探测并发数</label>
+                <input v-model="cfg.playback.preprobe_concurrency" type="number" step="1" min="1" max="8" :disabled="!cfg.playback.preprobe_after_scan" />
+                <span class="hint">默认 1(串行)。网盘容易限速时不要调大。</span>
+              </div>
+              <div class="field wide">
+                <label>HEVC 直拷(iOS / Apple)</label>
+                <label class="check-line">
+                  <input type="checkbox" v-model="cfg.playback.apple_hevc_copy" />
+                  允许 Apple 设备把 HEVC 直拷进 MPEG-TS
+                </label>
+                <span class="hint">
+                  <b>建议保持关闭</b>：Apple 不解码 MPEG-TS 里的 HEVC,直拷会变成「有声音、没画面」;
+                  关闭时这类片子走转码(能看,但吃 CPU)。真机确认能播再打开,可以省下全部转码开销。
+                </span>
+              </div>
             </div>
           </div>
 

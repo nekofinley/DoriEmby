@@ -46,6 +46,23 @@ function RawReq($client, $method, $url, $headers) {
   return @{ Status = [int]$resp.StatusCode; RespHeaders = $resp.Headers; ContentHeaders = $resp.Content.Headers; Bytes = $bytes }
 }
 
+# /api/play answers immediately with state="probing" while the file's first
+# probe runs in the background (probing a cloud file can take minutes); poll the
+# status endpoint, then re-request the decision. Mirrors what the player does.
+function PlayDecision($fileId, $client) {
+  $url = "$Base/api/play/$fileId`?client=$client"
+  $r = Invoke-RestMethod -Uri $url -WebSession $sess
+  $deadline = (Get-Date).AddSeconds(180)
+  while ($r.state -eq "probing" -and (Get-Date) -lt $deadline) {
+    Start-Sleep -Milliseconds 400
+    $st = Invoke-RestMethod -Uri "$Base/api/play/$fileId/status" -WebSession $sess
+    if ($st.state -eq "failed") { throw "probe failed for file $fileId`: $($st.error)" }
+    if ($st.state -eq "ready") { $r = Invoke-RestMethod -Uri $url -WebSession $sess }
+  }
+  if ($r.state -eq "probing") { throw "probe for file $fileId did not finish within 180s" }
+  return $r
+}
+
 Write-Host "==> 2. create local source + libraries"
 $root = (Resolve-Path $TestData).Path
 $src = Invoke-RestMethod -Uri "$Base/api/sources" -Method Post -WebSession $sess -ContentType "application/json" -Body (J @{name="本地测试"; type="local"; config=@{root=$root}})
@@ -58,7 +75,16 @@ $libMovie = Invoke-RestMethod -Uri "$Base/api/libraries" -Method Post -WebSessio
 $libSeries = Invoke-RestMethod -Uri "$Base/api/libraries" -Method Post -WebSession $sess -ContentType "application/json" -Body (J @{name="测试剧集"; type="series"; source_id=$src.id; path="/series"})
 Show "libraries" "$($libMovie.id), $($libSeries.id)"
 
-Write-Host "==> 3. scan"
+Write-Host "==> 3. scan (post-scan pre-probe OFF so the async path is observable)"
+# The scan below must NOT warm the probe cache, otherwise step 5a would find a
+# cached probe and the async contract would go untested. Set it explicitly: the
+# server persists config, so relying on the file's current value is not enough.
+Invoke-RestMethod -Uri "$Base/api/config" -Method Put -WebSession $sess -ContentType "application/json" `
+  -Body (J @{playback=@{preprobe_after_scan=$false}}) | Out-Null
+$pre0 = (Invoke-RestMethod -Uri "$Base/api/config" -WebSession $sess).playback.preprobe_after_scan
+Show "preprobe_after_scan (before scan)" $pre0
+if ($pre0) { throw "could not disable pre-probe for the async probe check" }
+
 Invoke-RestMethod -Uri "$Base/api/libraries/$($libMovie.id)/scan" -Method Post -WebSession $sess | Out-Null
 Invoke-RestMethod -Uri "$Base/api/libraries/$($libSeries.id)/scan" -Method Post -WebSession $sess | Out-Null
 $deadline = (Get-Date).AddSeconds(180)
@@ -92,9 +118,35 @@ foreach ($season in $showDetail.seasons) {
   }
 }
 
+Write-Host "==> 5a. async probe contract (config-test has post-scan pre-probe off)"
+# No cached probe exists for this file, so /api/play must answer immediately
+# with state=probing instead of blocking until ffprobe returns.
+$asyncFile = $targets[0].file
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$p0 = Invoke-RestMethod -Uri "$Base/api/play/$asyncFile`?client=ios" -WebSession $sess
+$sw.Stop()
+Show "first /api/play answer" "$([int]$sw.ElapsedMilliseconds)ms state=$($p0.state) url='$($p0.url)'"
+Show "preparing reason" $p0.reason
+if ($p0.state -eq "probing") {
+  if ($p0.url) { throw "state=probing must not carry a playback url" }
+  $st0 = Invoke-RestMethod -Uri "$Base/api/play/$asyncFile/status" -WebSession $sess
+  Show "status right after" "state=$($st0.state) elapsed=$([math]::Round([double]$st0.elapsed,2))s"
+} else {
+  Write-Host "  NOTE: probe was already cached (state=$($p0.state))" -ForegroundColor Yellow
+}
+$p1 = PlayDecision $asyncFile "ios"
+Show "after polling -> mode" "$($p1.mode) | $($p1.reason)"
+Show "status is now ready" "$((Invoke-RestMethod -Uri "$Base/api/play/$asyncFile/status" -WebSession $sess).state)"
+
+Write-Host "==> 5b. enable post-scan pre-probe for the cloud library check"
+Invoke-RestMethod -Uri "$Base/api/config" -Method Put -WebSession $sess -ContentType "application/json" `
+  -Body (J @{playback=@{preprobe_after_scan=$true; preprobe_max_files=50; preprobe_concurrency=2}}) | Out-Null
+$cfgNow = Invoke-RestMethod -Uri "$Base/api/config" -WebSession $sess
+Show "preprobe_after_scan" $cfgNow.playback.preprobe_after_scan
+
 foreach ($t in $targets) {
-  $ios = Invoke-RestMethod -Uri "$Base/api/play/$($t.file)?client=ios" -WebSession $sess
-  $pc  = Invoke-RestMethod -Uri "$Base/api/play/$($t.file)?client=chrome" -WebSession $sess
+  $ios = PlayDecision $t.file "ios"
+  $pc  = PlayDecision $t.file "chrome"
   $t.media = $ios.media
   $vid = "-"; if ($t.media -and $t.media.video) { $vid = "$($t.media.video.codec)/$($t.media.video.tag)" }
   $aud = "-"; if ($t.media -and $t.media.audio.Count -gt 0) { $aud = $t.media.audio[0].codec }
@@ -112,7 +164,7 @@ Show "local HEAD status" "$($resp.Status) accept-ranges=$($resp.RespHeaders.Acce
 
 Write-Host "==> 7. HLS remux pipeline (hevc_hev1 file, iOS)"
 $hev1 = ($targets | Where-Object { $_.media.video.tag -eq "hev1" } | Select-Object -First 1).file
-$play = Invoke-RestMethod -Uri "$Base/api/play/$($hev1)?client=ios" -WebSession $sess
+$play = PlayDecision $hev1 "ios"
 Show "decision" "$($play.mode) $($play.url)"
 $m3u8r = RawReq $hc "GET" "$Base$($play.url)" @{}
 $txt = [System.Text.Encoding]::UTF8.GetString($m3u8r.Bytes)
@@ -124,12 +176,51 @@ Show "first segment url" $segLine
 $seg = RawReq $hc "GET" "$Base$segLine" @{}
 Show "segment fetch" "$($seg.Status) type=$($seg.ContentHeaders.ContentType) bytes=$($seg.Bytes.Length)"
 Show "TS sync byte (0x47)" ($seg.Bytes.Length -gt 188 -and $seg.Bytes[0] -eq 0x47)
+
+# A segment can be a structurally valid TS and still carry no decodable video
+# (that is exactly what "audio but no picture" looks like from the client side),
+# so decode a frame instead of only checking the container.
+$segPath = Join-Path $env:TEMP "doriya-e2e-seg.ts"
+[System.IO.File]::WriteAllBytes($segPath, $seg.Bytes)
+$vstreams = (& ffprobe -v error -select_streams v -show_entries stream=codec_name -of csv=p=0 $segPath 2>&1 | Out-String).Trim()
+Show "segment video stream" $(if ($vstreams) { $vstreams } else { "NONE" })
+$decErr = (& ffmpeg -v error -i $segPath -frames:v 1 -f null - 2>&1 | Out-String).Trim()
+if ($decErr) {
+  Show "segment video decodes" "FAIL -> $decErr"
+  throw "first HLS segment has no decodable video: $decErr"
+} else {
+  Show "segment video decodes" "OK (a frame decoded)"
+}
+Remove-Item $segPath -ErrorAction SilentlyContinue
+
 $seg2 = RawReq $hc "GET" "$Base$($segLine -replace '/0\?', '/3?')" @{}
 Show "seek segment 3 fetch" "$($seg2.Status) bytes=$($seg2.Bytes.Length)"
 
+# Generation progress must be observable, so the player can show a real bar
+# instead of an opaque spinner.
+$pst = Invoke-RestMethod -Uri "$Base/api/play/$hev1/status" -WebSession $sess
+if ($pst.stream) {
+  Show "generation progress" "ready=$($pst.stream.segments_ready) generated=$([math]::Round([double]$pst.stream.generated_seconds,1))s rate=$([math]::Round([double]$pst.stream.realtime_factor,2))x"
+} else {
+  Show "generation progress" "MISSING (status carried no stream block)"
+  throw "status endpoint did not report segment-generation progress"
+}
+
+Write-Host "==> 7b. forcing a remux must not copy undecodable video"
+# hls.js cannot demux HEVC from MPEG-TS, so a forced remux for an MSE client
+# would produce audio with no picture. It must fall back to a real transcode.
+$forced = Invoke-RestMethod -Uri "$Base/api/play/$hev1`?client=chrome&force=remux" -WebSession $sess
+Show "forced remux (chrome, HEVC)" "$($forced.mode) | $($forced.reason)"
+if ($forced.mode -ne "transcode") {
+  throw "forced remux for an MSE client on HEVC must fall back to transcode, got '$($forced.mode)'"
+}
+if ($forced.reason -notmatch 'HEVC') {
+  throw "the fallback reason must name the codec, got '$($forced.reason)'"
+}
+
 Write-Host "==> 8. subtitles"
 $epFile = ($targets | Where-Object { $_.title -match "^E1 " } | Select-Object -First 1).file
-$playEp = Invoke-RestMethod -Uri "$Base/api/play/$($epFile)?client=ios" -WebSession $sess
+$playEp = PlayDecision $epFile "ios"
 foreach ($sub in $playEp.subtitles) { Show "subtitle" "$($sub.label) -> $($sub.url)" }
 if (@($playEp.subtitles).Count -gt 0) {
   $vtt = RawReq $hc "GET" "$Base$($playEp.subtitles[0].url)" @{}
@@ -153,7 +244,21 @@ $omovies = Invoke-RestMethod -Uri "$Base/api/items?library_id=$($olib.id)&type=m
 Show "openlist movies parsed" $omovies.total
 $od = Invoke-RestMethod -Uri "$Base/api/items/$($omovies.items[0].id)" -WebSession $sess
 $ofile = $od.files[0].id
-$oplay = Invoke-RestMethod -Uri "$Base/api/play/$($ofile)?client=ios" -WebSession $sess
+# Pre-probe was enabled before this scan and no /api/play call has touched this
+# file, so state=ready can only mean the background pre-probe probed and
+# persisted it — i.e. the cache was warmed without the user waiting.
+$preDeadline = (Get-Date).AddSeconds(60)
+$pst = $null
+do {
+  Start-Sleep -Milliseconds 500
+  $pst = Invoke-RestMethod -Uri "$Base/api/play/$ofile/status" -WebSession $sess
+} while ($pst.state -ne "ready" -and (Get-Date) -lt $preDeadline)
+Show "pre-probed before any play" "state=$($pst.state)"
+$sw2 = [System.Diagnostics.Stopwatch]::StartNew()
+$oplay = Invoke-RestMethod -Uri "$Base/api/play/$ofile`?client=ios" -WebSession $sess
+$sw2.Stop()
+Show "first decision (warm cache)" "$([int]$sw2.ElapsedMilliseconds)ms state=$($oplay.state) mode=$($oplay.mode)"
+if ($oplay.state -eq "probing") { $oplay = PlayDecision $ofile "ios" }
 Show "cloud play decision" "$($oplay.mode) | $($oplay.reason)"
 if ($oplay.mode -eq "direct") {
   $r302 = RawReq $hcNoRedir "GET" "$Base$($oplay.url)" @{}
