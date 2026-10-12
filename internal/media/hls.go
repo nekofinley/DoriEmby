@@ -43,6 +43,10 @@ type Engine struct {
 	streamMu sync.Mutex
 	stream   map[int64]*streamProgress
 
+	// packaging sessions for HEVC copy to fMP4 (see session.go)
+	sessMu   sync.Mutex
+	sessions map[sessionKey]*Session
+
 	// execProbe runs one ffprobe pass with a given window. Indirection so tests
 	// can drive the probe lifecycle without the ffprobe binary.
 	execProbe func(ctx context.Context, p *Prober, target string, headers map[string]string) (*Probe, error)
@@ -77,6 +81,7 @@ func NewEngine(store *db.Store, cfg *config.Config) *Engine {
 		probeJobs:    map[int64]*probeJob{},
 		pre:          preProbeQueue{queued: map[int64]bool{}},
 		stream:       map[int64]*streamProgress{},
+		sessions:     map[sessionKey]*Session{},
 		execProbe: func(ctx context.Context, p *Prober, target string, headers map[string]string) (*Probe, error) {
 			return p.ProbeFile(ctx, target, headers)
 		},

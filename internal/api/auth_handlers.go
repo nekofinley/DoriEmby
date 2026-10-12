@@ -218,6 +218,9 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request, user *m
 		if req.Playback.AppleHEVCCopy != nil {
 			s.Cfg.Playback.AppleHEVCCopy = *req.Playback.AppleHEVCCopy
 		}
+		if req.Playback.HLSSessionPackager != nil {
+			s.Cfg.Playback.HLSSessionPackager = *req.Playback.HLSSessionPackager
+		}
 	}
 	if err := s.Cfg.Save(s.configFile()); err != nil {
 		fail(w, 500, err.Error())
@@ -254,4 +257,5 @@ type configPlayback = struct {
 	PreProbeMaxFiles    *int  `json:"preprobe_max_files"`
 	PreProbeConcurrency *int  `json:"preprobe_concurrency"`
 	AppleHEVCCopy       *bool `json:"apple_hevc_copy"`
+	HLSSessionPackager  *bool `json:"hls_session_packager"`
 }

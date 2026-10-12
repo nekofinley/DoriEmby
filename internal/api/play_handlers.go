@@ -6,6 +6,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -86,7 +89,10 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		Force:         force,
 		HasDirect:     hasDirect,
 		DirectHeaders: directHeaders,
-		AppleHEVCCopy: s.Cfg.Playback.AppleHEVCCopy,
+		// Copying HEVC is only safe for Apple when the result is fMP4, which the
+		// session packager produces; without it, Apple gets MPEG-TS it cannot
+		// decode (audio, no picture) — so the packager implies the copy is allowed.
+		AppleHEVCCopy: s.Cfg.Playback.AppleHEVCCopy || s.Cfg.Playback.HLSSessionPackager,
 	})
 
 	switch dec.Mode {
@@ -459,6 +465,19 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	segLen := s.Cfg.Playback.SegmentSeconds
 
+	// HEVC copy for Apple cannot be MPEG-TS: Apple does not decode HEVC from TS,
+	// and fMP4 needs a continuous timeline that only a long-lived packager
+	// produces. Everything else stays on the on-demand TS path, which needs no
+	// temporary disk. See media/session.go.
+	if s.Cfg.Playback.HLSSessionPackager && q.Get("m") != "transcode" {
+		if probe, err := s.Engine.EnsureProbe(ctx, file, drv); err == nil {
+			if v := probe.Video(); v != nil && v.CodecName == "hevc" {
+				s.serveSessionHLS(w, r, ctx, file, drv, probe, rest, q, segLen)
+				return
+			}
+		}
+	}
+
 	if rest == "" || strings.HasPrefix(rest, "index") || strings.HasPrefix(rest, "playlist") {
 		probe, err := s.Engine.EnsureProbe(ctx, file, drv)
 		if err != nil {
@@ -539,6 +558,127 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "分片生成失败,请重试", http.StatusBadGateway)
 		}
 	}
+}
+
+// ---------- /api/hls/{id}/... served from a packaging session ----------
+
+// serveSessionHLS answers HLS requests from a long-lived packager session: the
+// media playlist (rewritten to point at our signed endpoints), the fMP4 init
+// segment, and the media segments. A resource the packager has not produced yet
+// is waited for rather than 404'd — the player would otherwise treat a segment
+// that is merely early as fatal.
+func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx context.Context,
+	file *models.MediaFile, drv source.Driver, probe *media.Probe, rest string, q url.Values, segLen float64) {
+
+	audioOrdinal := 0
+	if a := q.Get("a"); a != "" {
+		if n, e := strconv.Atoi(a); e == nil {
+			audioOrdinal = n
+		}
+	}
+	auds := probe.AudioStreams()
+	if audioOrdinal >= len(auds) {
+		audioOrdinal = -1
+	}
+	videoIndex := -1
+	videoCodec := ""
+	if v := probe.Video(); v != nil {
+		videoIndex = v.Index
+		videoCodec = v.CodecName
+	}
+
+	// Re-resolve so a link the cloud refused is replaced (see resolveTarget).
+	target, headers, err := s.Engine.ProbeTarget(ctx, file, drv)
+	if err != nil {
+		fail(w, 502, "获取源地址失败: "+err.Error())
+		return
+	}
+
+	audioMode := "copy"
+	if audioOrdinal >= 0 {
+		if ac := auds[audioOrdinal].CodecName; ac != "aac" && ac != "mp3" {
+			audioMode = "aac"
+		}
+	}
+
+	opts := media.PackagerOptions{
+		FFmpeg:          s.Cfg.FFmpeg,
+		Target:          target,
+		Headers:         headers,
+		VideoIndex:      videoIndex,
+		AudioOrdinal:    audioOrdinal,
+		VideoMode:       "remux",
+		AudioMode:       audioMode,
+		VideoCodec:      videoCodec,
+		TranscodeHeight: s.Cfg.Playback.TranscodeHeight,
+		SegmentSeconds:  segLen,
+	}
+	key := media.SessionKey(file.ID, "remux", audioOrdinal, videoIndex, s.Cfg.Playback.TranscodeHeight)
+	sess, err := s.Engine.EnsureSession(ctx, key, opts)
+	if err != nil {
+		log.Printf("hls session for file %d failed to start: %v", file.ID, err)
+		fail(w, 502, "打包会话启动失败: "+err.Error())
+		return
+	}
+
+	sig := signedQuery(s.Cfg.Secret, file.ID, sigTTL) + "&m=remux"
+	if a := q.Get("a"); a != "" {
+		sig += "&a=" + a
+	}
+	base := fmt.Sprintf("/api/hls/%d", file.ID)
+
+	switch {
+	case rest == "" || strings.HasPrefix(rest, "index") || strings.HasPrefix(rest, "playlist"):
+		if err := sess.WaitForFile(ctx, sess.PlaylistPath(), 45*time.Second); err != nil {
+			fail(w, 502, "打包播放列表未就绪: "+err.Error())
+			return
+		}
+		pl, err := os.ReadFile(sess.PlaylistPath())
+		if err != nil {
+			fail(w, 502, "读取播放列表失败: "+err.Error())
+			return
+		}
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write([]byte(media.RewriteSessionPlaylist(string(pl), base, sig)))
+
+	case rest == "init.mp4":
+		s.serveSessionFile(w, r, ctx, sess, sess.InitPath())
+
+	default:
+		idx, ok := media.ParseSessionSegment(rest)
+		if !ok {
+			fail(w, 404, "未知 HLS 资源")
+			return
+		}
+		s.serveSessionFile(w, r, ctx, sess, sess.SegmentPath(idx))
+	}
+}
+
+// serveSessionFile waits for a packaged file and serves it with Range support.
+func (s *Server) serveSessionFile(w http.ResponseWriter, r *http.Request, ctx context.Context, sess *media.Session, path string) {
+	if err := sess.WaitForFile(ctx, path, 45*time.Second); err != nil {
+		log.Printf("hls session %s: %v", filepath.Base(path), err)
+		w.Header().Set("Retry-After", "2")
+		http.Error(w, "分片尚未就绪,请重试", http.StatusBadGateway)
+		return
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		fail(w, 502, "读取分片失败: "+err.Error())
+		return
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		fail(w, 502, "读取分片失败: "+err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "video/mp4")
+	// Segments are transient: the session directory goes away when the session
+	// closes, so nothing here may be cached by the client.
+	w.Header().Set("Cache-Control", "no-store")
+	http.ServeContent(w, r, filepath.Base(path), fi.ModTime(), f)
 }
 
 // ---------- /api/subs/{id}/{sub}.vtt ----------

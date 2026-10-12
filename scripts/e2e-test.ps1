@@ -218,6 +218,42 @@ if ($forced.reason -notmatch 'HEVC') {
   throw "the fallback reason must name the codec, got '$($forced.reason)'"
 }
 
+Write-Host "==> 7c. session packager: Apple-valid fMP4 for copied HEVC"
+# Apple will not decode HEVC from MPEG-TS, so copied HEVC has to be fMP4 with a
+# proper init segment. This is the whole point of the session packager.
+Invoke-RestMethod -Uri "$Base/api/config" -Method Put -WebSession $sess -ContentType "application/json" `
+  -Body (J @{playback=@{hls_session_packager=$true}}) | Out-Null
+$sp = PlayDecision $hev1 "ios"
+Show "decision with packager" "$($sp.mode) | $($sp.reason)"
+if ($sp.mode -ne "remux") {
+  throw "with the session packager on, HEVC on iOS should be copied (remux), got '$($sp.mode)'"
+}
+$spM3u8 = RawReq $hc "GET" "$Base$($sp.url)" @{}
+$spTxt = [System.Text.Encoding]::UTF8.GetString($spM3u8.Bytes)
+if ($spTxt -notmatch '#EXT-X-MAP:URI="([^"]+)"') { throw "session playlist has no EXT-X-MAP`n$spTxt" }
+$initUrl = $Matches[1]
+Show "playlist EXT-X-MAP" $initUrl
+$initR = RawReq $hc "GET" "$Base$initUrl" @{}
+$initTxt = [System.Text.Encoding]::ASCII.GetString($initR.Bytes)
+Show "init fetch" "$($initR.Status) bytes=$($initR.Bytes.Length) hvc1=$($initTxt.Contains('hvc1')) hev1=$($initTxt.Contains('hev1'))"
+# ffmpeg writes hev1 by default and Apple refuses to play that.
+if (-not $initTxt.Contains('hvc1')) { throw "init segment is not hvc1, Apple would refuse it" }
+if ($initTxt.Contains('hev1')) { throw "init segment still carries hev1" }
+
+$spSegLine = ($spTxt -split "`n" | Where-Object { $_ -and $_ -notmatch '^#' } | Select-Object -First 1).Trim()
+$spSeg = RawReq $hc "GET" "$Base$spSegLine" @{}
+Show "session segment" "$($spSeg.Status) type=$($spSeg.ContentHeaders.ContentType) bytes=$($spSeg.Bytes.Length)"
+if ($spSeg.Status -ne 200 -or $spSeg.Bytes.Length -eq 0) { throw "session segment fetch failed" }
+$comb = Join-Path $env:TEMP "doriya-e2e-fmp4.mp4"
+[System.IO.File]::WriteAllBytes($comb, $initR.Bytes + $spSeg.Bytes)
+$decErr = (& ffmpeg -v error -i $comb -frames:v 1 -f null - 2>&1 | Out-String).Trim()
+if ($decErr) { throw "fMP4 init+segment does not decode: $decErr" }
+Show "fMP4 init+segment decodes" "OK"
+Remove-Item $comb -ErrorAction SilentlyContinue
+# Back to the default so the remaining steps see ordinary behaviour.
+Invoke-RestMethod -Uri "$Base/api/config" -Method Put -WebSession $sess -ContentType "application/json" `
+  -Body (J @{playback=@{hls_session_packager=$false}}) | Out-Null
+
 Write-Host "==> 8. subtitles"
 $epFile = ($targets | Where-Object { $_.title -match "^E1 " } | Select-Object -First 1).file
 $playEp = PlayDecision $epFile "ios"

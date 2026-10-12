@@ -27,7 +27,8 @@
     "preprobe_after_scan": true,
     "preprobe_max_files": 50,
     "preprobe_concurrency": 2,
-    "apple_hevc_copy": false
+    "apple_hevc_copy": false,
+    "hls_session_packager": false
   },
   "scan_concurrency": 4,
   "dev_web_dir": ""

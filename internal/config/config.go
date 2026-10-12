@@ -63,6 +63,13 @@ type Playback struct {
 	// HEVC carried in MPEG-TS: such a copy plays audio with no picture. Enable it
 	// only on a device that has been verified to play HEVC-in-TS.
 	AppleHEVCCopy bool `json:"apple_hevc_copy"`
+
+	// HLSSessionPackager routes HEVC copy for Apple through one long-lived ffmpeg
+	// that packages fMP4 HLS — the only form of copied HEVC Apple will play — so
+	// copied HEVC needs no transcoding at all. It writes the packaged segments
+	// under <data>/cache/hls for the life of a playback session, trading
+	// temporary disk space for CPU. Off by default.
+	HLSSessionPackager bool `json:"hls_session_packager"`
 }
 
 type Config struct {

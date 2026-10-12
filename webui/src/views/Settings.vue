@@ -637,6 +637,18 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                   关闭时这类片子走转码(能看,但吃 CPU)。真机确认能播再打开,可以省下全部转码开销。
                 </span>
               </div>
+              <div class="field wide">
+                <label>会话打包(fMP4,Apple 直拷 HEVC)</label>
+                <label class="check-line">
+                  <input type="checkbox" v-model="cfg.playback.hls_session_packager" />
+                  用长驻 ffmpeg 打包 fMP4,让 Apple 设备直拷 HEVC 而不转码
+                </label>
+                <span class="hint">
+                  Apple 只接受 fMP4 里的 HEVC,这个模式会输出正确的 fMP4(带 #EXT-X-MAP 与 hvc1),
+                  于是 HEVC 不再转码、CPU 几乎为零。代价:播放期间分片写在
+                  <code>data/cache/hls</code>(一部片子约等于原文件大小),会话结束自动清理。
+                </span>
+              </div>
             </div>
           </div>
 
