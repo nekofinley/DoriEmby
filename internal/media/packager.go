@@ -238,9 +238,9 @@ func packagerArgs(o PackagerOptions) ([]string, error) {
 // The names ffmpeg is told to write, and therefore the names a session — live or
 // adopted from a previous run's cache — finds in its directory.
 const (
-	packagerPlaylistName    = "index.m3u8"
-	packagerInitName        = "init.mp4"
-	packagerSegmentPattern  = "seg%05d.m4s"
+	packagerPlaylistName   = "index.m3u8"
+	packagerInitName       = "init.mp4"
+	packagerSegmentPattern = "seg%05d.m4s"
 )
 
 // Dir is the directory holding the packaged output.
