@@ -645,8 +645,17 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                 </label>
                 <span class="hint">
                   Apple 只接受 fMP4 里的 HEVC,这个模式会输出正确的 fMP4(带 #EXT-X-MAP 与 hvc1),
-                  于是 HEVC 不再转码、CPU 几乎为零。代价:播放期间分片写在
-                  <code>data/cache/hls</code>(一部片子约等于原文件大小),会话结束自动清理。
+                  于是 HEVC 不再转码、CPU 几乎为零。每个分片只生成一次、不再逐片重启 ffmpeg,
+                  也不再来回重读探测窗口。
+                </span>
+              </div>
+              <div class="field">
+                <label>分片缓存上限(MB)</label>
+                <input v-model="cfg.playback.hls_cache_mb" type="number" step="256" min="0" />
+                <span class="hint">
+                  打包完成的产物留在 <code>data/cache/hls</code>,同一部片子**再次播放直接秒开**;
+                  超出上限时按最近最少使用淘汰,未完成的残留会在启动时清掉。填 0 表示不留缓存
+                  (播放结束即删)。默认 2048。
                 </span>
               </div>
             </div>

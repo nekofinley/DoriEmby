@@ -228,12 +228,20 @@ func packagerArgs(o PackagerOptions) ([]string, error) {
 		// on the first segments instead of waiting for the whole file.
 		"-hls_playlist_type", "event",
 		"-hls_list_size", "0",
-		"-hls_fmp4_init_filename", "init.mp4",
-		"-hls_segment_filename", "seg%05d.m4s",
-		"index.m3u8",
+		"-hls_fmp4_init_filename", packagerInitName,
+		"-hls_segment_filename", packagerSegmentPattern,
+		packagerPlaylistName,
 	)
 	return args, nil
 }
+
+// The names ffmpeg is told to write, and therefore the names a session — live or
+// adopted from a previous run's cache — finds in its directory.
+const (
+	packagerPlaylistName    = "index.m3u8"
+	packagerInitName        = "init.mp4"
+	packagerSegmentPattern  = "seg%05d.m4s"
+)
 
 // Dir is the directory holding the packaged output.
 func (p *Packager) Dir() string { return p.dir }

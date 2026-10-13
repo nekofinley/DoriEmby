@@ -253,6 +253,19 @@ if ($decErr) { throw "fMP4 init+segment does not decode: $decErr" }
 Show "fMP4 init+segment decodes" "OK"
 Remove-Item $comb -ErrorAction SilentlyContinue
 
+# The packaged output is cached so a replayed file needs no packaging at all.
+# A finished session's playlist carries ENDLIST, so seeing it on a replay proves
+# the output survived rather than being thrown away and packaged again.
+Start-Sleep -Seconds 2
+$replay = RawReq $hc "GET" "$Base$($sp.url)" @{}
+$replayTxt = [System.Text.Encoding]::UTF8.GetString($replay.Bytes)
+$replaySegs = @($replayTxt -split "`n" | Where-Object { $_ -and $_ -notmatch '^#' }).Count
+Show "cached replay" "status=$($replay.Status) segments=$replaySegs endlist=$($replayTxt.Contains('#EXT-X-ENDLIST'))"
+if ($replay.Status -ne 200 -or $replaySegs -eq 0) { throw "replaying a packaged file must be served from cache" }
+if (-not $replayTxt.Contains('#EXT-X-ENDLIST')) {
+  throw "the packaging should have finished by now; its output must be kept for replay"
+}
+
 Write-Host "==> 7d. resuming begins the session at the saved position"
 # ffmpeg rebases timestamps to zero when it seeks, so a session that starts
 # mid-file has to be put back on the absolute timeline when served: otherwise the

@@ -70,6 +70,13 @@ type Playback struct {
 	// under <data>/cache/hls for the life of a playback session, trading
 	// temporary disk space for CPU. Off by default.
 	HLSSessionPackager bool `json:"hls_session_packager"`
+
+	// HLSCacheMB bounds the packaged-segment cache under <data>/cache/hls. A
+	// session that finished the whole file is kept, so replaying that file needs
+	// no packaging at all; the least recently used are evicted to stay inside this
+	// budget, and nothing partial survives a restart. 0 turns the cache off, and
+	// then a session's output is deleted as soon as it ends.
+	HLSCacheMB int `json:"hls_cache_mb"`
 }
 
 type Config struct {
@@ -112,6 +119,7 @@ func Defaults() *Config {
 			PreProbeAfterScan:   true,
 			PreProbeMaxFiles:    100,
 			PreProbeConcurrency: 1,
+			HLSCacheMB:          2048,
 		},
 		ScanConcurrency: 4,
 	}
@@ -191,6 +199,14 @@ func (c *Config) normalize() {
 	}
 	if c.Playback.PreProbeConcurrency > 8 {
 		c.Playback.PreProbeConcurrency = 8
+	}
+	// The cache budget is in MB; an unset value gets the default rather than
+	// silently disabling the cache, and a negative one means "off".
+	if c.Playback.HLSCacheMB < 0 {
+		c.Playback.HLSCacheMB = 0
+	}
+	if c.Playback.HLSCacheMB > 102400 {
+		c.Playback.HLSCacheMB = 102400
 	}
 	if c.ScanConcurrency <= 0 {
 		c.ScanConcurrency = 4

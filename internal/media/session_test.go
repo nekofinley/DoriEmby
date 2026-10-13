@@ -133,10 +133,193 @@ func TestSessionLifecycle(t *testing.T) {
 		t.Fatalf("waiting for first segment: %v", err)
 	}
 
+	// Let it finish (an event playlist gains ENDLIST at the end), because what
+	// happens to the directory now depends on whether the file was completed.
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		if pl, err := os.ReadFile(sess.PlaylistPath()); err == nil && strings.Contains(string(pl), "#EXT-X-ENDLIST") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("packaging did not finish")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
 	dir := sess.Dir()
 	e.CloseSessions()
-	if _, err := os.Stat(dir); !os.IsNotExist(err) {
-		t.Fatalf("closing the session must remove its directory %s (stat err=%v)", dir, err)
+	// Completed output is cache: replaying the file must not package it again.
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("a completed session must be kept as cache: %v", err)
+	}
+	if !sess.Complete() {
+		t.Error("a finished session must be marked complete")
+	}
+	if sess.Size() <= 0 {
+		t.Error("a completed session must have a measured size")
+	}
+
+	// And a fresh engine adopts it from disk, so a restart does not redo the work.
+	e2 := newTestEngine(t, nil)
+	e2.Cfg.DataDir = e.Cfg.DataDir
+	e2.LoadCache()
+	adopted := e2.SessionForStream(42, "remux", 0, 0, 1080)
+	if adopted == nil {
+		t.Fatal("LoadCache did not adopt the completed session from disk")
+	}
+	if !adopted.Complete() || adopted.Size() != sess.Size() {
+		t.Errorf("adopted session looks wrong: complete=%v size=%d want %d", adopted.Complete(), adopted.Size(), sess.Size())
+	}
+	// Reuse: asking again must return the adopted session, not start a packager.
+	reuse, err := e2.EnsureSession(ctx, SessionKey(42, "remux", 0, 0, 1080, 0), PackagerOptions{Target: testMKV})
+	if err != nil {
+		t.Fatalf("EnsureSession after LoadCache: %v", err)
+	}
+	if reuse != adopted {
+		t.Error("a cached session must be reused instead of packaging the file again")
+	}
+	if reuse.pack != nil {
+		t.Error("a reused session must not have started a packager")
+	}
+}
+
+// Half-written output is worthless: it must not survive as cache.
+func TestIncompleteSessionIsDiscarded(t *testing.T) {
+	requireFFmpeg(t)
+	dir := t.TempDir()
+	src := requireSeekableSource(t, dir, 120)
+
+	e := newTestEngine(t, nil)
+	e.Cfg.DataDir = t.TempDir()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	sess, err := e.EnsureSession(ctx, SessionKey(5, "remux", 0, 0, 1080, 0), PackagerOptions{
+		Target: src, VideoIndex: 0, AudioOrdinal: -1, VideoMode: "copy", VideoCodec: "h264",
+	})
+	if err != nil {
+		t.Fatalf("EnsureSession: %v", err)
+	}
+	out := sess.Dir()
+	if sess.Complete() {
+		t.Fatal("the session cannot have completed this fast")
+	}
+	e.CloseSessions()
+	if _, err := os.Stat(out); !os.IsNotExist(err) {
+		t.Fatalf("an unfinished session's directory must be removed (stat err=%v)", err)
+	}
+}
+
+// fakeCacheSession registers a completed session holding a file of n bytes.
+func fakeCacheSession(t *testing.T, e *Engine, fileID int64, start int, n int) *Session {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "seg00000.m4s"), make([]byte, n), 0o644); err != nil {
+		t.Fatalf("write segment: %v", err)
+	}
+	s := &Session{key: SessionKey(fileID, "remux", 0, 0, 1080, start), dir: dir, lastUsed: time.Now()}
+	s.markComplete()
+	e.sessMu.Lock()
+	e.sessions[s.key] = s
+	e.sessMu.Unlock()
+	return s
+}
+
+// The cache has to stay inside its budget, and it must evict the session nobody
+// has touched for longest — never the one serving a request right now.
+func TestCacheEvictionDropsLeastRecentlyUsed(t *testing.T) {
+	e := newTestEngine(t, nil)
+	e.Cfg.DataDir = t.TempDir()
+	e.Cfg.Playback.HLSCacheMB = 1 // 1 MiB budget
+
+	oldest := fakeCacheSession(t, e, 1, 0, 400<<10)
+	middle := fakeCacheSession(t, e, 2, 0, 400<<10)
+	inUse := fakeCacheSession(t, e, 3, 0, 400<<10)
+	oldest.lastUsed = time.Now().Add(-time.Hour)
+	middle.lastUsed = time.Now().Add(-time.Minute)
+	inUse.lastUsed = time.Now() // active: must survive this pass
+
+	e.evictCache(nil)
+
+	if _, err := os.Stat(oldest.Dir()); !os.IsNotExist(err) {
+		t.Error("the least recently used session must be evicted first")
+	}
+	if _, err := os.Stat(middle.Dir()); err != nil {
+		t.Error("eviction should have stopped once the cache fitted its budget")
+	}
+	if _, err := os.Stat(inUse.Dir()); err != nil {
+		t.Error("a session in active use must not be evicted")
+	}
+
+	// With the budget already satisfied, nothing else goes.
+	e.evictCache(nil)
+	if _, err := os.Stat(middle.Dir()); err != nil {
+		t.Error("eviction must not run past the budget")
+	}
+
+	// A budget of zero means no cache at all.
+	if (&Engine{Cfg: e.Cfg}).keepCompleted() != true {
+		t.Error("a positive budget must keep completed output")
+	}
+	e.Cfg.Playback.HLSCacheMB = 0
+	if e.keepCompleted() {
+		t.Error("a zero budget must disable the cache")
+	}
+}
+
+// Startup must adopt finished output and throw away anything partial.
+func TestLoadCacheAdoptsCompleteAndDropsPartial(t *testing.T) {
+	e := newTestEngine(t, nil)
+	e.Cfg.DataDir = t.TempDir()
+	root := filepath.Join(e.Cfg.Abs(), "cache", "hls")
+
+	good := filepath.Join(root, SessionKey(7, "remux", 0, 0, 1080, 12).dirName())
+	if err := os.MkdirAll(good, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeFileT(t, filepath.Join(good, packagerPlaylistName), "#EXTM3U\n#EXTINF:4,\nseg00012.m4s\n#EXT-X-ENDLIST\n")
+	writeFileT(t, filepath.Join(good, packagerInitName), "init")
+	writeFileT(t, filepath.Join(good, fmt.Sprintf(packagerSegmentPattern, 12)), "segment")
+
+	partial := filepath.Join(root, SessionKey(8, "remux", 0, 0, 1080, 0).dirName())
+	if err := os.MkdirAll(partial, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeFileT(t, filepath.Join(partial, packagerPlaylistName), "#EXTM3U\n") // no init, no segments
+
+	junk := filepath.Join(root, "not-a-session")
+	if err := os.MkdirAll(junk, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	e.LoadCache()
+
+	if s := e.SessionForSegment(7, "remux", 0, 0, 1080, 12, SessionSeekAhead); s == nil {
+		t.Error("a completed session on disk must be adopted")
+	} else if !s.Complete() || s.StartSegment() != 12 {
+		t.Errorf("adopted session has wrong state: complete=%v start=%d", s.Complete(), s.StartSegment())
+	}
+	if _, err := os.Stat(partial); !os.IsNotExist(err) {
+		t.Error("a partial session directory must be removed at startup")
+	}
+	if _, err := os.Stat(junk); err != nil {
+		t.Error("a directory that is not a session should be left alone")
+	}
+
+	// With the cache turned off, even a finished directory is cleared out.
+	e2 := newTestEngine(t, nil)
+	e2.Cfg.DataDir = e.Cfg.DataDir
+	e2.Cfg.Playback.HLSCacheMB = 0
+	e2.LoadCache()
+	if _, err := os.Stat(good); !os.IsNotExist(err) {
+		t.Error("with caching off, leftover output must be cleared at startup")
+	}
+}
+
+func writeFileT(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
 	}
 }
 

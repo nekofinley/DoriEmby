@@ -221,6 +221,12 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request, user *m
 		if req.Playback.HLSSessionPackager != nil {
 			s.Cfg.Playback.HLSSessionPackager = *req.Playback.HLSSessionPackager
 		}
+		if req.Playback.HLSCacheMB != nil {
+			s.Cfg.Playback.HLSCacheMB = *req.Playback.HLSCacheMB
+			if s.Cfg.Playback.HLSCacheMB < 0 {
+				s.Cfg.Playback.HLSCacheMB = 0
+			}
+		}
 	}
 	if err := s.Cfg.Save(s.configFile()); err != nil {
 		fail(w, 500, err.Error())
@@ -258,4 +264,5 @@ type configPlayback = struct {
 	PreProbeConcurrency *int  `json:"preprobe_concurrency"`
 	AppleHEVCCopy       *bool `json:"apple_hevc_copy"`
 	HLSSessionPackager  *bool `json:"hls_session_packager"`
+	HLSCacheMB          *int  `json:"hls_cache_mb"`
 }

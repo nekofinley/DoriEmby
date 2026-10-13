@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -98,6 +99,52 @@ type Session struct {
 	startSeconds float64
 	// tracks caches the init segment's track timescales for that shift.
 	tracks []mp4Track
+	// complete is set once the packager finished the whole file successfully:
+	// such a session's output is kept on disk so replaying the file is instant,
+	// and it survives a restart (see LoadCache).
+	complete bool
+	// size is the directory's size in bytes, measured when it completes.
+	size int64
+}
+
+// markComplete records that the packager finished and measures what it produced.
+func (s *Session) markComplete() {
+	s.mu.Lock()
+	s.complete = true
+	s.mu.Unlock()
+	s.size = dirSize(s.dir)
+}
+
+// Complete reports whether this session packaged the whole file.
+func (s *Session) Complete() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.complete
+}
+
+// Size is the bytes this session holds, once measured.
+func (s *Session) Size() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.size
+}
+
+// dirSize totals the regular files in a directory, ignoring errors.
+func dirSize(dir string) int64 {
+	var total int64
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if fi, err := e.Info(); err == nil {
+			total += fi.Size()
+		}
+	}
+	return total
 }
 
 // StartSeconds is the absolute file position this session began at.
@@ -163,14 +210,19 @@ func (s *Session) activeWithin(d time.Duration) bool { return s.idleFor() <= d }
 // Dir is the session's output directory.
 func (s *Session) Dir() string { return s.dir }
 
+// These derive from the directory rather than from a running packager, so a
+// session adopted from a previous run's cache behaves like a live one.
+
 // InitPath is the fMP4 initialization segment path.
-func (s *Session) InitPath() string { return s.pack.InitPath() }
+func (s *Session) InitPath() string { return filepath.Join(s.dir, packagerInitName) }
 
 // PlaylistPath is ffmpeg's own media playlist path.
-func (s *Session) PlaylistPath() string { return s.pack.PlaylistPath() }
+func (s *Session) PlaylistPath() string { return filepath.Join(s.dir, packagerPlaylistName) }
 
 // SegmentPath is the file path for segment index i.
-func (s *Session) SegmentPath(i int) string { return s.pack.SegmentPath(i) }
+func (s *Session) SegmentPath(i int) string {
+	return filepath.Join(s.dir, fmt.Sprintf(packagerSegmentPattern, i))
+}
 
 // Failed reports a packaging failure that has already happened.
 func (s *Session) Failed() error {
@@ -219,8 +271,9 @@ func (s *Session) WaitForFile(ctx context.Context, path string, max time.Duratio
 	}
 }
 
-// close stops the packager and removes the session directory.
-func (s *Session) close() {
+// close stops the packager. The output is removed unless the session completed
+// and is being kept as cache (see keepCompleted).
+func (s *Session) close(remove bool) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -240,10 +293,173 @@ func (s *Session) close() {
 		case <-time.After(3 * time.Second):
 		}
 	}
-	_ = os.RemoveAll(s.dir)
+	if remove {
+		_ = os.RemoveAll(s.dir)
+	}
 }
 
-// EnsureSession returns the live session for key, starting one if needed.
+// finished reports whether the packager exited successfully, i.e. the whole file
+// was packaged and the output is worth keeping.
+func (s *Session) finished() bool {
+	if s.pack == nil {
+		return s.Complete()
+	}
+	select {
+	case <-s.pack.Done():
+		if err := s.pack.Err(); err == nil {
+			if !s.Complete() {
+				s.markComplete()
+			}
+			return true
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+// keepCompleted is the cache policy: completed output stays on disk so a replay
+// does not package the file again, while anything partial is worthless and goes.
+// A zero budget disables the cache entirely.
+func (e *Engine) keepCompleted() bool {
+	return e.Cfg == nil || e.Cfg.Playback.HLSCacheMB > 0
+}
+
+// cacheBudget is the cache's size limit in bytes (0 = unlimited).
+func (e *Engine) cacheBudget() int64 {
+	if e.Cfg == nil || e.Cfg.Playback.HLSCacheMB <= 0 {
+		return 0
+	}
+	return int64(e.Cfg.Playback.HLSCacheMB) << 20
+}
+
+// evictCache deletes least-recently-used completed sessions until the cache fits
+// its budget, never touching one that is still in use or the caller's protectee.
+func (e *Engine) evictCache(protect *Session) {
+	budget := e.cacheBudget()
+	if budget <= 0 {
+		return
+	}
+	e.sessMu.Lock()
+	total := int64(0)
+	var done []*Session
+	for _, s := range e.sessions {
+		if s.Complete() {
+			total += s.Size()
+			done = append(done, s)
+		}
+	}
+	e.sessMu.Unlock()
+	if total <= budget {
+		return
+	}
+	// Oldest first, but a session serving a request right now is not a candidate,
+	// and neither is the one the caller is about to use.
+	sort.Slice(done, func(i, j int) bool { return done[i].lastUsedTime().Before(done[j].lastUsedTime()) })
+	for _, s := range done {
+		if total <= budget {
+			return
+		}
+		if s == protect || s.activeWithin(SessionActiveFor) {
+			continue
+		}
+		e.sessMu.Lock()
+		delete(e.sessions, s.key)
+		e.sessMu.Unlock()
+		size := s.Size()
+		s.close(true)
+		total -= size
+		log.Printf("hls cache: evicted session %s (%d MB)", s.key.dirName(), size>>20)
+	}
+}
+
+// LoadCache adopts packaging output left by a previous run, so replaying a file
+// does not package it again, and removes directories that never completed.
+// It is safe to call before serving anything.
+func (e *Engine) LoadCache() {
+	root := filepath.Join(e.Cfg.Abs(), "cache", "hls")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	adopted, dropped := 0, 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		key, ok := parseSessionDirName(entry.Name())
+		if !ok {
+			continue
+		}
+		dir := filepath.Join(root, entry.Name())
+		if !e.keepCompleted() || !looksComplete(dir) {
+			// Nothing that can be resumed: a partial directory is dead weight.
+			_ = os.RemoveAll(dir)
+			dropped++
+			continue
+		}
+		s := &Session{key: key, dir: dir, lastUsed: time.Now()}
+		s.markComplete()
+		e.sessMu.Lock()
+		e.sessions[key] = s
+		e.sessMu.Unlock()
+		adopted++
+	}
+	if adopted > 0 || dropped > 0 {
+		log.Printf("hls cache: adopted %d completed session(s), removed %d incomplete", adopted, dropped)
+	}
+	e.evictCache(nil)
+}
+
+// looksComplete reports whether a directory holds a usable packaged session:
+// the playlist, the init segment and at least one media segment.
+func looksComplete(dir string) bool {
+	if fi, err := os.Stat(filepath.Join(dir, packagerPlaylistName)); err != nil || fi.Size() == 0 {
+		return false
+	}
+	if fi, err := os.Stat(filepath.Join(dir, packagerInitName)); err != nil || fi.Size() == 0 {
+		return false
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() && reSessionSegment.MatchString(e.Name()) {
+			return true
+		}
+	}
+	return false
+}
+
+// parseSessionDirName reverses sessionKey.dirName. The mode never contains a
+// dash, so the fields split unambiguously.
+func parseSessionDirName(name string) (sessionKey, bool) {
+	var k sessionKey
+	parts := strings.Split(name, "-")
+	if len(parts) != 6 {
+		return k, false
+	}
+	fileID, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return k, false
+	}
+	num := func(s string) (int, bool) {
+		v, err := strconv.Atoi(strings.TrimLeft(s, "avhs"))
+		return v, err == nil
+	}
+	audio, ok1 := num(parts[2])
+	vindex, ok2 := num(parts[3])
+	height, ok3 := num(parts[4])
+	start, ok4 := num(parts[5])
+	if !ok1 || !ok2 || !ok3 || !ok4 {
+		return k, false
+	}
+	return sessionKey{fileID: fileID, mode: parts[1], audio: audio, vindex: vindex, height: height, start: start}, true
+}
+
+// EnsureSession returns the live session for key, reusing a completed one when
+// the cache still holds it, and starting a packager otherwise.
 func (e *Engine) EnsureSession(ctx context.Context, key sessionKey, opts PackagerOptions) (*Session, error) {
 	e.gcSessions()
 
@@ -254,6 +470,9 @@ func (e *Engine) EnsureSession(ctx context.Context, key sessionKey, opts Package
 		return s, nil
 	}
 	e.sessMu.Unlock()
+
+	// Make room before writing anything.
+	e.evictCache(nil)
 
 	// The packager needs an existing directory and runs with it as its working
 	// directory (see packager.go for why).
@@ -279,7 +498,7 @@ func (e *Engine) EnsureSession(ctx context.Context, key sessionKey, opts Package
 	// Another request may have won the race; keep only one session per key.
 	if existing, ok := e.sessions[key]; ok {
 		e.sessMu.Unlock()
-		s.close()
+		s.close(true)
 		existing.Touch()
 		return existing, nil
 	}
@@ -288,7 +507,8 @@ func (e *Engine) EnsureSession(ctx context.Context, key sessionKey, opts Package
 	return s, nil
 }
 
-// gcSessions closes sessions that have been idle for a while.
+// gcSessions ends sessions that have been idle for a while. Output that finished
+// cleanly is kept as cache; anything partial is removed.
 func (e *Engine) gcSessions() {
 	e.sessMu.Lock()
 	var dead []*Session
@@ -299,12 +519,14 @@ func (e *Engine) gcSessions() {
 		}
 	}
 	e.sessMu.Unlock()
+	keep := e.keepCompleted()
 	for _, s := range dead {
-		s.close()
+		s.close(!(keep && s.finished()))
 	}
 }
 
-// CloseSessions stops every session (used on shutdown).
+// CloseSessions stops every session (used on shutdown). Completed output stays
+// behind as cache; partial output goes.
 func (e *Engine) CloseSessions() {
 	e.sessMu.Lock()
 	all := make([]*Session, 0, len(e.sessions))
@@ -313,8 +535,9 @@ func (e *Engine) CloseSessions() {
 		delete(e.sessions, k)
 	}
 	e.sessMu.Unlock()
+	keep := e.keepCompleted()
 	for _, s := range all {
-		s.close()
+		s.close(!(keep && s.finished()))
 	}
 }
 
@@ -409,8 +632,11 @@ func (e *Engine) CloseStreamSessions(fileID int64, mode string, audio, vindex, h
 		}
 	}
 	e.sessMu.Unlock()
+	// A session that finished is still useful cache (seeking back to that
+	// position becomes instant); a half-written one is discarded.
+	cacheOn := e.keepCompleted()
 	for _, s := range dead {
-		s.close()
+		s.close(!(cacheOn && s.finished()))
 	}
 }
 

@@ -51,6 +51,9 @@ func main() {
 	}
 
 	engine := media.NewEngine(store, cfg)
+	// Adopt packaged output a previous run left behind (and drop anything that
+	// never finished), so replaying a file does not package it again.
+	engine.LoadCache()
 	manager := metadata.NewManager(store, cfg)
 	scanner := &scan.Scanner{
 		Store: store,
