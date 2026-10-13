@@ -74,7 +74,7 @@ if ($play.mode -eq "direct" -or $play.mode -eq "proxy") {
     Show "status" $r.Status
     Show "content-range" $r.Resp.Content.Headers.ContentRange
   }
-} elseif ($play.mode -eq "remux" -or $play.mode -eq "transcode") {
+} elseif ($play.mode -eq "remux") {
   $r = RawReq $hc "GET" ($Base + $play.url) @{}
   $m3u8 = [System.Text.Encoding]::UTF8.GetString($r.Bytes)
   $segs = ($m3u8 -split "`n" | Where-Object { $_ -match "^/" } | Select-Object -First 1)
@@ -85,5 +85,7 @@ if ($play.mode -eq "direct" -or $play.mode -eq "proxy") {
     $sync = $b[0] -eq 0x47
     Show "segment" "$($s.Status) bytes=$($b.Length) ts-sync=$sync"
   }
+} elseif ($play.mode -eq "unsupported") {
+  throw "the decision refused this file: $($play.reason)"
 }
 Write-Host "LIVE TEST DONE"

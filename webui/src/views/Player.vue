@@ -105,11 +105,18 @@ const touchPlayer = computed(() => touchOnly && !nativeControls.value)
  * because a back button that vanishes on a page is just a lost back button.
  * A fullscreen stage counts as a theater even when the page behind it is not. */
 const theaterChrome = computed(() => !isStacked.value || fsActive.value)
+/* Who gets a bar over the picture. The tablet watch page does not: iPadOS puts
+ * its own fullscreen control in the picture's top-left corner, and a back button
+ * on top of it is a mis-tap waiting to happen — that page keeps its 返回 in the
+ * text below instead. */
+const stageBar = computed(() => theaterChrome.value || layout.value === 'phone')
 const chromeHidden = computed(() => theaterChrome.value && !controlsVisible.value &&
   isPlaying.value && !menuOpen.value && !panelOpen.value)
 
 const modeClass = computed(() => `mode-${play.value?.mode || 'direct'}`)
-const MODE_LABELS = { direct: '302 直连', proxy: '代理播放', remux: 'HLS 转封装', transcode: 'HLS 转码' }
+const MODE_LABELS = { direct: '302 直连', proxy: '代理播放', remux: 'HLS 转封装', unsupported: '无法播放' }
+/** The server refused the file itself: there is nothing to attach, only a reason. */
+const unplayableFile = computed(() => play.value?.mode === 'unsupported')
 function candName(c) { return MODE_LABELS[c?.mode] || c?.mode || '' }
 const modeLabel = computed(() => candName(play.value))
 
@@ -164,7 +171,8 @@ const forceModes = [
   { value: 'direct', label: '强制 302 直连', hint: '不经过服务器,最省带宽' },
   { value: 'proxy', label: '强制代理', hint: '服务器中转,支持拖动' },
   { value: 'remux', label: '强制 HLS 转封装', hint: '视频直拷,只转不兼容音轨' },
-  { value: 'transcode', label: '强制 HLS 转码', hint: '编码不支持时使用,占用 CPU' },
+  // There is no "强制转码": re-encoding video is not offered at all, so a mode
+  // that would start one has no place in the list.
 ]
 
 /* --------------------------------------------------------- episodes (选集) */
@@ -285,6 +293,7 @@ let hideTimer = null
 let probeTimer = null
 let streamTimer = null
 let stallTimer = null
+let waitTimer = null     // grace period before a buffering event counts as loading
 let stallSince = 0
 let disposed = false
 
@@ -310,6 +319,7 @@ async function loadDecision(force) {
   // The episode list does not depend on the decision, so ask for it in parallel
   // with the (slow) probe rather than after it.
   loadQueue()
+  if (unplayable()) return
   if (play.value?.state === 'probing') {
     startProbePoll()
     return
@@ -318,11 +328,24 @@ async function loadDecision(force) {
   attachSource()
 }
 
+/**
+ * The server decided nothing here can play this file (its video codec has no
+ * decoding path on this client, and re-encoding is disabled). There is no source
+ * to attach, so the reason becomes the message and the player stops there.
+ */
+function unplayable() {
+  if (!unplayableFile.value) return false
+  fatal.value = play.value?.reason || '这个文件在当前设备上无法播放'
+  error.value = ''
+  isLoading.value = false
+  return true
+}
+
 // Ask the browser what it can actually decode, rather than assuming. A machine
 // with hardware HEVC support answers yes, and the server then copies the video
-// instead of transcoding it; a machine that answers no gets a transcode instead
-// of a stream it would only fail to decode. The report is a result either way,
-// because "no answer" means "unknown" and must keep the old behaviour.
+// instead of refusing the file; a machine that answers no is never handed HEVC it
+// would only fail to decode. The report is a result either way, because
+// "no answer" means "unknown" and must keep the old behaviour.
 //
 // Audio is asked the same way, for the same reason: AC-3, E-AC-3 and DTS are
 // decoded by the operating system rather than the browser, so the server's codec
@@ -394,6 +417,7 @@ function startProbePoll() {
       try { play.value = await fetchPlay() } catch (e) { fatal.value = e.message; isLoading.value = false; return }
       if (disposed) return
       loadQueue()
+      if (unplayable()) return
       if (play.value?.state === 'probing') { probeTimer = setTimeout(tick, 800); return }
       await nextTick()
       attachSource()
@@ -453,9 +477,14 @@ function stopStreamPoll() {
 }
 
 /* Stall clock: while the player waits on data, show how long we have waited —
-   that is the difference between "still loading" and "dead". */
+   that is the difference between "still loading" and "dead".
+
+   The picture has the last word on whether the player is loading. A `waiting`
+   event is not proof that it stopped — the element raises it while it buffers
+   ahead too — so the state is only claimed once the playhead has really stalled,
+   and any frame that moves clears it again (markPlaying). A spinner over a
+   picture that is already playing is worse than no spinner at all. */
 function onWaiting() {
-  isLoading.value = true
   if (stallSince) return
   stallSince = Date.now()
   stallSeconds.value = 0
@@ -463,9 +492,26 @@ function onWaiting() {
   stallTimer = setInterval(() => {
     stallSeconds.value = (Date.now() - stallSince) / 1000
   }, 500)
+  if (waitTimer) clearTimeout(waitTimer)
+  waitTimer = setTimeout(() => {
+    waitTimer = null
+    const v = videoEl.value
+    // HAVE_FUTURE_DATA (3) is the least that can keep playing; below it the
+    // element really has run out of data, and saying so is honest whether or not
+    // the viewer had pressed play.
+    if (v && v.readyState < 3) isLoading.value = true
+  }, 400)
 }
 
 function onPlaying() {
+  isLoading.value = false
+  clearStall()
+}
+
+/** Frames are moving: nothing is loading, whatever the element's events said. */
+function markPlaying() {
+  const v = videoEl.value
+  if (!v || v.paused || v.readyState < 3 || !(v.currentTime > 0)) return
   isLoading.value = false
   clearStall()
 }
@@ -474,6 +520,7 @@ function clearStall() {
   stallSince = 0
   stallSeconds.value = 0
   if (stallTimer) { clearInterval(stallTimer); stallTimer = null }
+  if (waitTimer) { clearTimeout(waitTimer); waitTimer = null }
 }
 
 const cands = ref([])
@@ -504,28 +551,17 @@ let candMeta = false   // the element reported metadata for it
 let switchTimer = null // pending retry, so two error events cannot race
 let errHandledAt = 0   // when a failure was last acted on (one failure, two events)
 
-// 候选链:主决策 + 后端下发的备用方案(直连/代理/转封装/转码)。
+// 候选链:主决策 + 后端下发的备用方案(直连/代理/转封装)。
 // 后端只会下发这个客户端真的能用的方案,并已按"便宜→贵"排好序。
 function buildCandidates() {
   const p = play.value
-  const list = [{ mode: p.mode, url: p.url, kind: p.kind || (p.url.includes('/api/hls/') ? 'hls' : 'mp4') }]
-  for (const a of (p.alternates || [])) {
-    list.push({ mode: a.mode, url: a.url, kind: a.url.includes('/api/hls/') ? 'hls' : 'mp4' })
+  const list = []
+  const push = (mode, url, kind) => {
+    if (!url) return   // an unplayable decision carries no stream and no chain
+    list.push({ mode, url, kind: kind || (url.includes('/api/hls/') ? 'hls' : 'mp4') })
   }
-  const v = videoEl.value
-  if (v && p.video_codec === 'hevc' && list[0].kind === 'mp4') {
-    const hevcOK = v.canPlayType('video/mp4; codecs="hvc1.1.6.L93.B0"') ||
-      v.canPlayType('video/mp4; codecs="hev1.1.6.L93.B0"') ||
-      v.canPlayType('video/x-matroska; codecs="hvc1.1.6.L93.B0"')
-    if (!hevcOK) {
-      const ti = list.findIndex((c) => c.mode === 'transcode')
-      if (ti > 0) {
-        const [t] = list.splice(ti, 1)
-        list.unshift(t)
-        toast.info('本机不支持 HEVC 硬解,已切换云端转码')
-      }
-    }
-  }
+  push(p.mode, p.url, p.kind)
+  for (const a of (p.alternates || [])) push(a.mode, a.url)
   return list
 }
 
@@ -679,7 +715,10 @@ function onHlsError(_, data) {
 }
 
 function onLoadedMetadata() {
-  isLoading.value = false
+  // Metadata is not "ready": a stream still waiting for its first segments keeps
+  // its loading state (and its bar) until there is enough to play, or until
+  // frames actually move.
+  if (videoEl.value && videoEl.value.readyState >= 3) isLoading.value = false
   candMeta = true
   const v = videoEl.value
   // Everything here is reported in *file* time. A packaged session begins where
@@ -728,6 +767,9 @@ function onErr() {
 function onTimeUpdate() {
   const v = videoEl.value
   if (!v) return
+  // Every tick is proof the picture is moving — the moment it starts, the
+  // loading state goes away and stays away until it really stalls.
+  markPlaying()
   // The element's clock is relative to the stream; everything the UI and the API
   // deal in is file time, so the session offset is added on the way out.
   if (!scrubbing.value) position.value = v.currentTime + streamStart.value
@@ -762,7 +804,7 @@ watch(() => route.params.fileId, (nv, ov) => {
 function selectAudio(i) {
   currentAudio.value = i
   panelOpen.value = false
-  loadDecision(play.value.mode === 'transcode' ? 'transcode' : undefined)
+  loadDecision()
 }
 
 // Subtitle preference: 'auto' (follow the server's ranking), 'off', or a
@@ -1132,11 +1174,11 @@ onBeforeUnmount(() => {
             <!-- On the immersive player the top bar carries the title and the
                  settings; on a watch page both are in the page below, so only
                  the way back stays on the picture. -->
-            <div class="top-bar">
+            <div v-if="stageBar" class="top-bar">
               <button class="icon-btn solid round" aria-label="返回" @click="goBack">
                 <AppIcon name="arrowLeft" :size="19" />
               </button>
-              <template v-if="!isStacked">
+              <template v-if="theaterChrome">
                 <div class="tb-title">
                   <div class="tb-name truncate">{{ play?.title || '播放中' }}</div>
                   <div class="tb-sub">
@@ -1170,9 +1212,11 @@ onBeforeUnmount(() => {
               </button>
             </Transition>
 
-            <!-- center states -->
+            <!-- Center states. The theater has nowhere else to put them; a watch
+                 page shows its progress under the picture instead (see .wi-loading
+                 below), where it cannot cover the picture or the play button. -->
             <Transition name="fade">
-              <div v-if="isLoading && !error && !fatal" class="center-state">
+              <div v-if="!isStacked && isLoading && !error && !fatal" class="center-state">
                 <span class="ring" />
                 <div class="cs-text">{{ loadingText }}</div>
                 <div v-if="streamPct > 0" class="cs-bar" role="progressbar" :aria-valuenow="Math.round(streamPct)" aria-valuemin="0" aria-valuemax="100">
@@ -1180,8 +1224,8 @@ onBeforeUnmount(() => {
                 </div>
                 <div v-if="encoderTooSlow" class="cs-hint">
                   <div class="cs-hint-t">
-                    服务器编码速度只有实时速度的 {{ streamRate.toFixed(2) }} 倍,追不上播放。
-                    把「转码最高高度」降到 720p 通常就能追上。
+                    服务器生成分片的速度只有实时速度的 {{ streamRate.toFixed(2) }} 倍,追不上播放。
+                    通常是片源读取慢;换个方式或稍等再试。
                   </div>
                   <div class="cs-actions">
                     <button class="btn sm" @click="loadDecision('remux')">强制转封装</button>
@@ -1192,7 +1236,6 @@ onBeforeUnmount(() => {
                   <div class="cs-hint-t">这个片源读取得慢,当前方式追不上播放速度。</div>
                   <div class="cs-actions">
                     <button class="btn sm" @click="loadDecision('remux')">强制转封装</button>
-                    <button class="btn sm" @click="loadDecision('transcode')">强制转码</button>
                     <button class="btn sm" @click="loadDecision()">重试自动</button>
                   </div>
                 </div>
@@ -1202,12 +1245,18 @@ onBeforeUnmount(() => {
             <Transition name="fade">
               <div v-if="error || fatal" class="error-panel">
                 <AppIcon name="alert" :size="26" />
-                <div class="ep-title">播放遇到问题</div>
+                <div class="ep-title">{{ unplayableFile ? '无法播放' : '播放遇到问题' }}</div>
                 <div class="ep-text">{{ error || fatal }}</div>
                 <div class="ep-actions">
-                  <button class="btn primary" @click="loadDecision()"><AppIcon name="refresh" :size="15" /> 重试自动</button>
-                  <button class="btn" @click="loadDecision('remux')">强制转封装</button>
-                  <button class="btn" @click="loadDecision('transcode')">强制转码</button>
+                  <!-- An unplayable file has nothing to retry: the server made a
+                       decision about the file, not about a failed attempt. -->
+                  <template v-if="unplayableFile">
+                    <button class="btn primary" @click="goBack"><AppIcon name="arrowLeft" :size="15" /> 返回</button>
+                  </template>
+                  <template v-else>
+                    <button class="btn primary" @click="loadDecision()"><AppIcon name="refresh" :size="15" /> 重试自动</button>
+                    <button class="btn" @click="loadDecision('remux')">强制转封装</button>
+                  </template>
                 </div>
               </div>
             </Transition>
@@ -1323,6 +1372,43 @@ onBeforeUnmount(() => {
              drawer inside it is the same right-hand drawer it always was. -->
         <div class="winfo">
           <template v-if="isStacked">
+            <!-- Preparing, as a long thin bar under the picture: centred on a 16:9
+                 box it would sit exactly where the play button goes. -->
+            <div v-if="isLoading && !error && !fatal" class="wi-loading">
+              <div
+                class="wl-bar" :class="{ live: streamPct > 0 }" role="progressbar"
+                :aria-valuenow="Math.round(streamPct)" aria-valuemin="0" aria-valuemax="100"
+              >
+                <i :style="streamPct > 0 ? { width: streamPct + '%' } : null"></i>
+              </div>
+              <div class="wl-text">{{ loadingText }}</div>
+              <div v-if="encoderTooSlow" class="cs-hint">
+                <div class="cs-hint-t">
+                  服务器生成分片的速度只有实时速度的 {{ streamRate.toFixed(2) }} 倍,追不上播放。
+                  通常是片源读取慢;换个方式或稍等再试。
+                </div>
+                <div class="cs-actions">
+                  <button class="btn sm" @click="loadDecision('remux')">强制转封装</button>
+                  <button class="btn sm" @click="loadDecision()">重试自动</button>
+                </div>
+              </div>
+              <div v-else-if="slowHint" class="cs-hint">
+                <div class="cs-hint-t">这个片源读取得慢,当前方式追不上播放速度。</div>
+                <div class="cs-actions">
+                  <button class="btn sm" @click="loadDecision('remux')">强制转封装</button>
+                  <button class="btn sm" @click="loadDecision()">重试自动</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- The tablet's own way back, in the page rather than on the picture. -->
+            <div v-if="layout === 'tablet'" class="wi-topline">
+              <button class="btn sm" @click="goBack">
+                <AppIcon name="arrowLeft" :size="15" /> 返回
+              </button>
+              <span v-if="infoShow?.name" class="tiny truncate">{{ infoShow.name }}</span>
+            </div>
+
             <h1 class="wi-title">{{ play?.title || '播放中' }}</h1>
             <div class="wi-meta">
               <span v-if="play" class="badge" :class="modeClass">{{ modeLabel }}</span>
@@ -1403,31 +1489,37 @@ onBeforeUnmount(() => {
 
               <div v-if="(play?.versions || []).length" class="pn-group">
                 <div class="label">版本</div>
-                <button
-                  v-for="v in play.versions" :key="v.id"
-                  class="chip" :class="{ on: v.current }" @click="selectVersion(v)"
-                >{{ v.label || '默认版本' }}</button>
+                <div class="pn-chips">
+                  <button
+                    v-for="v in play.versions" :key="v.id"
+                    class="chip" :class="{ on: v.current }" @click="selectVersion(v)"
+                  >{{ v.label || '默认版本' }}</button>
+                </div>
               </div>
 
               <div v-if="(play?.audio_tracks || []).length > 1" class="pn-group">
                 <div class="label">音轨</div>
-                <button
-                  v-for="a in play.audio_tracks" :key="a.ordinal"
-                  class="chip" :class="{ on: a.ordinal === currentAudio }"
-                  @click="selectAudio(a.ordinal)"
-                >
-                  {{ a.codec.toUpperCase() }}{{ a.lang ? ' · ' + a.lang : '' }}{{ a.title ? ' · ' + a.title : '' }}
-                </button>
+                <div class="pn-chips">
+                  <button
+                    v-for="a in play.audio_tracks" :key="a.ordinal"
+                    class="chip" :class="{ on: a.ordinal === currentAudio }"
+                    @click="selectAudio(a.ordinal)"
+                  >
+                    {{ a.codec.toUpperCase() }}{{ a.lang ? ' · ' + a.lang : '' }}{{ a.title ? ' · ' + a.title : '' }}
+                  </button>
+                </div>
               </div>
 
               <div v-if="!nativeSubs && (play?.subtitles || []).length" class="pn-group">
                 <div class="label">字幕</div>
-                <button class="chip" :class="{ on: activeSub === null }" @click="selectSub(null)">关闭</button>
-                <button
-                  v-for="sub in play.subtitles" :key="sub.id"
-                  class="chip" :class="{ on: activeSub && activeSub.id === sub.id || (sub.burn && burnSub === sub.id) }"
-                  @click="selectSub(sub)"
-                >{{ sub.label || sub.lang || '字幕' }}<span v-if="sub.burn" class="tiny"> · 烧录</span></button>
+                <div class="pn-chips">
+                  <button class="chip" :class="{ on: activeSub === null }" @click="selectSub(null)">关闭</button>
+                  <button
+                    v-for="sub in play.subtitles" :key="sub.id"
+                    class="chip" :class="{ on: activeSub && activeSub.id === sub.id || (sub.burn && burnSub === sub.id) }"
+                    @click="selectSub(sub)"
+                  >{{ sub.label || sub.lang || '字幕' }}<span v-if="sub.burn" class="tiny"> · 烧录</span></button>
+                </div>
               </div>
 
               <div class="pn-group">
@@ -1439,18 +1531,22 @@ onBeforeUnmount(() => {
 
               <div class="pn-group">
                 <div class="label">播放模式</div>
-                <button
-                  v-for="m in forceModes" :key="m.value" class="chip"
-                  :class="{ on: (play?.mode === m.value) || (!m.value && !forceModes.some(x => x.value === play?.mode)) }"
-                  @click="setMode(m)"
-                >{{ m.label }}</button>
+                <div class="pn-chips">
+                  <button
+                    v-for="m in forceModes" :key="m.value" class="chip"
+                    :class="{ on: (play?.mode === m.value) || (!m.value && !forceModes.some(x => x.value === play?.mode)) }"
+                    @click="setMode(m)"
+                  >{{ m.label }}</button>
+                </div>
               </div>
 
               <div class="pn-group">
                 <div class="label">画面</div>
-                <button class="chip" :class="{ on: pipActive }" @click="togglePip()">
-                  <AppIcon name="pip" :size="14" /> 画中画{{ pipActive ? ' · 已开启' : '' }}
-                </button>
+                <div class="pn-chips">
+                  <button class="chip" :class="{ on: pipActive }" @click="togglePip()">
+                    <AppIcon name="pip" :size="14" /> 画中画{{ pipActive ? ' · 已开启' : '' }}
+                  </button>
+                </div>
               </div>
 
               <div v-if="play?.reason" class="pn-reason tiny">
@@ -1726,7 +1822,12 @@ video { width: 100%; height: 100%; object-fit: contain; background: #000; displa
   position: absolute;
   bottom: calc(100% + 12px);
   right: 0;
-  width: 268px;
+  /* Never taller or wider than the screen it is opened on: in phone fullscreen
+     the whole menu used to run off the top. */
+  width: min(268px, calc(100vw - 24px));
+  max-height: calc(100dvh - 132px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 14px;
   border-radius: var(--r-m);
   background: rgba(14, 16, 21, 0.96);
@@ -1773,6 +1874,15 @@ video { width: 100%; height: 100%; object-fit: contain; background: #000; displa
 .pn-group .label { font-size: var(--fs-11); font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-4); }
 .pn-group .chip { max-width: 100%; height: auto; min-height: 34px; padding: 7px 14px; white-space: normal; text-align: left; }
 .pn-rates { display: flex; flex-wrap: wrap; gap: 6px; }
+/* A group's options: stacked in the drawer, a wrapping row on a watch page — the
+   same shape as the speed chips, so every group reads the same way. */
+.pn-chips { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
+.lay-phone .panel .pn-chips, .lay-tablet .panel .pn-chips {
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.lay-phone .panel .pn-group .chip, .lay-tablet .panel .pn-group .chip { white-space: nowrap; }
 .pn-reason { display: flex; gap: 8px; line-height: 1.55; margin-top: auto; padding-top: 16px; border-top: 1px solid var(--line-1); }
 
 .slide-enter-active, .slide-leave-active { transition: transform var(--t-mid), opacity var(--t-mid); }
@@ -1794,8 +1904,8 @@ video { width: 100%; height: 100%; object-fit: contain; background: #000; displa
   border-bottom: 1px solid var(--line-1);
 }
 .lay-phone .big-play { width: 62px; height: 62px; }
-.lay-phone .error-panel { padding: 14px; gap: 6px; }
-.lay-phone .error-panel svg { display: none; }
+.lay-phone .error-panel, .lay-tablet .error-panel { padding: 16px; gap: 7px; }
+.lay-phone .error-panel svg, .lay-tablet .error-panel svg { display: none; }
 .lay-phone .cs-hint { padding: 10px 12px; }
 .lay-phone .winfo { display: block; padding: 14px 16px calc(30px + env(safe-area-inset-bottom)); }
 .lay-phone :deep(.toast-host) { bottom: calc(18px + env(safe-area-inset-bottom)); }
@@ -1834,6 +1944,30 @@ video { width: 100%; height: 100%; object-fit: contain; background: #000; displa
   overflow: visible;
   gap: 16px;
 }
+
+/* Loading, under the picture: the bar carries a real width once segments are
+   being generated, and sweeps while there is nothing to measure yet. */
+.wi-loading { display: flex; flex-direction: column; gap: 10px; padding: 14px 0 4px; }
+.wl-bar {
+  position: relative;
+  height: 4px;
+  border-radius: var(--r-pill);
+  background: rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+}
+.wl-bar i {
+  position: absolute;
+  top: 0; bottom: 0; left: 0;
+  border-radius: inherit;
+  background: var(--brand);
+  transition: width 0.4s ease;
+}
+.wl-bar:not(.live) i { width: 32%; animation: wl-sweep 1.2s ease-in-out infinite; }
+@keyframes wl-sweep { 0% { left: -32%; } 100% { left: 100%; } }
+.wl-text { font-size: var(--fs-12); color: var(--text-3); }
+
+.wi-topline { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.wi-topline .tiny { min-width: 0; }
 
 .wi-title { font-size: var(--fs-20); font-weight: 700; letter-spacing: -0.02em; line-height: 1.4; margin: 0; }
 .wi-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; }

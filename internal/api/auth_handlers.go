@@ -233,9 +233,6 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request, user *m
 				s.Cfg.Playback.HLSCacheMB = 0
 			}
 		}
-		if req.Playback.TranscodeFallback != nil {
-			s.Cfg.Playback.TranscodeFallback = *req.Playback.TranscodeFallback
-		}
 	}
 	if err := s.Cfg.Save(s.configFile()); err != nil {
 		fail(w, 500, err.Error())
@@ -274,5 +271,4 @@ type configPlayback = struct {
 	AppleHEVCCopy       *bool `json:"apple_hevc_copy"`
 	HLSSessionPackager  *bool `json:"hls_session_packager"`
 	HLSCacheMB          *int  `json:"hls_cache_mb"`
-	TranscodeFallback   *bool `json:"transcode_fallback"`
 }

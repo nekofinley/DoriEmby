@@ -265,14 +265,18 @@ if ($pst.stream) {
 
 Write-Host "==> 7b. forcing a remux must not copy undecodable video"
 # hls.js cannot demux HEVC from MPEG-TS, so a forced remux for an MSE client
-# would produce audio with no picture. It must fall back to a real transcode.
+# would produce audio with no picture. Video re-encoding is withdrawn, so the
+# honest answer is that this client cannot play the file at all.
 $forced = Invoke-RestMethod -Uri "$Base/api/play/$hev1`?client=chrome&force=remux" -WebSession $sess
 Show "forced remux (chrome, HEVC)" "$($forced.mode) | $($forced.reason)"
-if ($forced.mode -ne "transcode") {
-  throw "forced remux for an MSE client on HEVC must fall back to transcode, got '$($forced.mode)'"
+if ($forced.mode -ne "unsupported") {
+  throw "forced remux for an MSE client on HEVC must be refused, got '$($forced.mode)'"
+}
+if ($forced.url) {
+  throw "an unplayable decision must carry no URL, got '$($forced.url)'"
 }
 if ($forced.reason -notmatch 'HEVC') {
-  throw "the fallback reason must name the codec, got '$($forced.reason)'"
+  throw "the refusal reason must name the codec, got '$($forced.reason)'"
 }
 
 Write-Host "==> 7b2. the client's own codec report (P3)"
@@ -289,8 +293,8 @@ if ($capYes.mode -ne "remux") {
 }
 $capNo = Invoke-RestMethod -Uri "$Base/api/play/$hev1`?client=chrome&caps=nohevc" -WebSession $sess
 Show "reported no HEVC" "$($capNo.mode) | $($capNo.reason)"
-if ($capNo.mode -ne "transcode") {
-  throw "a client reporting no HEVC must be transcoded, got '$($capNo.mode)'"
+if ($capNo.mode -ne "unsupported") {
+  throw "a client reporting no HEVC must be refused rather than transcoded, got '$($capNo.mode)'"
 }
 # The reason names the self-report; matched in ASCII, because this script is read
 # as ANSI by Windows PowerShell and CJK literals in code can decode into quotes.
@@ -355,22 +359,11 @@ Show "ios fallback chain" $(if ($chainModes.Count) { $chainModes -join " -> " } 
 if ($chainModes -contains "direct" -or $chainModes -contains "proxy") {
   throw "the chain offers a direct play for a Matroska/HEVC file on iOS: $($chainModes -join ',')"
 }
-# A real re-encode is not a fallback by default: the decision already transcodes
-# when nothing else can play the file, so falling back into one usually means
-# re-encoding something the client could not play, on a server that cannot keep up.
+# A re-encode is not in the chain at all any more — not as a primary, not as a
+# fallback: it is a different promise the server no longer makes.
 if ($chainModes -contains "transcode") {
-  throw "transcode must not be offered as a fallback by default: $($chainModes -join ',')"
+  throw "transcode must never be offered: $($chainModes -join ',')"
 }
-Invoke-RestMethod -Uri "$Base/api/config" -Method Put -WebSession $sess -ContentType "application/json" `
-  -Body (J @{playback=@{transcode_fallback=$true}}) | Out-Null
-$chainOn = PlayDecision $hev1 "ios"
-$chainOnModes = @($chainOn.alternates | ForEach-Object { $_.mode })
-Show "ios fallback chain (opt-in)" $(if ($chainOnModes.Count) { $chainOnModes -join " -> " } else { "(none)" })
-if ($chainOnModes.Count -ne 1 -or $chainOnModes[0] -ne "transcode") {
-  throw "with the opt-in, the transcode is the only thing left worth trying, got '$($chainOnModes -join ',')'"
-}
-Invoke-RestMethod -Uri "$Base/api/config" -Method Put -WebSession $sess -ContentType "application/json" `
-  -Body (J @{playback=@{transcode_fallback=$false}}) | Out-Null
 
 # A browser that says it can decode the file gets the *copy* as its fallback —
 # the cheap way back — and never the re-encode first.
@@ -435,35 +428,24 @@ Remove-Item $comb2 -ErrorAction SilentlyContinue
 Invoke-RestMethod -Uri "$Base/api/progress" -Method Post -WebSession $sess -ContentType "application/json" `
   -Body (J @{file_id=$mkvFile; position=0; duration=$dur}) | Out-Null
 
-Write-Host "==> 7e. with the packager on, a transcode is session-packaged too"
-# The point of P2: one long-lived ffmpeg per playback rather than a process per
-# segment — for transcodes as well, and the result is fMP4, not MPEG-TS.
-# Forced, because with the packager on the HEVC fixtures legitimately copy
-# instead of transcoding.
+Write-Host "==> 7e. a refused transcode request still lands on a session-packaged copy"
+# A stale page or bookmark may still ask for force=transcode. It must not start an
+# encoder: the request lands on the copy, which the packager serves as fMP4.
 $tc = Invoke-RestMethod -Uri "$Base/api/play/$hev1`?client=ios&force=transcode" -WebSession $sess
-Show "transcode decision" "$($tc.mode) | $($tc.reason)"
-if ($tc.mode -ne "transcode") { throw "forced transcode must be honoured, got '$($tc.mode)'" }
+Show "transcode request" "$($tc.mode) | $($tc.reason)"
+if ($tc.mode -ne "remux") { throw "a refused transcode must land on the copy, got '$($tc.mode)'" }
 $tcM3u8 = RawReq $hc "GET" "$Base$($tc.url)" @{}
 $tcTxt = [System.Text.Encoding]::UTF8.GetString($tcM3u8.Bytes)
 if ($tcTxt -notmatch '#EXT-X-MAP:URI="([^"]+)"') {
-  throw "a transcoded session must still be fMP4 with an init segment`n$tcTxt"
+  throw "a session-packaged stream must be fMP4 with an init segment`n$tcTxt"
 }
-$tcInit = RawReq $hc "GET" "$Base$($Matches[1])" @{}
 $tcSegLine = ($tcTxt -split "`n" | Where-Object { $_ -and $_ -notmatch '^#' } | Select-Object -First 1).Trim()
 $tcSeg = RawReq $hc "GET" "$Base$tcSegLine" @{}
-Show "transcode session segment" "$($tcSeg.Status) type=$($tcSeg.ContentHeaders.ContentType) bytes=$($tcSeg.Bytes.Length)"
+Show "session segment" "$($tcSeg.Status) type=$($tcSeg.ContentHeaders.ContentType) bytes=$($tcSeg.Bytes.Length)"
 if ($tcSeg.ContentHeaders.ContentType -notmatch 'mp4') {
   throw "a session must serve fMP4 segments, got '$($tcSeg.ContentHeaders.ContentType)'"
 }
-$tcComb = Join-Path $env:TEMP "doriya-e2e-transcode.mp4"
-[System.IO.File]::WriteAllBytes($tcComb, $tcInit.Bytes + $tcSeg.Bytes)
-$tcCodec = ((& ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 $tcComb 2>&1) | Out-String).Trim()
-Show "transcode session codec" $tcCodec
-if ($tcCodec -notmatch 'h264') { throw "a transcode must produce H.264, got '$tcCodec'" }
-$tcErr = (& ffmpeg -v error -i $tcComb -frames:v 1 -f null - 2>&1 | Out-String).Trim()
-if ($tcErr) { throw "transcoded session segment does not decode: $tcErr" }
-Show "transcode session decodes" "OK"
-Remove-Item $tcComb -ErrorAction SilentlyContinue
+if ($tcSeg.Bytes.Length -eq 0) { throw "the session served an empty segment" }
 
 Write-Host "==> 7f. a seek outside the packaged window is still served"
 # A session packages from the resume position forwards, so a viewer who then
@@ -548,9 +530,9 @@ if (@($playEp.subtitles).Count -gt 0) {
 
 Write-Host "==> 8b. HLS subtitle renditions (players that manage their own)"
 # Safari plays HLS natively and ignores <track>, so the same subtitles are offered
-# as EXT-X-MEDIA renditions behind a master playlist. Forced to transcode because
-# a Safari client would otherwise pick a direct/proxy stream, which has no playlist.
-$epForce = Invoke-RestMethod -Uri "$Base/api/play/$epFile`?client=ios&force=transcode" -WebSession $sess
+# as EXT-X-MEDIA renditions behind a master playlist. Forced to remux because a
+# Safari client would otherwise pick a direct/proxy stream, which has no playlist.
+$epForce = Invoke-RestMethod -Uri "$Base/api/play/$epFile`?client=ios&force=remux" -WebSession $sess
 Show "url for a Safari client" "$($epForce.url -replace '\?.*','')"
 if ($epForce.url -notmatch '/master\.m3u8\?') {
   throw "a Safari client with subtitles must get the master playlist, got '$($epForce.url)'"

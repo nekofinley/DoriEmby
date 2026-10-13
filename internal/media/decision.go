@@ -34,8 +34,20 @@ func DetectClient(ua string) ClientKind {
 }
 
 // Decision is the playback plan for one file on one client.
+//
+// Mode is one of:
+//
+//	direct      — 302 to the source's own URL; nothing touches this server
+//	proxy       — the same bytes streamed through this server
+//	remux       — video stream copied into HLS (audio re-encoded when needed)
+//	unsupported — nothing here can play it: the video codec has no decoding path
+//	              on this client, and re-encoding the video on the fly is
+//	              deliberately not offered. A realtime H.264 encode that cannot
+//	              keep up is worse than an honest refusal — it burns the CPU and
+//	              still leaves the viewer watching a spinner. URL stays empty and
+//	              Reason says why, so the player can explain itself.
 type Decision struct {
-	Mode       string  `json:"mode"` // direct | proxy | remux | transcode
+	Mode       string  `json:"mode"` // direct | proxy | remux | unsupported
 	Kind       string  `json:"kind"` // mp4 | hls
 	URL        string  `json:"url,omitempty"`
 	MimeType   string  `json:"mime_type,omitempty"`
@@ -167,7 +179,7 @@ func CanDirectPlay(probe *Probe, path string, client ClientKind, reportedAudio m
 	// 10-bit H.264 (Hi10P) has no consumer hardware decode path — no client
 	// can direct-play it; everything else is gated per client below.
 	if v != nil && v.CodecName == "h264" && strings.Contains(strings.ToLower(v.Profile), "10") {
-		return false, "10bit H.264(Hi10P)无硬件解码,需转码"
+		return false, "10bit H.264(Hi10P)没有硬件解码路径"
 	}
 
 	switch client {
@@ -233,7 +245,7 @@ func CanDirectPlay(probe *Probe, path string, client ClientKind, reportedAudio m
 // With the session packager on, the copy is fMP4 with an hvc1 sample entry, which
 // is what Apple actually wants — and what a browser may support too, which is why
 // an MSE client is allowed to copy HEVC when it says its MediaSource handles it
-// (caps.HEVC). Without that report the safe answer stays "transcode".
+// (caps.HEVC). Without that report the safe answer stays "cannot play here".
 func hlsVideoCopyOK(v *ProbeStream, client ClientKind, appleHEVCCopy, clientHEVC bool) bool {
 	if v == nil {
 		return false
@@ -257,6 +269,13 @@ func hlsVideoCopyOK(v *ProbeStream, client ClientKind, appleHEVCCopy, clientHEVC
 // instead of silently transcoding.
 func hevcCopyBlockedForApple(v *ProbeStream, client ClientKind, appleHEVCCopy bool) bool {
 	return v != nil && v.CodecName == "hevc" && client == ClientSafari && !appleHEVCCopy
+}
+
+// unsupported records a file this client cannot play, carrying the reason the
+// player shows the viewer. Kind stays empty: there is no stream to attach.
+func unsupported(d *Decision, why string) *Decision {
+	d.Mode, d.Kind, d.Reason = "unsupported", "", why
+	return d
 }
 
 func firstAudio(p *Probe) *ProbeStream {
@@ -296,14 +315,6 @@ type DecideOptions struct {
 	// (ffprobe names, e.g. "eac3"). It only ever widens direct play; see
 	// CanDirectPlay.
 	ClientAudio map[string]bool
-	// TranscodeFallback offers a real re-encode as a *fallback*, to be tried when
-	// the chosen strategy fails. Off by default, and deliberately so: a fallback
-	// is there to rescue a cheap plan, and a realtime H.264 encode is not cheap —
-	// on a small server it burns the CPU and still cannot keep up, so the viewer
-	// waits for a stream that will never arrive. This flag does not govern the
-	// decision itself: a file nothing else can play (AV1, 10-bit H.264) is still
-	// transcoded, because that is the only way to watch it at all.
-	TranscodeFallback bool
 }
 
 // Decide produces the playback plan: what to play first, and which strategies are
@@ -343,7 +354,10 @@ func canDirectPlay(probe *Probe, path string, client ClientKind, opts DecideOpti
 //	                                                      codec one
 //	remux    video stream copied into HLS              — only if the client's own
 //	                                                      stack can decode the copy
-//	transcode  video re-encoded to H.264               — only when opted in
+//
+// Re-encoding is absent on purpose: it is not a fallback but a different (and
+// expensive) promise, and a server that cannot encode in realtime would only
+// make the viewer wait for a stream that never arrives.
 //
 // The filtering is the point. Offering "direct" for a file the client cannot
 // play is not a fallback but a guaranteed dead end, and it is reached precisely
@@ -364,9 +378,6 @@ func fallbackPlan(probe *Probe, path string, client ClientKind, opts DecideOptio
 	if primary.Mode != "remux" && hlsVideoCopyOK(probe.Video(), client, opts.AppleHEVCCopy, opts.ClientHEVC) {
 		out = append(out, "remux")
 	}
-	if opts.TranscodeFallback && primary.Mode != "transcode" {
-		out = append(out, "transcode")
-	}
 	return out
 }
 
@@ -377,8 +388,7 @@ func decide(probe *Probe, path string, client ClientKind, opts DecideOptions) *D
 	directHeaders := opts.DirectHeaders
 	d := &Decision{VideoIndex: -1, AudioIndex: -1}
 	if probe == nil {
-		d.Mode, d.Kind, d.Reason = "transcode", "hls", "探测失败,强制转码"
-		return d
+		return unsupported(d, "无法探测媒体信息,无法判断这个文件能不能播")
 	}
 	v := probe.Video()
 	if v != nil {
@@ -405,31 +415,27 @@ func decide(probe *Probe, path string, client ClientKind, opts DecideOptions) *D
 		d.Mode, d.Kind, d.Reason = "proxy", "mp4", "手动指定代理"
 		return d
 	}
-	if force == "transcode" {
-		d.Mode, d.Kind, d.Reason = "transcode", "hls", "手动指定转码"
-		return d
-	}
+	// "transcode" is not honoured any more — not even as an override. A client
+	// still asking for it (an old bookmark, a stale page) lands on the automatic
+	// decision below, which never re-encodes either.
 	if force == "remux" {
 		// A remux only copies the video stream, which is only useful when this
-		// client can actually decode what gets copied. Honouring the request for
-		// a codec it cannot decode (AV1 / VP9 / MPEG-2 / 10-bit H.264 …) produced
-		// a stream with working audio and no picture at all — on every client —
-		// so fall back to a real transcode and say why.
+		// client can actually decode what gets copied. For a codec it cannot
+		// (AV1 / VP9 / MPEG-2 / 10-bit H.264 …) the copy would play audio over a
+		// black picture — and with video re-encoding off the table, the honest
+		// answer is that this file cannot be played here at all.
 		if hlsVideoCopyOK(v, client, opts.AppleHEVCCopy, opts.ClientHEVC) {
 			d.Mode, d.Kind, d.Reason = "remux", "hls", "手动指定转封装"
 			return d
 		}
-		d.Mode, d.Kind = "transcode", "hls"
 		if hevcCopyBlockedForApple(v, client, opts.AppleHEVCCopy) {
-			d.Reason = "手动指定转封装,但 Apple 不解码 MPEG-TS 里的 HEVC(只有声音没有画面),已改为转码"
-		} else {
-			codec := "该视频编码"
-			if v != nil && v.CodecName != "" {
-				codec = strings.ToUpper(v.CodecName)
-			}
-			d.Reason = fmt.Sprintf("手动指定转封装,但 %s 无法被本机解码(只有声音没有画面),已改为转码", codec)
+			return unsupported(d, "手动指定转封装,但 Apple 不解码 MPEG-TS 里的 HEVC(只有声音没有画面);转码已禁用,无法播放")
 		}
-		return d
+		codec := "该视频编码"
+		if v != nil && v.CodecName != "" {
+			codec = strings.ToUpper(v.CodecName)
+		}
+		return unsupported(d, fmt.Sprintf("手动指定转封装,但 %s 无法被本机解码(只有声音没有画面);转码已禁用,无法播放", codec))
 	}
 
 	can, why := canDirectPlay(probe, path, client, opts)
@@ -443,17 +449,14 @@ func decide(probe *Probe, path string, client ClientKind, opts DecideOptions) *D
 	}
 
 	// Video copy is only possible when the client's HLS stack can actually
-	// decode the copied stream; otherwise fall through to real transcode.
+	// decode the copied stream; without that there is nothing left to offer.
 	if hlsVideoCopyOK(v, client, opts.AppleHEVCCopy, opts.ClientHEVC) {
 		d.Mode, d.Kind = "remux", "hls"
 		d.Reason = why + " → HLS 转封装(视频流直拷)"
 		return d
 	}
-	d.Mode, d.Kind = "transcode", "hls"
 	if hevcCopyBlockedForApple(v, client, opts.AppleHEVCCopy) {
-		d.Reason = why + " → HLS 转码(Apple 不解码 MPEG-TS 里的 HEVC,直拷会只有声音没有画面)"
-	} else {
-		d.Reason = why + " → HLS 转码(视频转 H.264,音频直拷)"
+		return unsupported(d, why+" → Apple 不解码 MPEG-TS 里的 HEVC(直拷会只有声音没有画面);转码已禁用,无法播放")
 	}
-	return d
+	return unsupported(d, why+" → 需要把视频重新编码才能播,而转码已禁用")
 }

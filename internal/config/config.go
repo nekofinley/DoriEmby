@@ -37,8 +37,10 @@ type BGMTV struct {
 }
 
 type Playback struct {
-	ForceMode       string  `json:"force_mode"` // auto | direct | proxy | remux | transcode
+	ForceMode       string  `json:"force_mode"` // auto | direct | proxy | remux
 	SegmentSeconds  float64 `json:"segment_seconds"`
+	// TranscodeHeight now only bounds a burned-in subtitle's output: the one
+	// remaining path that re-encodes video. Ordinary playback never re-encodes.
 	TranscodeHeight int     `json:"transcode_height"`
 
 	// ProbeSizeMB / ProbeAnalyzeSec bound how much of the source ffprobe pulls
@@ -78,14 +80,6 @@ type Playback struct {
 	// then a session's output is deleted as soon as it ends.
 	HLSCacheMB int `json:"hls_cache_mb"`
 
-	// TranscodeFallback offers a real re-encode as a *fallback* when the strategy
-	// a file was decided on fails. Off by default: the decision already picks a
-	// transcode when nothing else can play the file, so a fallback transcode is
-	// usually spent re-encoding something the client could not play anyway — and
-	// on a small server it cannot keep up regardless, so it burns the CPU and
-	// still shows a spinner. With it off, a failed playback says so and lets the
-	// viewer choose (强制转码 is still one click away).
-	TranscodeFallback bool `json:"transcode_fallback"`
 }
 
 type Config struct {

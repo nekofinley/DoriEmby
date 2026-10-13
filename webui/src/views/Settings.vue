@@ -592,12 +592,20 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                   <option value="direct">强制 302 直连</option>
                   <option value="proxy">强制代理</option>
                   <option value="remux">强制 HLS 转封装</option>
-                  <option value="transcode">强制 HLS 转码</option>
                 </select>
-                <span class="hint">自动决策:客户端能直接播的走 302/代理,不兼容的自动转封装(H.264/H.265 视频流直拷,CPU 几乎无消耗)。失败后的备用顺序是 直连 → 代理 → 转封装,而且只会尝试这个客户端真的有可能播的方式。</span>
+                <span class="hint">
+                  自动决策:客户端能直接播的走 302/代理,不兼容的自动转封装(H.264/H.265 视频流直拷,CPU 几乎无消耗)。
+                  失败后的备用顺序是 直连 → 代理 → 转封装,而且只会尝试这个客户端真的有可能播的方式。
+                  <b>服务器不再转码</b>:本机解码不了的编码(如 AV1、10bit H.264)会明确提示无法播放,
+                  不会偷偷起一个实时编码把 CPU 吃满。
+                </span>
               </div>
               <div class="field"><label>HLS 分片时长(秒)</label><input v-model="cfg.playback.segment_seconds" type="number" step="1" min="2" max="10" /></div>
-              <div class="field"><label>转码最高高度(像素)</label><input v-model="cfg.playback.transcode_height" type="number" step="80" min="480" max="2160" /></div>
+              <div class="field">
+                <label>字幕烧录输出高度(像素)</label>
+                <input v-model="cfg.playback.transcode_height" type="number" step="80" min="480" max="2160" />
+                <span class="hint">只有「烧录图形字幕」这一条路会重新编码画面,这里限制它的输出高度(默认 1080)。普通播放永不转码。</span>
+              </div>
               <div class="field">
                 <label>探测读取上限(MB)</label>
                 <input v-model="cfg.playback.probe_size_mb" type="number" step="1" min="1" max="256" />
@@ -633,8 +641,9 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                   允许 Apple 设备把 HEVC 直拷进 MPEG-TS
                 </label>
                 <span class="hint">
-                  <b>建议保持关闭</b>：Apple 不解码 MPEG-TS 里的 HEVC,直拷会变成「有声音、没画面」;
-                  关闭时这类片子走转码(能看,但吃 CPU)。真机确认能播再打开,可以省下全部转码开销。
+                  <b>建议保持关闭</b>：Apple 不解码 MPEG-TS 里的 HEVC,直拷会变成「有声音、没画面」。
+                  关闭时这类片子会被判为无法播放 —— 想让它能播,请打开下面的「会话打包」,
+                  那才是把 HEVC 直拷给 Apple 的正确形式(fMP4)。
                 </span>
               </div>
               <div class="field wide">
@@ -656,18 +665,6 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                   打包完成的产物留在 <code>data/cache/hls</code>,同一部片子**再次播放直接秒开**;
                   超出上限时按最近最少使用淘汰,未完成的残留会在启动时清掉。填 0 表示不留缓存
                   (播放结束即删)。默认 2048。
-                </span>
-              </div>
-              <div class="field wide">
-                <label>失败后允许自动改用转码</label>
-                <label class="check-line">
-                  <input type="checkbox" v-model="cfg.playback.transcode_fallback" />
-                  直连 / 代理 / 转封装都失败时,再试一次真转码
-                </label>
-                <span class="hint">
-                  <b>默认关闭</b>:转码是实时的重新编码,小服务器本来就跟不上,失败后再切过去只会白吃 CPU
-                  并继续转圈。关闭时失败会明确告诉你试过哪几种方式,需要时播放页仍可手动「强制转码」。
-                  片源本身只能转码的(如 AV1、10bit H.264)决策照样会选转码,不受这里影响。
                 </span>
               </div>
             </div>
@@ -710,7 +707,7 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
               <div class="field">
                 <label>ffmpeg</label>
                 <input v-model="cfg.ffmpeg" />
-                <span class="hint">转封装 / 转码与字幕转换都依赖它。找不到时填绝对路径。</span>
+                <span class="hint">转封装、字幕烧录与字幕转换都依赖它。找不到时填绝对路径。</span>
               </div>
               <div class="field"><label>ffprobe</label><input v-model="cfg.ffprobe" /></div>
               <div class="field">

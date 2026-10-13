@@ -112,8 +112,6 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		// it can decode is allowed to direct-play even where the server's tables
 		// guessed otherwise. Absent tokens keep the tables' verdict.
 		ClientAudio: reportedAudio(r.URL.Query().Get("caps")),
-		// A real re-encode as a fallback, opt-in: see config.Playback.
-		TranscodeFallback: s.Cfg.Playback.TranscodeFallback,
 	})
 
 	// Resume support: tell the HLS packager where the viewer left off, so a
@@ -224,8 +222,9 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 	// Safari manages HLS subtitles itself and ignores <track> on a natively
 	// played stream, so it is handed a master playlist carrying the subtitles as
 	// renditions. Other players keep the <track> route, which the page controls.
-	nativeSubs := client == media.ClientSafari && len(subDTOs) > 0 &&
-		(dec.Mode == "remux" || dec.Mode == "transcode")
+	// (A burned-in stream is deliberately excluded: its subtitles are already in
+	// the picture, and renditions as well would draw them twice.)
+	nativeSubs := client == media.ClientSafari && len(subDTOs) > 0 && dec.Mode == "remux"
 	playlist := "index.m3u8"
 	if nativeSubs {
 		playlist = "master.m3u8"
@@ -239,7 +238,12 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		dec.URL = fmt.Sprintf("/api/stream/%d?proxy=1", file.ID) +
 			strings.Replace(signedQuery(s.Cfg.Secret, file.ID, sigTTL), "?", "&", 1)
 		dec.MimeType = "video/mp4"
-	default: // remux / transcode → HLS
+	case "unsupported":
+		// Nothing to hand the player. The reason travels with the decision, and the
+		// player shows it instead of attaching a source it cannot decode.
+		dec.URL = ""
+		dec.MimeType = ""
+	default: // remux → HLS
 		sq := signedQuery(s.Cfg.Secret, file.ID, sigTTL)
 		if force == "byterange" {
 			dec.URL = fmt.Sprintf("/api/hls/%d/byterange.m3u8%s", file.ID, sq)
@@ -265,7 +269,7 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 	}
 	alts := make([]media.DecisionAlt, 0, len(dec.Alternates))
 	for _, a := range dec.Alternates {
-		if dec.Duration <= 0 && (a.Mode == "remux" || a.Mode == "transcode") {
+		if dec.Duration <= 0 && a.Mode == "remux" {
 			// HLS needs a duration to build a playlist; without one there is no
 			// stream to fall back to.
 			continue
@@ -275,7 +279,7 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 			a.URL, a.MimeType = directURL, "video/mp4"
 		case "proxy":
 			a.URL, a.MimeType = proxyURL, "video/mp4"
-		case "remux", "transcode":
+		case "remux":
 			a.URL, a.MimeType = hlsURL(a.Mode), "application/vnd.apple.mpegurl"
 		default:
 			continue
@@ -359,7 +363,7 @@ func (s *Server) streamStartFor(mode string, startSec float64) float64 {
 	if startSec <= 0 || !s.Cfg.Playback.HLSSessionPackager {
 		return 0
 	}
-	if mode != "remux" && mode != "transcode" && !strings.HasPrefix(mode, "burn.") {
+	if mode != "remux" && !strings.HasPrefix(mode, "burn.") {
 		return 0
 	}
 	segLen := s.Cfg.Playback.SegmentSeconds
@@ -639,7 +643,9 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 	// MPEG-TS). With the flag off, everything keeps using the on-demand MPEG-TS
 	// path, which needs no temporary disk. See media/session.go.
 	if s.Cfg.Playback.HLSSessionPackager {
-		if mode := q.Get("m"); mode == "remux" || mode == "transcode" {
+		// Only remux: a video re-encode is no longer offered, so "m=transcode"
+		// from a stale page falls through to the on-demand remux path below.
+		if mode := q.Get("m"); mode == "remux" {
 			if probe, err := s.Engine.EnsureProbe(ctx, file, drv); err == nil {
 				s.serveSessionHLS(w, r, ctx, file, drv, probe,
 					sessionRequest{keyMode: mode, videoMode: mode}, rest, q, segLen, startSec)
@@ -659,10 +665,7 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 			fail(w, 500, "无法确定媒体时长,无法生成 HLS")
 			return
 		}
-		mode := q.Get("m")
-		if mode != "transcode" {
-			mode = "remux"
-		}
+		mode := "remux"
 		sig := signedQuery(s.Cfg.Secret, file.ID, sigTTL) + "&m=" + mode
 		if a := q.Get("a"); a != "" {
 			sig += "&a=" + a
@@ -685,10 +688,7 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mode := q.Get("m")
-	if mode != "transcode" {
-		mode = "remux"
-	}
+	mode := "remux"
 	audioOrdinal := 0
 	if a := q.Get("a"); a != "" {
 		if n, e := strconv.Atoi(a); e == nil {
@@ -705,9 +705,6 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 		if mode == "transcode" || (ac != "aac" && ac != "mp3") {
 			audioMode = "aac"
 		}
-	}
-	if mode == "transcode" {
-		audioMode = "aac"
 	}
 
 	videoIndex := -1
