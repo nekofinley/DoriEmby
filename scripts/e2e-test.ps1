@@ -413,6 +413,57 @@ if (@($playEp.subtitles).Count -gt 0) {
   $vtxt = [System.Text.Encoding]::UTF8.GetString($vtt.Bytes)
   Show "vtt head" ((($vtxt -split "`n")[0..2]) -join " / ")
   Show "vtt cue timing converted" ($vtxt -match "00:00:00\.500 --> 00:00:02\.000")
+  # A cue that is timed in file time has to move when the stream does not start at
+  # the file's beginning, and it must not come out as an impossible ":60.000".
+  $shifted = RawReq $hc "GET" "$Base$($playEp.subtitles[0].url)&start=0.200" @{}
+  $shiftedTxt = [System.Text.Encoding]::UTF8.GetString($shifted.Bytes)
+  Show "vtt shifted by 0.2s" "$($shiftedTxt -match '00:00:00\.300 --> 00:00:01\.800')"
+  if ($shiftedTxt -notmatch '00:00:00\.300 --> 00:00:01\.800') {
+    throw "a shifted rendition's cues must move with the stream`n$shiftedTxt"
+  }
+  # Shifted cues belong to one playback, so they must not be cached as the
+  # unshifted document is. (Cache-Control is a response header, not a content one,
+  # and PowerShell does not surface HttpResponseHeaders' indexer.)
+  $cc = ($shifted.RespHeaders.GetValues('Cache-Control') -join ',')
+  Show "shifted vtt cache-control" $cc
+  if ($cc -notmatch 'no-store') {
+    throw "shifted cues must be served no-store, got '$cc'"
+  }
+}
+
+Write-Host "==> 8b. HLS subtitle renditions (players that manage their own)"
+# Safari plays HLS natively and ignores <track>, so the same subtitles are offered
+# as EXT-X-MEDIA renditions behind a master playlist. Forced to transcode because
+# a Safari client would otherwise pick a direct/proxy stream, which has no playlist.
+$epForce = Invoke-RestMethod -Uri "$Base/api/play/$epFile`?client=ios&force=transcode" -WebSession $sess
+Show "url for a Safari client" "$($epForce.url -replace '\?.*','')"
+if ($epForce.url -notmatch '/master\.m3u8\?') {
+  throw "a Safari client with subtitles must get the master playlist, got '$($epForce.url)'"
+}
+if (-not $epForce.native_subtitles) {
+  throw "native_subtitles must tell the page the player owns the subtitles"
+}
+$master = RawReq $hc "GET" "$Base$($epForce.url)" @{}
+$masterTxt = [System.Text.Encoding]::UTF8.GetString($master.Bytes)
+$media = @($masterTxt -split "`n" | Where-Object { $_ -match '^#EXT-X-MEDIA:TYPE=SUBTITLES' })
+$defaults = @($media | Where-Object { $_ -match 'DEFAULT=YES' })
+Show "master renditions" "$($media.Count) (默认 $($defaults.Count))"
+if ($media.Count -lt 1) { throw "the master playlist lists no subtitle renditions`n$masterTxt" }
+if ($defaults.Count -ne 1) { throw "exactly one rendition must be DEFAULT, got $($defaults.Count)" }
+if ($masterTxt -notmatch '#EXT-X-STREAM-INF:.*SUBTITLES="subs"') {
+  throw "the variant must declare the subtitle group`n$masterTxt"
+}
+if ($masterTxt -notmatch 'URI="(/api/hls/\d+/subs/\d+\.m3u8[^"]*)"') {
+  throw "a rendition must point at its own playlist`n$masterTxt"
+}
+$subPlaylist = RawReq $hc "GET" "$Base$($Matches[1])" @{}
+$subTxt = [System.Text.Encoding]::UTF8.GetString($subPlaylist.Bytes)
+Show "rendition playlist" "status=$($subPlaylist.Status) extinf=$($subTxt -match '#EXTINF:') endlist=$($subTxt.Contains('#EXT-X-ENDLIST'))"
+if ($subTxt -notmatch '#EXTINF:[\d.]+,' -or -not $subTxt.Contains('#EXT-X-ENDLIST')) {
+  throw "a rendition playlist needs one segment and an ENDLIST`n$subTxt"
+}
+if ($subTxt -notmatch '(/api/subs/\d+/\d+\.vtt[^\s]*\.vtt|/api/subs/\d+/\d+\.vtt[^\s]*)') {
+  throw "the rendition playlist must point at the WebVTT document`n$subTxt"
 }
 
 Write-Host "==> 9. openlist source (mock) + 302 direct"

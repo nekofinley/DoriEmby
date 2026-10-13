@@ -2,7 +2,9 @@ package media
 
 import (
 	"fmt"
+	"math"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"doriyamedia/internal/models"
@@ -252,4 +254,90 @@ func PickDefaultSubtitle(subs []models.Subtitle) int64 {
 		}
 	}
 	return best
+}
+
+// ---------- timing shifts ----------
+
+func parseVTTTime(s string) (float64, bool) {
+	parts := strings.Split(strings.TrimSpace(s), ":")
+	if len(parts) != 3 {
+		return 0, false
+	}
+	h, err1 := strconv.Atoi(parts[0])
+	m, err2 := strconv.Atoi(parts[1])
+	sec, err3 := strconv.ParseFloat(parts[2], 64)
+	if err1 != nil || err2 != nil || err3 != nil {
+		return 0, false
+	}
+	return float64(h)*3600 + float64(m)*60 + sec, true
+}
+
+// formatVTTTime renders seconds as a WebVTT timestamp, rounded to milliseconds
+// so a shifted cue can never come out as "…:60.000".
+func formatVTTTime(t float64) string {
+	ms := int64(math.Round(t * 1000))
+	if ms < 0 {
+		ms = 0
+	}
+	h := ms / 3600000
+	m := (ms % 3600000) / 60000
+	s := (ms % 60000) / 1000
+	return fmt.Sprintf("%02d:%02d:%02d.%03d", h, m, s, ms%1000)
+}
+
+// ShiftVTT moves a WebVTT document's cues back by offset seconds, dropping cues
+// that end before the new zero point and clamping ones that straddle it.
+//
+// HLS subtitle renditions are timed against the stream the player is on, and a
+// packaging session's stream starts wherever the session started, while a sidecar
+// file's cues are in file time. Blocks without a cue timing line (the WEBVTT
+// header, STYLE, NOTE) are passed through untouched, and so is a whole cue's
+// payload when it survives.
+func ShiftVTT(data []byte, offset float64) []byte {
+	if offset <= 0 {
+		return data
+	}
+	text := strings.ReplaceAll(string(data), "\r\n", "\n")
+	blocks := strings.Split(text, "\n\n")
+	out := make([]string, 0, len(blocks))
+	for _, block := range blocks {
+		lines := strings.Split(block, "\n")
+		idx := -1
+		for i, line := range lines {
+			if strings.Contains(line, "-->") {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			out = append(out, block)
+			continue
+		}
+		fields := strings.Fields(lines[idx])
+		arrow := -1
+		for i, f := range fields {
+			if f == "-->" {
+				arrow = i
+				break
+			}
+		}
+		if arrow < 1 || arrow+1 >= len(fields) {
+			out = append(out, block)
+			continue
+		}
+		start, ok1 := parseVTTTime(fields[arrow-1])
+		end, ok2 := parseVTTTime(fields[arrow+1])
+		if !ok1 || !ok2 {
+			out = append(out, block)
+			continue
+		}
+		if end <= offset {
+			continue // wholly before the stream starts
+		}
+		fields[arrow-1] = formatVTTTime(start - offset)
+		fields[arrow+1] = formatVTTTime(end - offset)
+		lines[idx] = strings.Join(fields, " ")
+		out = append(out, strings.Join(lines, "\n"))
+	}
+	return []byte(strings.Join(out, "\n\n"))
 }

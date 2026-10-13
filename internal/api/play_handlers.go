@@ -132,18 +132,53 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		startQ = "&start=" + strconv.FormatFloat(resumeFrom, 'f', 3, 64)
 	}
 
+	// subtitles: only convertible (text) tracks can be served as WebVTT, and the
+	// one worth turning on automatically is picked here so every client agrees.
+	// Resolved before the URL is built, because whether there are subtitles
+	// decides whether a Safari client gets a master playlist or a media one.
+	subs := s.discoverSubtitles(ctx, drv, file)
+	servable := make([]models.Subtitle, 0, len(subs))
+	for _, sub := range subs {
+		if sub.Convertible {
+			servable = append(servable, sub)
+		}
+	}
+	defSubID := media.PickDefaultSubtitle(servable)
+
+	type subDTO struct {
+		ID       int64  `json:"id"`
+		Label    string `json:"label"`
+		Lang     string `json:"lang"`
+		Embedded bool   `json:"embedded"`
+		Default  bool   `json:"default"`
+		URL      string `json:"url,omitempty"`
+	}
+	subDTOs := make([]subDTO, 0, len(servable))
+	for _, sub := range servable {
+		subDTOs = append(subDTOs, subDTO{
+			ID:       sub.ID,
+			Label:    sub.Title,
+			Lang:     sub.Lang,
+			Embedded: sub.Embedded,
+			Default:  sub.ID == defSubID,
+			URL:      fmt.Sprintf("/api/subs/%d/%d.vtt%s", file.ID, sub.ID, signedQuery(s.Cfg.Secret, file.ID, sigTTL)),
+		})
+	}
+
 	// A session begins at a segment boundary, and the player presents that stream
 	// as starting at zero. So the client is told where the stream begins in file
 	// time, or it would save progress measured from the resume point and line
 	// subtitles up against the wrong clock.
-	streamStart := 0.0
-	if resumeFrom > 0 && s.Cfg.Playback.HLSSessionPackager &&
-		(dec.Mode == "remux" || dec.Mode == "transcode") {
-		segLen := s.Cfg.Playback.SegmentSeconds
-		if segLen <= 0 {
-			segLen = 4
-		}
-		streamStart = math.Floor(resumeFrom/segLen) * segLen
+	streamStart := s.streamStartFor(dec.Mode, resumeFrom)
+
+	// Safari manages HLS subtitles itself and ignores <track> on a natively
+	// played stream, so it is handed a master playlist carrying the subtitles as
+	// renditions. Other players keep the <track> route, which the page controls.
+	nativeSubs := client == media.ClientSafari && len(subDTOs) > 0 &&
+		(dec.Mode == "remux" || dec.Mode == "transcode")
+	playlist := "index.m3u8"
+	if nativeSubs {
+		playlist = "master.m3u8"
 	}
 
 	switch dec.Mode {
@@ -156,7 +191,7 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		dec.MimeType = "video/mp4"
 	default: // remux / transcode → HLS
 		sq := signedQuery(s.Cfg.Secret, file.ID, sigTTL)
-		dec.URL = fmt.Sprintf("/api/hls/%d/index.m3u8%s&m=%s%s", file.ID, sq, dec.Mode, startQ)
+		dec.URL = fmt.Sprintf("/api/hls/%d/%s%s&m=%s%s", file.ID, playlist, sq, dec.Mode, startQ)
 		dec.MimeType = "application/vnd.apple.mpegurl"
 	}
 
@@ -166,7 +201,7 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 	proxyURL := fmt.Sprintf("/api/stream/%d?proxy=1", file.ID) + strings.Replace(sq, "?", "&", 1)
 	directURL := fmt.Sprintf("/api/stream/%d%s", file.ID, sq)
 	hlsURL := func(m string) string {
-		return fmt.Sprintf("/api/hls/%d/index.m3u8%s&m=%s%s", file.ID, sq, m, startQ)
+		return fmt.Sprintf("/api/hls/%d/%s%s&m=%s%s", file.ID, playlist, sq, m, startQ)
 	}
 	addAlt := func(mode, url, mime string) {
 		if url == dec.URL {
@@ -210,37 +245,6 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		})
 	}
 
-	// subtitles: only convertible (text) tracks can be served as WebVTT, and the
-	// one worth turning on automatically is picked here so every client agrees.
-	subs := s.discoverSubtitles(ctx, drv, file)
-	servable := make([]models.Subtitle, 0, len(subs))
-	for _, sub := range subs {
-		if sub.Convertible {
-			servable = append(servable, sub)
-		}
-	}
-	defSubID := media.PickDefaultSubtitle(servable)
-
-	type subDTO struct {
-		ID       int64  `json:"id"`
-		Label    string `json:"label"`
-		Lang     string `json:"lang"`
-		Embedded bool   `json:"embedded"`
-		Default  bool   `json:"default"`
-		URL      string `json:"url,omitempty"`
-	}
-	subDTOs := make([]subDTO, 0, len(servable))
-	for _, sub := range servable {
-		subDTOs = append(subDTOs, subDTO{
-			ID:       sub.ID,
-			Label:    sub.Title,
-			Lang:     sub.Lang,
-			Embedded: sub.Embedded,
-			Default:  sub.ID == defSubID,
-			URL:      fmt.Sprintf("/api/subs/%d/%d.vtt%s", file.ID, sub.ID, signedQuery(s.Cfg.Secret, file.ID, sigTTL)),
-		})
-	}
-
 	// item context
 	title := s.playTitle(file)
 
@@ -279,7 +283,31 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		// timestamps the segments carry — so the client needs this offset to seek,
 		// to save progress in file time, and to line up absolutely timed subtitles.
 		"stream_start": streamStart,
+		// native_subtitles says the stream carries its subtitles as HLS
+		// renditions, so the player manages them (its own menu, its own default)
+		// and the page must not also attach <track> elements.
+		"native_subtitles": nativeSubs,
 	})
+}
+
+// streamStartFor reports where an HLS stream will begin, in file time: the saved
+// position snapped down to a segment boundary, or 0 when the stream starts at the
+// file's beginning. It is 0 whenever packaging will not start mid-file — with the
+// session packager off, the on-demand playlist covers the whole file from zero and
+// the player's clock is already file time. The client (progress and seeks) and the
+// subtitle renditions both depend on this agreeing with what the packager does.
+func (s *Server) streamStartFor(mode string, startSec float64) float64 {
+	if startSec <= 0 || !s.Cfg.Playback.HLSSessionPackager {
+		return 0
+	}
+	if mode != "remux" && mode != "transcode" {
+		return 0
+	}
+	segLen := s.Cfg.Playback.SegmentSeconds
+	if segLen <= 0 {
+		segLen = 4
+	}
+	return math.Floor(startSec/segLen) * segLen
 }
 
 // playTitle resolves the display title for a file ("剧名 · S01E02 · 标题").
@@ -548,6 +576,14 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// The subtitle side of HLS: a master playlist offering each servable subtitle
+	// as a rendition, and the one-segment playlist for each one. Handled before
+	// the packaging split, because it is the same either way.
+	if rest == "master.m3u8" || strings.HasPrefix(rest, "subs/") {
+		s.serveHLSSubtitles(w, r, ctx, file, drv, q.Get("m"), rest, q, startSec)
+		return
+	}
+
 	// With the session packager on, every HLS playback runs through one long-lived
 	// ffmpeg: it reads the source once instead of re-seeking and re-reading a
 	// probe window for each and every segment, and it is also what produces the
@@ -814,6 +850,110 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 	}
 }
 
+// serveHLSSubtitles answers the subtitle side of HLS: "master.m3u8" lists the
+// media stream plus one EXT-X-MEDIA rendition per servable subtitle, and
+// "subs/<id>.m3u8" is the single-segment playlist for one of them.
+//
+// This exists for players that manage subtitles themselves — Safari on iOS plays
+// HLS natively and does not use <track> elements — so the same ranking that picks
+// the default for the web player also picks the rendition marked DEFAULT.
+func (s *Server) serveHLSSubtitles(w http.ResponseWriter, r *http.Request, ctx context.Context,
+	file *models.MediaFile, drv source.Driver, mode, rest string, q url.Values, startSec float64) {
+
+	probe, err := s.Engine.EnsureProbe(ctx, file, drv)
+	if err != nil {
+		fail(w, 500, "媒体探测失败: "+err.Error())
+		return
+	}
+	servable := make([]models.Subtitle, 0, 4)
+	for _, sub := range s.discoverSubtitles(ctx, drv, file) {
+		if sub.Convertible {
+			servable = append(servable, sub)
+		}
+	}
+	defSubID := media.PickDefaultSubtitle(servable)
+	// Rendition cues are timed against the stream the player is on, which begins
+	// where packaging begins; the VTT endpoint shifts them by this much.
+	streamStart := s.streamStartFor(mode, startSec)
+	sig := signedQuery(s.Cfg.Secret, file.ID, sigTTL)
+	startParam := ""
+	if streamStart > 0 {
+		startParam = "&start=" + strconv.FormatFloat(streamStart, 'f', 3, 64)
+	}
+
+	if rest == "master.m3u8" {
+		if len(servable) == 0 {
+			fail(w, 404, "该文件没有可用字幕")
+			return
+		}
+		var b strings.Builder
+		b.WriteString("#EXTM3U\n#EXT-X-VERSION:7\n")
+		for _, sub := range servable {
+			def := "NO"
+			if sub.ID == defSubID {
+				def = "YES"
+			}
+			fmt.Fprintf(&b, `#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="%s",DEFAULT=%s,AUTOSELECT=YES,FORCED=NO,URI="/api/hls/%d/subs/%d.m3u8%s%s"`+"\n",
+				escapeM3U8(sub.Title), def, file.ID, sub.ID, sig, startParam)
+		}
+		// One variant, offering the subtitles. BANDWIDTH is required by the spec;
+		// with a single variant the player has nothing to choose between, so an
+		// estimate from the file's own bitrate is enough.
+		bw := 2000000
+		if size, dur := file.Size, probe.Duration(); dur > 0 && size > 0 {
+			if est := int(float64(size) * 8 / dur); est > bw {
+				bw = est
+			}
+		}
+		fmt.Fprintf(&b, "#EXT-X-STREAM-INF:BANDWIDTH=%d,SUBTITLES=\"subs\"\n", bw)
+		fmt.Fprintf(&b, "/api/hls/%d/index.m3u8%s&m=%s%s\n", file.ID, sig, mode, startParam)
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write([]byte(b.String()))
+		return
+	}
+
+	// subs/<id>.m3u8: one WebVTT document covering the whole file.
+	subID, err := strconv.ParseInt(strings.TrimSuffix(strings.TrimPrefix(rest, "subs/"), ".m3u8"), 10, 64)
+	if err != nil {
+		fail(w, 404, "未知字幕")
+		return
+	}
+	var target *models.Subtitle
+	for i := range servable {
+		if servable[i].ID == subID {
+			target = &servable[i]
+			break
+		}
+	}
+	if target == nil {
+		fail(w, 404, "字幕不存在或无法转换")
+		return
+	}
+	dur := probe.Duration()
+	if dur <= 0 {
+		dur = 1
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-PLAYLIST-TYPE:VOD\n")
+	fmt.Fprintf(&b, "#EXT-X-TARGETDURATION:%d\n#EXT-X-MEDIA-SEQUENCE:0\n", int(math.Ceil(dur)))
+	fmt.Fprintf(&b, "#EXTINF:%.3f,\n", dur)
+	fmt.Fprintf(&b, "/api/subs/%d/%d.vtt%s%s\n", file.ID, target.ID, sig, startParam)
+	b.WriteString("#EXT-X-ENDLIST\n")
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write([]byte(b.String()))
+}
+
+// escapeM3U8 keeps a subtitle's own title from breaking out of the attribute it
+// is written into.
+func escapeM3U8(s string) string {
+	s = strings.ReplaceAll(s, `"`, "'")
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	return s
+}
+
 // serveSessionFile waits for a packaged file and serves it with Range support.
 // Media segments are shifted onto the absolute timeline first (see
 // Session.ShiftSegment); the init segment carries no timestamps.
@@ -906,7 +1046,22 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		}
 		data = media.ToVTT(sub.Format, raw)
 	}
+	// A subtitle rendition inside an HLS stream is timed against that stream,
+	// which begins where the packaging session began; the caller says where that
+	// is and the cues are moved accordingly. Without it (a plain <track>) the
+	// client shifts them itself, since it knows the offset of its own clock.
+	if v := r.URL.Query().Get("start"); v != "" {
+		if off, err := strconv.ParseFloat(v, 64); err == nil && off > 0 {
+			data = media.ShiftVTT(data, off)
+			// Shifted cues are tied to one playback, so they must not be cached
+			// the way the unshifted document is.
+			w.Header().Set("Cache-Control", "no-store")
+		} else {
+			w.Header().Set("Cache-Control", "public, max-age=86400")
+		}
+	} else {
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+	}
 	w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
-	w.Header().Set("Cache-Control", "public, max-age=86400")
 	_, _ = w.Write(data)
 }

@@ -308,7 +308,7 @@ client_capabilities{ua_hash, mse, webcodecs}
 | **P3** | 放宽 copy 判据（iOS Hi10P）+ fMP4 + `-tag:v hvc1` + 客户端能力自报 | 更多片源从「全量转码」降级为「转封装」 | 中（需要真机验证各机型） | 🟡 **部分完成**：fMP4 + `hvc1` 已落地；能力仍是手动开关 `apple_hevc_copy`，未做自报 |
 | **P4** | MP4 `moov` 解析 + `EXT-X-BYTERANGE` 直取 + Range 补丁 | MP4 全部零转码、零 CPU | 高（新解析器，需充分测试） | 未开始（`internal/media/mp4box.go` 已提供 box 解析底座，见 §12） |
 | **P5** | 渐进代理加固（Range 能力探测、206 校验、HEAD） | WebDAV/不可 302 场景可用 | 低 |
-| **P6** | 字幕轨（HLS WebVTT）+ PGS 按需烧录缓存 | 补齐已知限制 | 中 | 🟡 **部分完成**：字幕已能自动载入（服务端排序 + `default` 标记），侧挂/内嵌文本轨按需转 WebVTT；**未做** HLS 字幕轨（`EXT-X-MEDIA`）与 PGS 烧录 |
+| **P6** | 字幕轨（HLS WebVTT）+ PGS 按需烧录缓存 | 补齐已知限制 | 中 | 🟡 **大部分完成**：自动载入 + 文本轨转 WebVTT + **HLS `EXT-X-MEDIA` 字幕轨**（Safari 原生菜单可用）已落地；**PGS 烧录未做** —— 见 §13 |
 
 先做 P0 + P1，能立刻回答「到底卡在探测还是卡在分片」；P2 是根治读取放大的主刀。
 
@@ -744,6 +744,64 @@ consoleErrors: []                                        ← hls.js 未因序号
   最高（要新写并充分测试 moov 解析），所以放在 P2/P6 之后。
 - **P5**（代理加固）：现在的代理路径已被 e2e 覆盖（Range 206、HEAD、`accept-ranges`），先补
   Range 能力探测与 206 校验即可，成本低，可在 P2 之后顺手做。
+
+## 13. P6：字幕轨
+
+### 13.1 已完成
+
+| 部分 | 说明 |
+| --- | --- |
+| 自动载入 | 服务端排序并标 `default`（中文 → 粤语 → 其他 → 无标记；同语言简体优先），客户端据此自动开字幕并记住偏好（§11.5 一带） |
+| 侧挂/内嵌文本轨 → WebVTT | `.srt/.ass/.ssa/.vtt` 与内嵌文本轨按需转换；图形字幕（PGS/VobSub）无法转文本 |
+| **HLS 字幕轨（本轮）** | 见 13.2 |
+| 会话偏移下的字幕 | 见 13.3 |
+
+### 13.2 HLS WebVTT 字幕轨（`EXT-X-MEDIA`）
+
+**为什么需要**：Safari 在 iOS 上原生播放 HLS，**不使用 `<track>` 元素**（网页播放器的字幕机制在那里
+不可靠）。HLS 的正规做法是把字幕作为 **rendition** 放进 **master playlist**：
+
+```
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="…",DEFAULT=YES,AUTOSELECT=YES,FORCE=NO,
+             URI="/api/hls/<file>/subs/<sub>.m3u8?…"
+#EXT-X-STREAM-INF:BANDWIDTH=…,SUBTITLES="subs"
+index.m3u8?…
+```
+
+实现：
+
+- `/api/hls/{id}/master.m3u8`：每个可转换字幕一条 `EXT-X-MEDIA`；**哪条是 `DEFAULT=YES` 用与网页
+  播放器完全相同的排序**决定，所以两端默认一致。单变体，`BANDWIDTH` 用文件码率估算。
+- `/api/hls/{id}/subs/{subID}.m3u8`：单分片的点播播单，分片就是那个 WebVTT 文档。
+- `/api/subs/{file}/{sub}.vtt?start=<秒>`：把 cue 时间整体减去偏移（13.3），并改为 `no-store`——
+  平移后的 cue 只属于一次播放，不能像未平移的文档那样缓存。
+- **客户端不重复接管**：当 payload 里 `native_subtitles` 为真（Safari + HLS + 有字幕），播放页
+  不再插入 `<track>`、也不再自动选轨，并把字幕按钮/面板隐藏——字幕交给系统播放器的菜单，
+  默认项由服务端排序决定。
+- 其他浏览器仍走 `<track>` 这条路（桌面已实测可用），因为 master playlist 会让 hls.js 也去建
+  自己的字幕轨，两边同时 'showing' 就会重影。
+
+### 13.3 两条时间轴上的字幕
+
+侧挂文件的 cue 是**文件时间**，而一次会话流的播放器时钟从**会话起点**开始（§12.7）：
+
+- `<track>` 路线：客户端把 cue 时间平移 `-stream_start`（`shiftCues`，每轨一次、幂等）；
+- HLS rendition 路线：服务端在 `?start=` 时平移（`media.ShiftVTT`）——整块 cue 早于起点就丢弃，
+  跨过起点的把开始时间夹到 0，块内其余内容与 `align:` 之类的设置原样保留，时间戳按毫秒取整
+  （避免出现 `:60.000`）。
+
+验证：`TestShiftVTT`（平移/保留设置/丢弃/夹取/取整/不改输入）；e2e 8 步骤断言
+`vtt shifted by 0.2s` 与 `shifted vtt cache-control no-store`，8b 步骤断言 Safari 拿到
+`master.m3u8`、`native_subtitles` 为真、恰好一条 `DEFAULT=YES`、变体声明 `SUBTITLES="subs"`、
+rendition 播单有 `#EXTINF` 与 `#EXT-X-ENDLIST`。
+
+### 13.4 P6 仍未做
+
+- **PGS / VobSub 按需烧录**：图形字幕无法转成文本，只能烧进画面（重编码）。设计应当是新增一种
+  会话模式（`-filter_complex` 叠加字幕流）并复用 P2 的缓存与淘汰，让"同一部片子第二次看"不必
+  重烧。这是 P6 剩下的唯一一块，工作量不小，因为它是"转码 + 字幕"两条链路的组合。
+- 真机验证：iOS 上字幕是否出现在系统字幕菜单里、默认项是否正确——**这只在真机可见**，
+  本地只能验到播单结构（上文 e2e）。
 
 
 

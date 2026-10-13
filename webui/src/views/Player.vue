@@ -21,6 +21,10 @@ const activeSub = ref(null)
 // packaging session started at the viewer's saved position, because players
 // present that stream as starting at zero.
 const streamStart = ref(0)
+// nativeSubs: the stream carries its subtitles as HLS renditions, so the player
+// manages them (its own menu and its own default) and the page must not attach
+// <track> elements as well, or both would render at once.
+const nativeSubs = computed(() => !!play.value?.native_subtitles)
 const duration = ref(0)
 const position = ref(0)
 const buffered = ref(0)
@@ -511,6 +515,12 @@ function selectSub(sub) {
 // autoSelectSub turns subtitles on without being asked: the track the server
 // ranked best, unless the viewer already turned them off or picked a language.
 function autoSelectSub() {
+  if (nativeSubs.value) {
+    // The player owns the subtitles (HLS renditions): its own menu applies the
+    // server's DEFAULT, and attaching tracks here would double them up.
+    activeSub.value = null
+    return
+  }
   const subs = play.value?.subtitles || []
   if (!subs.length) {
     activeSub.value = null
@@ -715,11 +725,13 @@ onBeforeUnmount(() => {
         @click="!nativeControls && togglePlay()"
         @ratechange="rate = videoEl?.playbackRate || 1"
       >
-        <track
-          v-for="sub in play?.subtitles || []" :key="sub.id" kind="subtitles"
-          :src="sub.url" :label="sub.label || sub.lang || '字幕'"
-          :default="!!sub.default"
-        />
+        <template v-if="!nativeSubs">
+          <track
+            v-for="sub in play?.subtitles || []" :key="sub.id" kind="subtitles"
+            :src="sub.url" :label="sub.label || sub.lang || '字幕'"
+            :default="!!sub.default"
+          />
+        </template>
       </video>
 
       <!-- top bar -->
@@ -845,7 +857,7 @@ onBeforeUnmount(() => {
           <span class="spacer"></span>
 
           <button
-            v-if="(play?.subtitles || []).length" class="icon-btn"
+            v-if="!nativeSubs && (play?.subtitles || []).length" class="icon-btn"
             :class="{ on: activeSub }" aria-label="字幕" title="字幕"
             @click="panelOpen = !panelOpen"
           >
@@ -916,7 +928,7 @@ onBeforeUnmount(() => {
             </button>
           </div>
 
-          <div v-if="(play?.subtitles || []).length" class="pn-group">
+          <div v-if="!nativeSubs && (play?.subtitles || []).length" class="pn-group">
             <div class="label">字幕</div>
             <button class="chip" :class="{ on: activeSub === null }" @click="selectSub(null)">关闭</button>
             <button
