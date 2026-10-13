@@ -1,8 +1,9 @@
 <script setup>
 import { ref, onMounted, onBeforeUnmount, computed, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { api, detectClient, fmtTime, fmtSize } from '../api.js'
+import { api, detectClient, fmtTime, fmtSize, imgUrl, parseGenres } from '../api.js'
 import AppIcon from '../components/AppIcon.vue'
+import SmartImage from '../components/SmartImage.vue'
 import ToastHost from '../components/ToastHost.vue'
 import { toast } from '../toast.js'
 
@@ -14,6 +15,7 @@ const error = ref('')
 const fatal = ref('')
 const videoEl = ref(null)
 const stageEl = ref(null)
+const watchEl = ref(null)
 const hls = ref(null)
 const currentAudio = ref(0)
 const activeSub = ref(null)
@@ -36,6 +38,9 @@ const rate = ref(Number(localStorage.getItem('dm:rate') ?? 1))
 const controlsVisible = ref(true)
 const panelOpen = ref(false)
 const menuOpen = ref(false)
+// locked: in fullscreen, every control but the lock button stops answering taps,
+// so a hand moving across the screen cannot pause, seek or leave by accident.
+const locked = ref(false)
 const fsActive = ref(false)
 const pipActive = ref(false)
 const scrubbing = ref(false)
@@ -57,10 +62,56 @@ const isIOS = computed(() => {
 /** iOS gets the native control surface; everything else gets the custom chrome. */
 const nativeControls = computed(() => isIOS.value)
 
+/* ----------------------------------------------------- which player is this?
+ *
+ * Three layouts, picked from what the device *is* rather than from how wide the
+ * window happens to be:
+ *   theater — the immersive full-screen player: desktop, and a phone held
+ *             sideways, where a stacked page would only waste the picture;
+ *   phone   — the YouTube/Bilibili portrait page: picture on top, its buttons
+ *             and the episode grid underneath;
+ *   tablet  — picture top-left, its buttons below it, episodes in a right
+ *             sidebar.
+ * A touch-only device (no hover, coarse pointer) is what tells a tablet apart
+ * from a desktop window of the same width.
+ */
+const vp = ref({ w: window.innerWidth, h: window.innerHeight })
+function onViewport() { vp.value = { w: window.innerWidth, h: window.innerHeight } }
+
+const touchOnly = (() => {
+  try { return window.matchMedia('(hover: none) and (pointer: coarse)').matches } catch { return false }
+})()
+
+/** ?view=phone|tablet|theater pins a layout — for testing, and stubborn devices. */
+const forcedView = computed(() => {
+  const v = String(route.query.view || '')
+  return ['phone', 'tablet', 'theater'].includes(v) ? v : ''
+})
+
+const layout = computed(() => {
+  if (forcedView.value) return forcedView.value
+  if (!touchOnly) return 'theater'
+  const short = Math.min(vp.value.w, vp.value.h)
+  if (short >= 600) return 'tablet'
+  return vp.value.w > vp.value.h ? 'theater' : 'phone'
+})
+/** Stacked: the picture is one block in a page, with everything else under it. */
+const isStacked = computed(() => layout.value !== 'theater')
+const layoutClass = computed(() => `lay-${layout.value}`)
+/** A touch screen gets double-tap-to-pause; a mouse keeps click-to-pause. */
+const touchPlayer = computed(() => touchOnly && !nativeControls.value)
+
+/* The immersive chrome fades out while playing; a watch page keeps its buttons,
+ * because a back button that vanishes on a page is just a lost back button.
+ * A fullscreen stage counts as a theater even when the page behind it is not. */
+const theaterChrome = computed(() => !isStacked.value || fsActive.value)
+const chromeHidden = computed(() => theaterChrome.value && !controlsVisible.value &&
+  isPlaying.value && !menuOpen.value && !panelOpen.value)
+
 const modeClass = computed(() => `mode-${play.value?.mode || 'direct'}`)
-const modeLabel = computed(() => ({
-  direct: '302 直连', proxy: '代理播放', remux: 'HLS 转封装', transcode: 'HLS 转码',
-}[play.value?.mode] || play.value?.mode || ''))
+const MODE_LABELS = { direct: '302 直连', proxy: '代理播放', remux: 'HLS 转封装', transcode: 'HLS 转码' }
+function candName(c) { return MODE_LABELS[c?.mode] || c?.mode || '' }
+const modeLabel = computed(() => candName(play.value))
 
 const currentSize = computed(() => {
   const v = (play.value?.versions || []).find((x) => x.current)
@@ -116,6 +167,119 @@ const forceModes = [
   { value: 'transcode', label: '强制 HLS 转码', hint: '编码不支持时使用,占用 CPU' },
 ]
 
+/* --------------------------------------------------------- episodes (选集) */
+
+// The play decision answers "what do I play", not "what else is on here", so the
+// siblings are fetched separately: episode → its season → that season's episodes.
+// Only the watch-page layouts ever ask, so a desktop plays exactly as before.
+const queue = ref(null)   // { season, show, episodes }
+const meta = ref(null)    // the item behind the current file (overview, air date…)
+let queueFor = 0          // item id the queue was loaded for
+let queueBusy = false
+let queueAgain = false
+
+async function loadQueue() {
+  const itemId = play.value?.item_id
+  if (!isStacked.value || !itemId || queueFor === itemId) return
+  if (queueBusy) { queueAgain = true; return }
+  queueBusy = true
+  try {
+    const detail = await api.get(`/api/items/${itemId}`)
+    const it = detail?.item
+    if (!it || disposed) return
+    meta.value = it
+    queueFor = itemId
+    if (it.type === 'episode' && it.parent_id) {
+      const season = await api.get(`/api/items/${it.parent_id}`)
+      if (disposed || play.value?.item_id !== itemId) return
+      queue.value = (season?.episodes || []).length
+        ? { season: season.item, show: season.show || null, episodes: season.episodes }
+        : null
+    } else if (it.type === 'season' && (detail.episodes || []).length) {
+      queue.value = { season: it, show: detail.show || null, episodes: detail.episodes }
+    } else {
+      queue.value = null
+    }
+  } catch {
+    // A file played straight out of the browser has no show behind it.
+    queue.value = null
+  } finally {
+    queueBusy = false
+    if (queueAgain) { queueAgain = false; loadQueue() }
+  }
+}
+
+const episodes = computed(() => queue.value?.episodes || [])
+const epIndex = computed(() => episodes.value.findIndex((e) => e.id === play.value?.item_id))
+const prevEp = computed(() => (epIndex.value > 0 ? episodes.value[epIndex.value - 1] : null))
+const nextEp = computed(() => {
+  const i = epIndex.value
+  return i >= 0 && i + 1 < episodes.value.length ? episodes.value[i + 1] : null
+})
+
+function epFile(ep) { return ep?.file_id || (ep?.versions || [])[0]?.id || 0 }
+function epNo(ep, i) { return ep?.episode || i + 1 }
+function epName(ep, i) { return ep?.name || `第 ${epNo(ep, i)} 集` }
+function epSub(ep) {
+  const parts = []
+  if (ep?.air_date) parts.push(ep.air_date)
+  const n = (ep?.versions || []).length
+  if (n > 1) parts.push(`${n} 个版本`)
+  return parts.join(' · ')
+}
+
+/** Switch episode. Replaces the history entry, so back still leaves the player. */
+function playEpisode(ep) {
+  const id = epFile(ep)
+  if (!id || id === Number(route.params.fileId)) return
+  saveProgress()
+  router.replace(`/play/${id}`)
+  // Picking an episode from the grid would otherwise leave the viewer looking at
+  // the list, with the picture they just chose scrolled off the top.
+  watchEl.value?.scrollTo({ top: 0, behavior: 'smooth' })
+}
+
+/* The block under the picture is tabbed: the episode grid (phone only — a tablet
+ * keeps them in the sidebar), a synopsis, and the track/mode settings that the
+ * theater keeps in its drawer. */
+const tab = ref('')
+const tabs = computed(() => {
+  const out = []
+  if (layout.value === 'phone' && episodes.value.length) out.push('eps')
+  out.push('about', 'settings')
+  return out
+})
+const activeTab = computed(() => (tabs.value.includes(tab.value) ? tab.value : tabs.value[0]))
+const panelShown = computed(() => (isStacked.value && !fsActive.value ? activeTab.value === 'settings' : panelOpen.value))
+
+const infoShow = computed(() => queue.value?.show || null)
+const infoGenres = computed(() => parseGenres(infoShow.value || meta.value))
+const overview = computed(() => {
+  const it = meta.value
+  const sh = infoShow.value
+  return (it?.type === 'episode' ? it.overview : '') || sh?.overview || it?.overview || ''
+})
+
+/** The gear and the panel button: a drawer in the theater, a tab in a page. */
+function togglePanel() {
+  if (isStacked.value && !fsActive.value) { tab.value = 'settings'; menuOpen.value = false; return }
+  panelOpen.value = !panelOpen.value
+}
+function toggleMenu() {
+  if (isStacked.value && !fsActive.value) { tab.value = 'settings'; return }
+  menuOpen.value = !menuOpen.value
+}
+function setMode(m) {
+  menuOpen.value = false
+  loadDecision(m.value || undefined)
+}
+
+// Rotating a phone into portrait (or back) swaps layouts without a reload, so the
+// watch page has to pick up its episode list the moment it appears.
+watch(isStacked, (stacked) => {
+  if (stacked) { panelOpen.value = false; loadQueue() }
+})
+
 let lastSave = 0
 let hideTimer = null
 let probeTimer = null
@@ -143,6 +307,9 @@ async function loadDecision(force) {
   // resume position). Everything the UI and the API show is file time, so this is
   // the offset between the element's clock and the file's.
   streamStart.value = Number(play.value?.stream_start) || 0
+  // The episode list does not depend on the decision, so ask for it in parallel
+  // with the (slow) probe rather than after it.
+  loadQueue()
   if (play.value?.state === 'probing') {
     startProbePoll()
     return
@@ -156,14 +323,36 @@ async function loadDecision(force) {
 // instead of transcoding it; a machine that answers no gets a transcode instead
 // of a stream it would only fail to decode. The report is a result either way,
 // because "no answer" means "unknown" and must keep the old behaviour.
+//
+// Audio is asked the same way, for the same reason: AC-3, E-AC-3 and DTS are
+// decoded by the operating system rather than the browser, so the server's codec
+// tables can only guess — Windows and Android usually have those decoders, Linux
+// usually does not, and the two look identical from the server. A codec reported
+// here may play direct; one that is not mentioned keeps the table's verdict
+// (which is usually "remux it so there is sound").
+const AUDIO_CAPS = [
+  ['ac3', ['ac-3']],
+  ['eac3', ['ec-3']],
+  ['dts', ['dtsc', 'dtsh', 'dtsl', 'dtse', 'dtsx']],
+  ['truehd', ['mlpa']],
+  ['flac', ['flac']],
+  ['opus', ['opus']],
+  ['vorbis', ['vorbis']],
+]
+
 const clientCaps = (() => {
   try {
     if (typeof MediaSource === 'undefined' || !MediaSource.isTypeSupported) return ''
+    const caps = []
     const hevc = [
       'video/mp4; codecs="hvc1.1.6.L123.B0"', // Main
       'video/mp4; codecs="hvc1.2.4.L153.B0"', // Main 10
     ].some((t) => MediaSource.isTypeSupported(t))
-    return hevc ? 'hevc' : 'nohevc'
+    caps.push(hevc ? 'hevc' : 'nohevc')
+    for (const [name, codecs] of AUDIO_CAPS) {
+      if (codecs.some((c) => MediaSource.isTypeSupported(`audio/mp4; codecs="${c}"`))) caps.push(name)
+    }
+    return caps.join(',')
   } catch {
     return ''
   }
@@ -204,6 +393,7 @@ function startProbePoll() {
     if (st && st.state === 'ready') {
       try { play.value = await fetchPlay() } catch (e) { fatal.value = e.message; isLoading.value = false; return }
       if (disposed) return
+      loadQueue()
       if (play.value?.state === 'probing') { probeTimer = setTimeout(tick, 800); return }
       await nextTick()
       attachSource()
@@ -292,8 +482,30 @@ let HlsLib = null
 let mediaRecovered = false
 let netRestarted = false
 
+/* One candidate is not abandoned lightly.
+ *
+ * An error means "this strategy is wrong" only sometimes. From inside the page a
+ * slow start and a broken mode look the same: the first segments of a cloud file
+ * take tens of seconds to produce, and a player gives up on the manifest long
+ * before the server gives up packaging it. Falling down the chain there is
+ * exactly how an iOS remux used to turn into a 302 of a Matroska file — the one
+ * thing that device can never open. So a failure has to earn the switch: a decode
+ * error (the bytes arrived and were refused) switches at once, everything else
+ * gets another attempt at the same mode for as long as the server is visibly
+ * working on it.
+ */
+const RETRY_DELAYS = [2000, 5000, 10000]
+const HLS_DWELL_MS = 15000     // an HLS attempt is not judged before this
+const CAND_PATIENCE_MS = 60000 // ...nor retried forever
+let candTries = 0      // retries spent on the current candidate
+let candFor = -1       // the candidate they belong to (-1: none yet)
+let candSince = 0      // when it was attached
+let candMeta = false   // the element reported metadata for it
+let switchTimer = null // pending retry, so two error events cannot race
+let errHandledAt = 0   // when a failure was last acted on (one failure, two events)
+
 // 候选链:主决策 + 后端下发的备用方案(直连/代理/转封装/转码)。
-// 浏览器报错就自动换下一种,直到放出来为止。
+// 后端只会下发这个客户端真的能用的方案,并已按"便宜→贵"排好序。
 function buildCandidates() {
   const p = play.value
   const list = [{ mode: p.mode, url: p.url, kind: p.kind || (p.url.includes('/api/hls/') ? 'hls' : 'mp4') }]
@@ -317,29 +529,44 @@ function buildCandidates() {
   return list
 }
 
+/** A retry must not be answered out of the browser's cache of the failure. */
+function bust(url, n) {
+  if (!n || !url) return url
+  return url + (url.includes('?') ? '&' : '?') + 'r=' + n
+}
+
 function destroyHls() {
   if (hls.value) { hls.value.destroy(); hls.value = null }
 }
 
 async function attachSource() {
   cands.value = buildCandidates()
-  mediaRecovered = false
-  netRestarted = false
+  candFor = -1
+  candTries = 0
+  candMeta = false
   await startCand(0)
 }
 
 async function startCand(i) {
+  clearTimeout(switchTimer)
+  switchTimer = null
   if (i >= cands.value.length) {
     isLoading.value = false
-    fatal.value = '所有播放方式都失败了(本机直连 + 云端转码)。可以切换音轨,或强制转码重试。'
+    const tried = cands.value.map(candName).join(' → ')
+    fatal.value = `所有播放方式都失败了(已尝试:${tried})。可以换一条音轨,或手动指定一种方式重试。`
     return
   }
+  if (candFor !== i) { candFor = i; candTries = 0; candMeta = false }
+  candSince = Date.now()
   candIdx.value = i
   const c = cands.value[i]
-  if (play.value) play.value = { ...play.value, mode: c.mode, url: c.url, kind: c.kind }
+  const src = bust(c.url, candTries)
+  if (play.value) play.value = { ...play.value, mode: c.mode, url: src, kind: c.kind }
   const v = videoEl.value
   if (!v) return
   destroyHls()
+  mediaRecovered = false
+  netRestarted = false
   startStreamPoll()
   v.removeAttribute('src')
   activeSub.value = null
@@ -347,7 +574,7 @@ async function startCand(i) {
   if (c.kind === 'hls') {
     const canNative = v.canPlayType('application/vnd.apple.mpegurl')
     if (canNative) {
-      v.src = c.url
+      v.src = src
     } else {
       if (!HlsLib) HlsLib = (await import('hls.js')).default
       const Hls = HlsLib
@@ -362,7 +589,7 @@ async function startCand(i) {
           fragLoadingRetryDelay: 1000,
           nudgeMaxRetry: 10,
         })
-        hls.value.loadSource(c.url)
+        hls.value.loadSource(src)
         hls.value.attachMedia(v)
         hls.value.on(Hls.Events.ERROR, onHlsError)
       } else {
@@ -371,7 +598,7 @@ async function startCand(i) {
       }
     }
   } else {
-    v.src = c.url
+    v.src = src
   }
 
   applyVolume()
@@ -379,6 +606,55 @@ async function startCand(i) {
   v.load()
   v.play().catch(() => { /* autoplay may be blocked — user presses play */ })
   showControls()
+}
+
+/** The server says it is still producing this stream. */
+function serverPreparing() {
+  const s = streamStatus.value
+  if (!s) return false
+  if (Number(s.segments_ready) > 0) return false   // there is something to play
+  // No segment out yet and the packager was asked for one recently: it is working.
+  return !(Number(s.idle_seconds) > 10)
+}
+
+/** Is this failure "not ready yet" rather than "the wrong mode"? */
+function keepWaiting(code) {
+  const c = cands.value[candIdx.value]
+  if (!c || candTries >= RETRY_DELAYS.length) return false
+  const waited = Date.now() - candSince
+  // The patience window is about *starting*: a stream that never produced a
+  // picture and has been retried for a minute is not going to. One that was
+  // already playing is a different case — a hiccup mid-playback is worth another
+  // attempt however long it has been running, since a mode switch reloads the
+  // whole stream (and jumps back to the last saved position).
+  if (!candMeta && waited > CAND_PATIENCE_MS) return false
+  // A fresh attempt swallowing the previous one's abort is not a failure.
+  if (code === 1 && waited < 1500) return false
+  // Decode error: the data arrived and the decoder refused it — believe it.
+  if (code === 3) return false
+  // Network-flavoured errors are worth another attempt whatever the mode.
+  if (code === 1 || code === 2) return true
+  // SRC_NOT_SUPPORTED is ambiguous: a native-HLS player (iOS) reports it for a
+  // manifest whose first segments are still being produced, and that is a verdict
+  // on nothing. While the server is packaging, wait; and an HLS attempt gets a
+  // minimum dwell either way, because its first segment is the slowest thing here.
+  if (c.kind !== 'hls' || candMeta) return false
+  return serverPreparing() || waited < HLS_DWELL_MS
+}
+
+function retryCand(code) {
+  candTries++
+  const c = cands.value[candIdx.value]
+  const why = (code === 1 || code === 2) ? '网络中断' : '服务器还在生成分片'
+  toast.info(`${why},继续用「${candName(c)}」重试(${candTries}/${RETRY_DELAYS.length})…`, 2400)
+  isLoading.value = true
+  clearStall()
+  const i = candIdx.value
+  clearTimeout(switchTimer)
+  switchTimer = setTimeout(() => {
+    switchTimer = null
+    if (!disposed && candIdx.value === i) startCand(i)
+  }, RETRY_DELAYS[candTries - 1] || 10000)
 }
 
 function onHlsError(_, data) {
@@ -393,12 +669,18 @@ function onHlsError(_, data) {
     hls.value?.startLoad()
     return
   }
+  // hls.js has spent its own retries on this; the question is still whether the
+  // mode is wrong or the server is merely slow.
+  const code = Number(videoEl.value?.error?.code) || 0
+  if (keepWaiting(code)) { errHandledAt = Date.now(); retryCand(code); return }
   toast.info(`${modeLabel.value}失败,切换下一种播放方式…`)
+  errHandledAt = Date.now()
   startCand(candIdx.value + 1)
 }
 
 function onLoadedMetadata() {
   isLoading.value = false
+  candMeta = true
   const v = videoEl.value
   // Everything here is reported in *file* time. A packaged session begins where
   // the viewer's saved position was, and players present that stream as starting
@@ -424,12 +706,23 @@ function onLoadedMetadata() {
 function onErr() {
   isLoading.value = false
   if (!play.value) return
+  // One failure can arrive twice: hls.js reports it, and the element fires error
+  // for the same underlying cause. Acting twice would skip a candidate.
+  const at = Date.now()
+  if (at - errHandledAt < 500) return
+  errHandledAt = at
+  // Not every error is a verdict on the mode: a slow first segment looks exactly
+  // like a broken one from here, and switching modes on it is how a working
+  // strategy gets replaced by one this client can never play.
+  const code = Number(videoEl.value?.error?.code) || 0
+  if (keepWaiting(code)) { retryCand(code); return }
   if (candIdx.value < cands.value.length - 1) {
     toast.info('该方式播放失败,自动切换…')
     startCand(candIdx.value + 1)
     return
   }
-  error.value = '播放失败(解码或网络错误)'
+  const tried = cands.value.map(candName).join(' → ')
+  error.value = `播放失败(解码或网络错误)。已尝试:${tried}`
 }
 
 function onTimeUpdate() {
@@ -582,6 +875,51 @@ function autoSelectSub() {
 
 /* ------------------------------------------------------------------ controls */
 
+/*
+ * Tapping the picture. On a touch screen a single tap is far too easy to make by
+ * accident — a hand shifting while watching pauses the video — so a tap only
+ * brings the controls back and play/pause takes the deliberate double tap. The
+ * count is our own rather than the browser's dblclick, whose window is wide
+ * enough to catch two unrelated taps. A mouse has no such problem and keeps
+ * click-to-pause; iOS plays through its own controls and is left alone.
+ */
+let tapTimer = null
+let taps = 0
+
+function onTap() {
+  if (locked.value || nativeControls.value) return
+  if (!touchPlayer.value) { togglePlay(); return }
+  taps++
+  if (taps > 1) {
+    clearTimeout(tapTimer)
+    tapTimer = null
+    taps = 0
+    togglePlay()
+    return
+  }
+  // Not a pause yet: reveal the controls, and wait long enough to be told the tap
+  // was the first half of a double tap.
+  tapTimer = setTimeout(() => { tapTimer = null; taps = 0; showControls() }, 240)
+}
+
+function onDoubleTap() {
+  // The mouse path only: a touch screen handled its double tap in onTap already.
+  if (locked.value || touchPlayer.value || nativeControls.value) return
+  toggleFullscreen()
+}
+
+/** The lock button — the one control a locked player still answers to. */
+function toggleLock() {
+  locked.value = !locked.value
+  if (locked.value) {
+    menuOpen.value = false
+    panelOpen.value = false
+    toast.info('已锁定按键,点左侧锁图标解锁', 2600)
+  } else {
+    showControls()
+  }
+}
+
 function togglePlay() {
   const v = videoEl.value
   if (!v) return
@@ -680,12 +1018,19 @@ async function togglePip() {
     else await v.requestPictureInPicture()
   } catch { toast.err('当前浏览器不支持画中画') }
 }
-function onFsChange() { fsActive.value = !!document.fullscreenElement }
+function onFsChange() {
+  fsActive.value = !!document.fullscreenElement
+  // Fullscreen is the lock's only home: the watch page has no lock button, so a
+  // lock that outlived fullscreen would be a player with no controls at all.
+  if (!fsActive.value) locked.value = false
+}
 function onPipChange() { pipActive.value = !!document.pictureInPictureElement }
 
 function showControls() {
+  if (locked.value) return   // a locked player shows nothing but the lock button
   controlsVisible.value = true
   clearTimeout(hideTimer)
+  if (!theaterChrome.value) return   // a page keeps its buttons; only the theater fades
   if (isPlaying.value && !menuOpen.value && !panelOpen.value) {
     hideTimer = setTimeout(() => { controlsVisible.value = false }, 3200)
   }
@@ -722,6 +1067,8 @@ onMounted(() => {
   applyVolume()
   window.addEventListener('beforeunload', saveProgress)
   window.addEventListener('keydown', onKey)
+  window.addEventListener('resize', onViewport)
+  window.addEventListener('orientationchange', onViewport)
   document.addEventListener('fullscreenchange', onFsChange)
   document.addEventListener('pointermove', showControls)
   videoEl.value?.addEventListener('enterpictureinpicture', onPipChange)
@@ -731,12 +1078,16 @@ onBeforeUnmount(() => {
   disposed = true
   saveProgress()
   destroyHls()
+  clearTimeout(switchTimer)
   stopProbePoll()
   stopStreamPoll()
   clearStall()
   clearTimeout(hideTimer)
+  clearTimeout(tapTimer)
   window.removeEventListener('beforeunload', saveProgress)
   window.removeEventListener('keydown', onKey)
+  window.removeEventListener('resize', onViewport)
+  window.removeEventListener('orientationchange', onViewport)
   document.removeEventListener('fullscreenchange', onFsChange)
   document.removeEventListener('pointermove', showControls)
   window.removeEventListener('pointermove', moveScrub)
@@ -745,249 +1096,400 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="player" :class="{ 'hide-ui': !controlsVisible && isPlaying && !menuOpen && !panelOpen }">
-    <!-- ================= stage ================= -->
-    <div ref="stageEl" class="stage" @pointermove="onStageMove" @dblclick="toggleFullscreen">
-      <video
-        ref="videoEl"
-        :controls="nativeControls"
-        playsinline
-        webkit-playsinline
-        preload="auto"
-        @loadedmetadata="onLoadedMetadata"
-        @error="onErr"
-        @timeupdate="onTimeUpdate"
-        @progress="onTimeUpdate"
-        @pause="saveProgress(); isPlaying = false; showControls()"
-        @play="isPlaying = true; showControls()"
-        @waiting="onWaiting"
-        @playing="onPlaying"
-        @click="!nativeControls && togglePlay()"
-        @ratechange="rate = videoEl?.playbackRate || 1"
-      >
-        <template v-if="!nativeSubs">
-          <track
-            v-for="sub in (play?.subtitles || []).filter(s => s.url)" :key="sub.id" kind="subtitles"
-            :src="sub.url" :label="sub.label || sub.lang || '字幕'"
-            :default="!!sub.default"
-          />
-        </template>
-      </video>
+  <div class="player" :class="[layoutClass, { fs: fsActive, locked, 'hide-ui': chromeHidden }]">
+    <div ref="watchEl" class="watch" :class="{ 'no-side': layout === 'tablet' && !episodes.length }">
+      <div class="wmain">
+        <!-- ================= the picture ================= -->
+        <div ref="stageEl" class="stage" @pointermove="onStageMove">
+          <div class="frame">
+            <video
+              ref="videoEl"
+              :controls="nativeControls"
+              playsinline
+              webkit-playsinline
+              preload="auto"
+              @loadedmetadata="onLoadedMetadata"
+              @error="onErr"
+              @timeupdate="onTimeUpdate"
+              @progress="onTimeUpdate"
+              @pause="saveProgress(); isPlaying = false; showControls()"
+              @play="isPlaying = true; showControls()"
+              @waiting="onWaiting"
+              @playing="onPlaying"
+              @click="onTap"
+              @dblclick="onDoubleTap"
+              @ratechange="rate = videoEl?.playbackRate || 1"
+            >
+              <template v-if="!nativeSubs">
+                <track
+                  v-for="sub in (play?.subtitles || []).filter(s => s.url)" :key="sub.id" kind="subtitles"
+                  :src="sub.url" :label="sub.label || sub.lang || '字幕'"
+                  :default="!!sub.default"
+                />
+              </template>
+            </video>
 
-      <!-- top bar -->
-      <div class="top-bar">
-        <button class="icon-btn solid round" aria-label="返回" @click="goBack">
-          <AppIcon name="arrowLeft" :size="19" />
-        </button>
-        <div class="tb-title">
-          <div class="tb-name truncate">{{ play?.title || '播放中' }}</div>
-          <div class="tb-sub">
-            <span v-if="play" class="badge" :class="modeClass">{{ modeLabel }}</span>
-            <span v-if="play?.resolution" class="tiny">{{ play.resolution.replace('x', '×') }}</span>
-            <span v-if="play?.video_codec" class="tiny">
-              {{ play.video_codec.toUpperCase() }}<template v-if="play.audio_codec"> / {{ play.audio_codec.toUpperCase() }}</template>
-            </span>
-            <span v-if="currentSize" class="tiny">{{ currentSize }}</span>
-          </div>
-        </div>
-        <button
-          class="icon-btn solid round" :class="{ on: panelOpen }"
-          aria-label="播放设置" @click="panelOpen = !panelOpen"
-        >
-          <AppIcon name="list" :size="19" />
-        </button>
-      </div>
-
-      <!-- center states -->
-      <Transition name="fade">
-        <div v-if="isLoading && !error && !fatal" class="center-state">
-          <span class="ring" />
-          <div class="cs-text">{{ loadingText }}</div>
-          <div v-if="streamPct > 0" class="cs-bar" role="progressbar" :aria-valuenow="Math.round(streamPct)" aria-valuemin="0" aria-valuemax="100">
-            <i :style="{ width: streamPct + '%' }"></i>
-          </div>
-          <div v-if="encoderTooSlow" class="cs-hint">
-            <div class="cs-hint-t">
-              服务器编码速度只有实时速度的 {{ streamRate.toFixed(2) }} 倍,追不上播放。
-              把「转码最高高度」降到 720p 通常就能追上。
-            </div>
-            <div class="cs-actions">
-              <button class="btn sm" @click="loadDecision('remux')">强制转封装</button>
-              <button class="btn sm" @click="loadDecision()">重试自动</button>
-            </div>
-          </div>
-          <div v-else-if="slowHint" class="cs-hint">
-            <div class="cs-hint-t">这个片源读取得慢,当前方式追不上播放速度。</div>
-            <div class="cs-actions">
-              <button class="btn sm" @click="loadDecision('remux')">强制转封装</button>
-              <button class="btn sm" @click="loadDecision('transcode')">强制转码</button>
-              <button class="btn sm" @click="loadDecision()">重试自动</button>
-            </div>
-          </div>
-        </div>
-      </Transition>
-
-      <Transition name="fade">
-        <div v-if="error || fatal" class="error-panel">
-          <AppIcon name="alert" :size="26" />
-          <div class="ep-title">播放遇到问题</div>
-          <div class="ep-text">{{ error || fatal }}</div>
-          <div class="ep-actions">
-            <button class="btn primary" @click="loadDecision()"><AppIcon name="refresh" :size="15" /> 重试自动</button>
-            <button class="btn" @click="loadDecision('remux')">强制转封装</button>
-            <button class="btn" @click="loadDecision('transcode')">强制转码</button>
-          </div>
-        </div>
-      </Transition>
-
-      <!-- big play affordance when paused (custom chrome only) -->
-      <Transition name="fade">
-        <button
-          v-if="!nativeControls && !isPlaying && !isLoading && !error && !fatal"
-          class="big-play" aria-label="播放" @click="togglePlay"
-        >
-          <AppIcon name="play" :size="30" filled />
-        </button>
-      </Transition>
-
-      <!-- ================= bottom control bar ================= -->
-      <div v-if="!nativeControls" class="controls" @pointermove="showControls">
-        <div
-          class="seek" @pointerdown="beginScrub" @pointermove="onSeekHover"
-          @pointerleave="clearHover"
-        >
-          <div class="seek-track">
-            <div class="seek-buffer" :style="{ width: bufferedPct + '%' }"></div>
-            <div class="seek-fill" :style="{ width: progressPct + '%' }"></div>
-            <div class="seek-knob" :style="{ left: progressPct + '%' }"></div>
-          </div>
-          <div v-if="hoverTime !== null" class="seek-tip" :style="{ left: hoverX + 'px' }">{{ fmtTime(hoverTime) }}</div>
-        </div>
-
-        <div class="ctl-row">
-          <button class="icon-btn" :aria-label="isPlaying ? '暂停' : '播放'" @click="togglePlay">
-            <AppIcon :name="isPlaying ? 'pause' : 'play'" :size="20" :filled="true" />
-          </button>
-          <button class="icon-btn" aria-label="后退 10 秒" @click="seekBy(-10)">
-            <AppIcon name="back10" :size="19" />
-          </button>
-          <button class="icon-btn" aria-label="前进 10 秒" @click="seekBy(10)">
-            <AppIcon name="fwd10" :size="19" />
-          </button>
-
-          <div class="vol">
-            <button class="icon-btn" :aria-label="muted ? '取消静音' : '静音'" @click="toggleMute">
-              <AppIcon :name="muted || volume === 0 ? 'volumeMute' : 'volume'" :size="19" />
-            </button>
-            <div class="vol-slider">
-              <div class="vol-fill" :style="{ width: volumePct + '%' }"></div>
-              <input
-                type="range" min="0" max="1" step="0.02" :value="muted ? 0 : volume"
-                aria-label="音量" @input="setVolume(Number($event.target.value))"
-              />
-            </div>
-          </div>
-
-          <div class="time num">
-            <span>{{ fmtTime(shownTime) }}</span>
-            <span class="dim">/</span>
-            <span class="dim">{{ fmtTime(duration) }}</span>
-          </div>
-
-          <span class="spacer"></span>
-
-          <button
-            v-if="!nativeSubs && (play?.subtitles || []).length" class="icon-btn"
-            :class="{ on: activeSub }" aria-label="字幕" title="字幕"
-            @click="panelOpen = !panelOpen"
-          >
-            <AppIcon name="subtitles" :size="19" />
-          </button>
-
-          <div class="menu-wrap">
-            <button class="icon-btn" :class="{ on: menuOpen }" aria-label="播放速度与模式" title="设置" @click="menuOpen = !menuOpen">
-              <AppIcon name="settings" :size="19" />
-            </button>
-            <Transition name="fade">
-              <div v-if="menuOpen" class="ctl-menu">
-                <div class="cm-title">播放速度</div>
-                <div class="cm-rates">
-                  <button
-                    v-for="r in rates" :key="r" class="chip sm" :class="{ on: rate === r }"
-                    @click="setRate(r)"
-                  >{{ r }}×</button>
+            <!-- On the immersive player the top bar carries the title and the
+                 settings; on a watch page both are in the page below, so only
+                 the way back stays on the picture. -->
+            <div class="top-bar">
+              <button class="icon-btn solid round" aria-label="返回" @click="goBack">
+                <AppIcon name="arrowLeft" :size="19" />
+              </button>
+              <template v-if="!isStacked">
+                <div class="tb-title">
+                  <div class="tb-name truncate">{{ play?.title || '播放中' }}</div>
+                  <div class="tb-sub">
+                    <span v-if="play" class="badge" :class="modeClass">{{ modeLabel }}</span>
+                    <span v-if="play?.resolution" class="tiny">{{ play.resolution.replace('x', '×') }}</span>
+                    <span v-if="play?.video_codec" class="tiny">
+                      {{ play.video_codec.toUpperCase() }}<template v-if="play?.audio_codec"> / {{ play.audio_codec.toUpperCase() }}</template>
+                    </span>
+                    <span v-if="currentSize" class="tiny">{{ currentSize }}</span>
+                  </div>
                 </div>
-                <div class="cm-title mt-4">播放模式</div>
                 <button
-                  v-for="m in forceModes" :key="m.value" class="cm-item"
-                  :class="{ on: (play?.mode === m.value) || (!m.value && !forceModes.some(x => x.value === play?.mode)) }"
-                  @click="menuOpen = false; loadDecision(m.value || undefined)"
+                  class="icon-btn solid round" :class="{ on: panelOpen }"
+                  aria-label="播放设置" @click="togglePanel"
                 >
-                  <span class="cm-label">{{ m.label }}</span>
-                  <span class="tiny">{{ m.hint }}</span>
+                  <AppIcon name="list" :size="19" />
                 </button>
-                <div class="cm-title mt-4">画面</div>
-                <button class="cm-item" @click="togglePip(); menuOpen = false">
-                  <span class="cm-label"><AppIcon name="pip" :size="15" /> 画中画</span>
-                  <span class="tiny">{{ pipActive ? '已开启' : '小窗播放' }}</span>
-                </button>
+              </template>
+            </div>
+
+            <!-- Lock: fullscreen only. While locked it stays on screen — it is the
+                 one control a locked player still answers to. -->
+            <Transition name="fade">
+              <button
+                v-if="fsActive && (locked || controlsVisible)"
+                class="icon-btn solid round lock-btn" :class="{ on: locked }"
+                :aria-pressed="locked" :aria-label="locked ? '已锁定,点击解锁' : '锁定按键'"
+                :title="locked ? '已锁定 · 点击解锁' : '锁定按键'" @click="toggleLock"
+              >
+                <AppIcon :name="locked ? 'lock' : 'lockOpen'" :size="18" />
+              </button>
+            </Transition>
+
+            <!-- center states -->
+            <Transition name="fade">
+              <div v-if="isLoading && !error && !fatal" class="center-state">
+                <span class="ring" />
+                <div class="cs-text">{{ loadingText }}</div>
+                <div v-if="streamPct > 0" class="cs-bar" role="progressbar" :aria-valuenow="Math.round(streamPct)" aria-valuemin="0" aria-valuemax="100">
+                  <i :style="{ width: streamPct + '%' }"></i>
+                </div>
+                <div v-if="encoderTooSlow" class="cs-hint">
+                  <div class="cs-hint-t">
+                    服务器编码速度只有实时速度的 {{ streamRate.toFixed(2) }} 倍,追不上播放。
+                    把「转码最高高度」降到 720p 通常就能追上。
+                  </div>
+                  <div class="cs-actions">
+                    <button class="btn sm" @click="loadDecision('remux')">强制转封装</button>
+                    <button class="btn sm" @click="loadDecision()">重试自动</button>
+                  </div>
+                </div>
+                <div v-else-if="slowHint" class="cs-hint">
+                  <div class="cs-hint-t">这个片源读取得慢,当前方式追不上播放速度。</div>
+                  <div class="cs-actions">
+                    <button class="btn sm" @click="loadDecision('remux')">强制转封装</button>
+                    <button class="btn sm" @click="loadDecision('transcode')">强制转码</button>
+                    <button class="btn sm" @click="loadDecision()">重试自动</button>
+                  </div>
+                </div>
               </div>
+            </Transition>
+
+            <Transition name="fade">
+              <div v-if="error || fatal" class="error-panel">
+                <AppIcon name="alert" :size="26" />
+                <div class="ep-title">播放遇到问题</div>
+                <div class="ep-text">{{ error || fatal }}</div>
+                <div class="ep-actions">
+                  <button class="btn primary" @click="loadDecision()"><AppIcon name="refresh" :size="15" /> 重试自动</button>
+                  <button class="btn" @click="loadDecision('remux')">强制转封装</button>
+                  <button class="btn" @click="loadDecision('transcode')">强制转码</button>
+                </div>
+              </div>
+            </Transition>
+
+            <!-- big play affordance when paused (custom chrome only) -->
+            <Transition name="fade">
+              <button
+                v-if="!nativeControls && !isPlaying && !isLoading && !error && !fatal"
+                class="big-play" aria-label="播放" @click="togglePlay"
+              >
+                <AppIcon name="play" :size="30" filled />
+              </button>
             </Transition>
           </div>
 
-          <button class="icon-btn" aria-label="全屏" @click="toggleFullscreen">
-            <AppIcon :name="fsActive ? 'fullscreenExit' : 'fullscreen'" :size="19" />
-          </button>
+          <!-- ================= bottom control bar =================
+               Immersive: laid over the foot of the picture. Watch page: the same
+               bar, sitting under the picture — a 16:9 box is no place for a
+               control strip. Same markup, two positions. -->
+          <div v-if="!nativeControls" class="controls" @pointermove="showControls">
+            <div
+              class="seek" @pointerdown="beginScrub" @pointermove="onSeekHover"
+              @pointerleave="clearHover"
+            >
+              <div class="seek-track">
+                <div class="seek-buffer" :style="{ width: bufferedPct + '%' }"></div>
+                <div class="seek-fill" :style="{ width: progressPct + '%' }"></div>
+                <div class="seek-knob" :style="{ left: progressPct + '%' }"></div>
+              </div>
+              <div v-if="hoverTime !== null" class="seek-tip" :style="{ left: hoverX + 'px' }">{{ fmtTime(hoverTime) }}</div>
+            </div>
+
+            <div class="ctl-row">
+              <button class="icon-btn" :aria-label="isPlaying ? '暂停' : '播放'" @click="togglePlay">
+                <AppIcon :name="isPlaying ? 'pause' : 'play'" :size="20" :filled="true" />
+              </button>
+              <button class="icon-btn" aria-label="后退 10 秒" @click="seekBy(-10)">
+                <AppIcon name="back10" :size="19" />
+              </button>
+              <button class="icon-btn" aria-label="前进 10 秒" @click="seekBy(10)">
+                <AppIcon name="fwd10" :size="19" />
+              </button>
+
+              <div class="vol">
+                <button class="icon-btn" :aria-label="muted ? '取消静音' : '静音'" @click="toggleMute">
+                  <AppIcon :name="muted || volume === 0 ? 'volumeMute' : 'volume'" :size="19" />
+                </button>
+                <div class="vol-slider">
+                  <div class="vol-fill" :style="{ width: volumePct + '%' }"></div>
+                  <input
+                    type="range" min="0" max="1" step="0.02" :value="muted ? 0 : volume"
+                    aria-label="音量" @input="setVolume(Number($event.target.value))"
+                  />
+                </div>
+              </div>
+
+              <div class="time num">
+                <span>{{ fmtTime(shownTime) }}</span>
+                <span class="dim">/</span>
+                <span class="dim">{{ fmtTime(duration) }}</span>
+              </div>
+
+              <span class="spacer"></span>
+
+              <button
+                v-if="!nativeSubs && (play?.subtitles || []).length" class="icon-btn"
+                :class="{ on: activeSub }" aria-label="字幕" title="字幕"
+                @click="togglePanel"
+              >
+                <AppIcon name="subtitles" :size="19" />
+              </button>
+
+              <div class="menu-wrap">
+                <button class="icon-btn" :class="{ on: menuOpen }" aria-label="播放速度与模式" title="设置" @click="toggleMenu">
+                  <AppIcon name="settings" :size="19" />
+                </button>
+                <Transition name="fade">
+                  <div v-if="menuOpen && (!isStacked || fsActive)" class="ctl-menu">
+                    <div class="cm-title">播放速度</div>
+                    <div class="cm-rates">
+                      <button
+                        v-for="r in rates" :key="r" class="chip sm" :class="{ on: rate === r }"
+                        @click="setRate(r)"
+                      >{{ r }}×</button>
+                    </div>
+                    <div class="cm-title mt-4">播放模式</div>
+                    <button
+                      v-for="m in forceModes" :key="m.value" class="cm-item"
+                      :class="{ on: (play?.mode === m.value) || (!m.value && !forceModes.some(x => x.value === play?.mode)) }"
+                      @click="setMode(m)"
+                    >
+                      <span class="cm-label">{{ m.label }}</span>
+                      <span class="tiny">{{ m.hint }}</span>
+                    </button>
+                    <div class="cm-title mt-4">画面</div>
+                    <button class="cm-item" @click="togglePip(); menuOpen = false">
+                      <span class="cm-label"><AppIcon name="pip" :size="15" /> 画中画</span>
+                      <span class="tiny">{{ pipActive ? '已开启' : '小窗播放' }}</span>
+                    </button>
+                  </div>
+                </Transition>
+              </div>
+
+              <button class="icon-btn" aria-label="全屏" @click="toggleFullscreen">
+                <AppIcon :name="fsActive ? 'fullscreenExit' : 'fullscreen'" :size="19" />
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- ============ watch page: everything under the picture ============
+             In the theater this wrapper is display:contents, so the settings
+             drawer inside it is the same right-hand drawer it always was. -->
+        <div class="winfo">
+          <template v-if="isStacked">
+            <h1 class="wi-title">{{ play?.title || '播放中' }}</h1>
+            <div class="wi-meta">
+              <span v-if="play" class="badge" :class="modeClass">{{ modeLabel }}</span>
+              <span v-if="infoShow?.year" class="badge plain">{{ infoShow.year }}</span>
+              <span v-if="infoShow?.rating" class="badge rating">
+                <AppIcon name="star" :size="11" filled />{{ Number(infoShow.rating).toFixed(1) }}
+              </span>
+              <span v-if="play?.resolution" class="tiny">{{ play.resolution.replace('x', '×') }}</span>
+              <span v-if="play?.video_codec" class="tiny">
+                {{ play.video_codec.toUpperCase() }}<template v-if="play?.audio_codec"> / {{ play.audio_codec.toUpperCase() }}</template>
+              </span>
+              <span v-if="currentSize" class="tiny">{{ currentSize }}</span>
+              <span v-if="meta?.air_date" class="tiny">{{ meta.air_date }}</span>
+            </div>
+
+            <div v-if="episodes.length" class="wi-actions">
+              <button class="btn sm" :disabled="!prevEp" @click="playEpisode(prevEp)">
+                <AppIcon name="chevronLeft" :size="14" /> 上一集
+              </button>
+              <button class="btn sm" :disabled="!nextEp" @click="playEpisode(nextEp)">
+                下一集 <AppIcon name="chevronRight" :size="14" />
+              </button>
+              <span class="spacer"></span>
+              <span v-if="epIndex >= 0" class="tiny num">第 {{ epIndex + 1 }} / {{ episodes.length }} 集</span>
+            </div>
+
+            <div class="wi-tabs" role="tablist">
+              <button
+                v-if="tabs.includes('eps')" role="tab" :aria-selected="activeTab === 'eps'"
+                :class="{ on: activeTab === 'eps' }" @click="tab = 'eps'"
+              >
+                <AppIcon name="grid" :size="14" /> 选集<span class="tiny num">{{ episodes.length }}</span>
+              </button>
+              <button
+                role="tab" :aria-selected="activeTab === 'about'"
+                :class="{ on: activeTab === 'about' }" @click="tab = 'about'"
+              >
+                <AppIcon name="info" :size="14" /> 简介
+              </button>
+              <button
+                role="tab" :aria-selected="activeTab === 'settings'"
+                :class="{ on: activeTab === 'settings' }" @click="tab = 'settings'"
+              >
+                <AppIcon name="settings" :size="14" /> 设置
+              </button>
+            </div>
+
+            <!-- phone: the episode grid, Bilibili-style -->
+            <div v-if="activeTab === 'eps' && episodes.length" class="wi-eps">
+              <button
+                v-for="(ep, i) in episodes" :key="ep.id" class="wi-ep num"
+                :class="{ on: ep.id === play?.item_id }"
+                :aria-label="epName(ep, i)" :title="epName(ep, i)"
+                @click="playEpisode(ep)"
+              >{{ epNo(ep, i) }}</button>
+            </div>
+
+            <div v-else-if="activeTab === 'about'" class="wi-about">
+              <p v-if="overview" class="wi-ov">{{ overview }}</p>
+              <p v-else class="tiny">这个条目还没有简介。</p>
+              <div v-if="infoGenres.length" class="wi-facts">
+                <span v-for="g in infoGenres" :key="g" class="chip sm">{{ g }}</span>
+              </div>
+            </div>
+          </template>
+
+          <!-- ============ side panel: tracks, mode, picture ============
+               A right-hand drawer over the picture in the theater, the 设置 tab
+               of the page in a watch page. -->
+          <Transition :name="isStacked ? 'none' : 'slide'">
+            <aside v-if="panelShown" class="panel glass">
+              <div class="pn-head">
+                <div class="card-title mb-0"><AppIcon name="layers" :size="16" /> 播放设置</div>
+                <button v-if="!isStacked" class="icon-btn" aria-label="关闭" @click="panelOpen = false">
+                  <AppIcon name="close" :size="17" />
+                </button>
+              </div>
+
+              <div v-if="(play?.versions || []).length" class="pn-group">
+                <div class="label">版本</div>
+                <button
+                  v-for="v in play.versions" :key="v.id"
+                  class="chip" :class="{ on: v.current }" @click="selectVersion(v)"
+                >{{ v.label || '默认版本' }}</button>
+              </div>
+
+              <div v-if="(play?.audio_tracks || []).length > 1" class="pn-group">
+                <div class="label">音轨</div>
+                <button
+                  v-for="a in play.audio_tracks" :key="a.ordinal"
+                  class="chip" :class="{ on: a.ordinal === currentAudio }"
+                  @click="selectAudio(a.ordinal)"
+                >
+                  {{ a.codec.toUpperCase() }}{{ a.lang ? ' · ' + a.lang : '' }}{{ a.title ? ' · ' + a.title : '' }}
+                </button>
+              </div>
+
+              <div v-if="!nativeSubs && (play?.subtitles || []).length" class="pn-group">
+                <div class="label">字幕</div>
+                <button class="chip" :class="{ on: activeSub === null }" @click="selectSub(null)">关闭</button>
+                <button
+                  v-for="sub in play.subtitles" :key="sub.id"
+                  class="chip" :class="{ on: activeSub && activeSub.id === sub.id || (sub.burn && burnSub === sub.id) }"
+                  @click="selectSub(sub)"
+                >{{ sub.label || sub.lang || '字幕' }}<span v-if="sub.burn" class="tiny"> · 烧录</span></button>
+              </div>
+
+              <div class="pn-group">
+                <div class="label">播放速度</div>
+                <div class="pn-rates">
+                  <button v-for="r in rates" :key="r" class="chip sm" :class="{ on: rate === r }" @click="setRate(r)">{{ r }}×</button>
+                </div>
+              </div>
+
+              <div class="pn-group">
+                <div class="label">播放模式</div>
+                <button
+                  v-for="m in forceModes" :key="m.value" class="chip"
+                  :class="{ on: (play?.mode === m.value) || (!m.value && !forceModes.some(x => x.value === play?.mode)) }"
+                  @click="setMode(m)"
+                >{{ m.label }}</button>
+              </div>
+
+              <div class="pn-group">
+                <div class="label">画面</div>
+                <button class="chip" :class="{ on: pipActive }" @click="togglePip()">
+                  <AppIcon name="pip" :size="14" /> 画中画{{ pipActive ? ' · 已开启' : '' }}
+                </button>
+              </div>
+
+              <div v-if="play?.reason" class="pn-reason tiny">
+                <AppIcon name="sparkles" :size="13" />
+                <span>{{ play.reason }}</span>
+              </div>
+            </aside>
+          </Transition>
         </div>
       </div>
 
-      <!-- ================= side panel: tracks ================= -->
-      <Transition name="slide">
-        <aside v-if="panelOpen" class="panel glass">
-          <div class="pn-head">
-            <div class="card-title mb-0"><AppIcon name="layers" :size="16" /> 播放设置</div>
-            <button class="icon-btn" aria-label="关闭" @click="panelOpen = false"><AppIcon name="close" :size="17" /></button>
-          </div>
-
-          <div v-if="(play?.versions || []).length" class="pn-group">
-            <div class="label">版本</div>
-            <button
-              v-for="v in play.versions" :key="v.id"
-              class="chip" :class="{ on: v.current }" @click="selectVersion(v)"
-            >{{ v.label || '默认版本' }}</button>
-          </div>
-
-          <div v-if="(play?.audio_tracks || []).length > 1" class="pn-group">
-            <div class="label">音轨</div>
-            <button
-              v-for="a in play.audio_tracks" :key="a.ordinal"
-              class="chip" :class="{ on: a.ordinal === currentAudio }"
-              @click="selectAudio(a.ordinal)"
-            >
-              {{ a.codec.toUpperCase() }}{{ a.lang ? ' · ' + a.lang : '' }}{{ a.title ? ' · ' + a.title : '' }}
-            </button>
-          </div>
-
-          <div v-if="!nativeSubs && (play?.subtitles || []).length" class="pn-group">
-            <div class="label">字幕</div>
-            <button class="chip" :class="{ on: activeSub === null }" @click="selectSub(null)">关闭</button>
-            <button
-              v-for="sub in play.subtitles" :key="sub.id"
-              class="chip" :class="{ on: activeSub && activeSub.id === sub.id || (sub.burn && burnSub === sub.id) }"
-              @click="selectSub(sub)"
-            >{{ sub.label || sub.lang || '字幕' }}<span v-if="sub.burn" class="tiny"> · 烧录</span></button>
-          </div>
-
-          <div v-if="play?.reason" class="pn-reason tiny">
-            <AppIcon name="sparkles" :size="13" />
-            <span>{{ play.reason }}</span>
-          </div>
-        </aside>
-      </Transition>
+      <!-- tablet: the episodes down the right-hand side -->
+      <aside v-if="layout === 'tablet' && episodes.length" class="wside">
+        <div class="ws-head">
+          <div class="ws-title"><AppIcon name="list" :size="15" /> 选集</div>
+          <span class="tiny">{{ episodes.length }} 集</span>
+        </div>
+        <div class="ws-list">
+          <button
+            v-for="(ep, i) in episodes" :key="ep.id" class="ws-ep"
+            :class="{ on: ep.id === play?.item_id }"
+            :aria-label="epName(ep, i)" @click="playEpisode(ep)"
+          >
+            <span class="ws-thumb">
+              <SmartImage v-if="ep.still_path" :src="imgUrl(ep.id, 'still')" :alt="epName(ep, i)" :seed="epName(ep, i)" />
+              <span v-else class="ws-ph num">{{ epNo(ep, i) }}</span>
+            </span>
+            <span class="ws-copy">
+              <span class="ws-name truncate">{{ epName(ep, i) }}</span>
+              <span class="tiny truncate">{{ epSub(ep) }}</span>
+            </span>
+            <AppIcon v-if="ep.id === play?.item_id" name="play" :size="14" filled />
+          </button>
+        </div>
+      </aside>
     </div>
 
-    <!-- ================= shortcuts hint (desktop) ================= -->
-    <div v-if="!nativeControls" class="hints">
+    <!-- ================= shortcuts hint (desktop theater only) ================= -->
+    <div v-if="!nativeControls && layout === 'theater'" class="hints">
       <span><kbd>空格</kbd> 播放/暂停</span>
       <span><kbd>←</kbd><kbd>→</kbd> 快退/快进 10s</span>
       <span><kbd>F</kbd> 全屏</span>
@@ -1010,8 +1512,17 @@ onBeforeUnmount(() => {
 }
 /* toasts must clear the control bar, not sit inside it */
 .player :deep(.toast-host) { bottom: calc(118px + env(safe-area-inset-bottom)); }
-.stage { position: relative; flex: 1; min-height: 0; background: #000; display: flex; align-items: center; justify-content: center; }
-video { width: 100%; height: 100%; object-fit: contain; background: #000; display: block; }
+
+/* ============================ the picture ================================= */
+/* Theater: the stage *is* the screen and the frame fills it. The watch-page
+   layouts below turn both into a normal 16:9 block in a page. */
+.watch { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.wmain { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.stage { position: relative; flex: 1; min-height: 0; background: #000; }
+.frame { position: absolute; inset: 0; }
+/* touch-action: the player has a double-tap gesture of its own, so the browser's
+   double-tap zoom must not race it. */
+video { width: 100%; height: 100%; object-fit: contain; background: #000; display: block; touch-action: manipulation; }
 
 .top-bar {
   position: absolute;
@@ -1028,8 +1539,13 @@ video { width: 100%; height: 100%; object-fit: contain; background: #000; displa
 .tb-name { font-size: var(--fs-15); font-weight: 650; text-shadow: 0 2px 12px rgba(0, 0, 0, 0.6); }
 .tb-sub { display: flex; align-items: center; gap: 9px; margin-top: 4px; }
 
+/* Overlays are centred on the picture rather than laid out beside it: as flex
+   items they would compete with the video for room and be pushed off-screen. */
 .center-state {
   position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -1067,7 +1583,10 @@ video { width: 100%; height: 100%; object-fit: contain; background: #000; displa
 .cs-actions { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin-top: 10px; }
 
 .error-panel {
-  position: relative;
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
   z-index: 6;
   max-width: min(520px, 88vw);
   text-align: center;
@@ -1089,6 +1608,9 @@ video { width: 100%; height: 100%; object-fit: contain; background: #000; displa
 
 .big-play {
   position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
   z-index: 4;
   width: 84px; height: 84px;
   display: grid; place-items: center;
@@ -1099,8 +1621,9 @@ video { width: 100%; height: 100%; object-fit: contain; background: #000; displa
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55);
   transition: transform var(--t-fast), background var(--t-fast);
 }
-.big-play:hover { transform: scale(1.06); background: #fff; }
+.big-play:hover { transform: translate(-50%, -50%) scale(1.06); background: #fff; }
 
+/* Theater position: laid over the foot of the picture. */
 .controls {
   position: absolute;
   inset: auto 0 0 0;
@@ -1113,7 +1636,27 @@ video { width: 100%; height: 100%; object-fit: contain; background: #000; displa
 .hide-ui .top-bar { opacity: 0; transform: translateY(-12px); pointer-events: none; }
 .hide-ui { cursor: none; }
 
-/* seek bar */
+/* Locked: the picture plays on, the chrome is gone, and only the lock button
+   still takes a tap. */
+.locked .controls { opacity: 0; transform: translateY(12px); pointer-events: none; }
+.locked .top-bar { opacity: 0; transform: translateY(-12px); pointer-events: none; }
+.locked .hints { opacity: 0; }
+.locked { cursor: none; }
+
+.lock-btn {
+  position: absolute;
+  left: max(10px, env(safe-area-inset-left));
+  top: 50%;
+  z-index: 9;
+  /* Spelled out, and more specific than .icon-btn:active, which would otherwise
+     swap the centring transform for a scale while the button is pressed. */
+  transform: translateY(-50%);
+}
+.player .lock-btn:active { transform: translateY(-50%) scale(0.94); }
+.locked .lock-btn { opacity: 0.55; }
+.locked .lock-btn:hover, .locked .lock-btn:active { opacity: 1; }
+
+/* Everything here is the same whatever the layout: the bar simply moves. */
 .seek { position: relative; padding: 10px 0; cursor: pointer; touch-action: none; }
 .seek-track {
   position: relative;
@@ -1208,6 +1751,10 @@ video { width: 100%; height: 100%; object-fit: contain; background: #000; displa
 .cm-item.on { background: var(--brand-tint); }
 .cm-label { font-size: var(--fs-13); font-weight: 600; color: var(--text-1); display: inline-flex; align-items: center; gap: 7px; }
 
+/* ============ settings: drawer in the theater, inline in a page =========== */
+/* In the theater this wrapper is display:contents, so the panel inside it is
+   positioned against .wmain — the same right-hand drawer it always was. */
+.winfo { display: contents; }
 .panel {
   position: absolute;
   inset: 0 0 0 auto;
@@ -1225,11 +1772,169 @@ video { width: 100%; height: 100%; object-fit: contain; background: #000; displa
 .pn-group { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
 .pn-group .label { font-size: var(--fs-11); font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-4); }
 .pn-group .chip { max-width: 100%; height: auto; min-height: 34px; padding: 7px 14px; white-space: normal; text-align: left; }
+.pn-rates { display: flex; flex-wrap: wrap; gap: 6px; }
 .pn-reason { display: flex; gap: 8px; line-height: 1.55; margin-top: auto; padding-top: 16px; border-top: 1px solid var(--line-1); }
 
 .slide-enter-active, .slide-leave-active { transition: transform var(--t-mid), opacity var(--t-mid); }
 .slide-enter-from, .slide-leave-to { transform: translateX(24px); opacity: 0; }
 
+/* ============================ phone: the watch page ======================= */
+/* Picture on top, its controls directly under it, then the title, the episode
+   grid and the settings — the whole thing scrolls, YouTube/Bilibili style. */
+.lay-phone .watch { display: block; overflow-y: auto; overscroll-behavior: contain; }
+.lay-phone .wmain { display: block; }
+.lay-phone .stage { display: block; flex: none; }
+.lay-phone .frame { position: relative; inset: auto; width: 100%; aspect-ratio: 16 / 9; }
+.lay-phone .top-bar { padding: max(10px, env(safe-area-inset-top)) 10px 10px; background: none; }
+.lay-phone .controls {
+  position: static;
+  inset: auto;
+  padding: 2px 8px 6px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line-1);
+}
+.lay-phone .big-play { width: 62px; height: 62px; }
+.lay-phone .error-panel { padding: 14px; gap: 6px; }
+.lay-phone .error-panel svg { display: none; }
+.lay-phone .cs-hint { padding: 10px 12px; }
+.lay-phone .winfo { display: block; padding: 14px 16px calc(30px + env(safe-area-inset-bottom)); }
+.lay-phone :deep(.toast-host) { bottom: calc(18px + env(safe-area-inset-bottom)); }
+
+/* ============================ tablet: sidebar on the right ================ */
+/* Picture top-left, its controls below it, episodes down the right-hand side. */
+.lay-tablet .watch { display: grid; grid-template-columns: minmax(0, 1fr) min(340px, 34vw); overflow: hidden; }
+.lay-tablet .watch.no-side { grid-template-columns: minmax(0, 1fr); }
+.lay-tablet .wmain { display: block; overflow-y: auto; }
+.lay-tablet .stage { display: block; flex: none; }
+.lay-tablet .frame { position: relative; inset: auto; width: 100%; aspect-ratio: 16 / 9; }
+.lay-tablet .watch.no-side .stage { max-width: 1040px; margin: 0 auto; }
+.lay-tablet .top-bar { padding: max(14px, env(safe-area-inset-top)) 16px 20px; background: none; }
+.lay-tablet .controls {
+  position: static;
+  inset: auto;
+  padding: 4px 12px 10px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line-1);
+}
+.lay-tablet .winfo { display: block; padding: 18px 20px calc(34px + env(safe-area-inset-bottom)); }
+.lay-tablet :deep(.toast-host) { bottom: calc(22px + env(safe-area-inset-bottom)); }
+
+/* The page's 设置 tab: the drawer's groups, flowed into the page instead. */
+.lay-phone .panel, .lay-tablet .panel {
+  position: static;
+  inset: auto;
+  width: auto;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  overflow: visible;
+  gap: 16px;
+}
+
+.wi-title { font-size: var(--fs-20); font-weight: 700; letter-spacing: -0.02em; line-height: 1.4; margin: 0; }
+.wi-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.wi-actions { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
+.wi-tabs { display: flex; align-items: center; gap: 2px; margin: 16px 0 14px; border-bottom: 1px solid var(--line-1); }
+.wi-tabs button {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 12px;
+  font-size: var(--fs-13);
+  font-weight: 600;
+  color: var(--text-3);
+  transition: color var(--t-fast);
+}
+.wi-tabs button:hover { color: var(--text-1); }
+.wi-tabs button.on { color: var(--text-1); }
+.wi-tabs button.on::after {
+  content: '';
+  position: absolute;
+  left: 10px; right: 10px; bottom: -1px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--brand);
+}
+.wi-eps { display: grid; grid-template-columns: repeat(auto-fill, minmax(50px, 1fr)); gap: 8px; }
+.wi-ep {
+  height: 44px;
+  border-radius: var(--r-s);
+  border: 1px solid var(--line-1);
+  background: var(--bg-2);
+  color: var(--text-2);
+  font-size: var(--fs-14);
+  font-weight: 650;
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast);
+}
+.wi-ep:hover { background: var(--bg-3); color: var(--text-1); }
+.wi-ep.on { background: var(--brand); border-color: transparent; color: var(--brand-ink); }
+.wi-about { display: flex; flex-direction: column; gap: 14px; }
+.wi-ov { margin: 0; font-size: var(--fs-14); line-height: 1.72; color: var(--text-2); max-width: 78ch; }
+.wi-facts { display: flex; flex-wrap: wrap; gap: 8px; }
+
+.wside {
+  min-height: 0;
+  overflow-y: auto;
+  background: var(--bg-1);
+  border-left: 1px solid var(--line-1);
+  padding: 12px 10px calc(24px + env(safe-area-inset-bottom));
+}
+.ws-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 4px 6px 10px; }
+.ws-title { display: flex; align-items: center; gap: 8px; font-size: var(--fs-13); font-weight: 700; }
+.ws-list { display: flex; flex-direction: column; gap: 4px; }
+.ws-ep {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px;
+  border-radius: var(--r-s);
+  border: 1px solid transparent;
+  text-align: left;
+  color: var(--text-3);
+  transition: background var(--t-fast), border-color var(--t-fast);
+}
+.ws-ep:hover { background: var(--bg-2); }
+.ws-ep.on { background: var(--brand-tint); border-color: rgba(240, 169, 46, 0.28); }
+.ws-ep.on svg { color: var(--brand); }
+.ws-thumb {
+  position: relative;
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 92px;
+  aspect-ratio: 16 / 9;
+  border-radius: var(--r-xs);
+  overflow: hidden;
+  background: var(--bg-3);
+}
+.ws-thumb :deep(img) { width: 100%; height: 100%; object-fit: cover; }
+.ws-ph { font-size: var(--fs-16); font-weight: 700; color: var(--text-4); }
+.ws-copy { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.ws-name { font-size: var(--fs-13); font-weight: 600; color: var(--text-2); }
+.ws-ep.on .ws-name { color: var(--text-1); }
+
+/* ============================ fullscreen ================================= */
+/* The stage is the screen again, whatever page layout it came from. */
+.player.fs .stage { display: block; max-width: none; margin: 0; }
+.player.fs .frame { position: absolute; inset: 0; width: auto; aspect-ratio: auto; }
+.player.fs .controls {
+  position: absolute;
+  inset: auto 0 0 0;
+  padding: 60px clamp(14px, 3vw, 34px) max(20px, env(safe-area-inset-bottom));
+  background: linear-gradient(to top, rgba(3, 4, 6, 0.94) 10%, rgba(3, 4, 6, 0.6) 55%, rgba(3, 4, 6, 0));
+  border-bottom: 0;
+}
+.player.fs .top-bar {
+  padding: max(14px, env(safe-area-inset-top)) clamp(14px, 3vw, 34px) 34px;
+  background: linear-gradient(to bottom, rgba(3, 4, 6, 0.86), rgba(3, 4, 6, 0));
+}
+
+/* ============================ misc ======================================= */
 .hints {
   position: absolute;
   bottom: calc(104px + env(safe-area-inset-bottom));
