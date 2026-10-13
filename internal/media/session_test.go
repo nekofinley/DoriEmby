@@ -274,9 +274,9 @@ func TestSessionSelectionForSegment(t *testing.T) {
 	e := newTestEngine(t, nil)
 	e.Cfg.DataDir = t.TempDir()
 
-	early := fakeSession(t, e, 7, 0, 20)    // started at the top, 20 segments in hand
-	late := fakeSession(t, e, 7, 10, 30)    // started at segment 10
-	other := fakeSession(t, e, 8, 0, 30)    // a different file
+	early := fakeSession(t, e, 7, 0, 20) // started at the top, 20 segments in hand
+	late := fakeSession(t, e, 7, 10, 30) // started at segment 10
+	other := fakeSession(t, e, 8, 0, 30) // a different file
 	_ = other
 
 	// Inside a session's window: the latest session that had already begun wins.
