@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -129,6 +130,20 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 	startQ := ""
 	if resumeFrom > 0 {
 		startQ = "&start=" + strconv.FormatFloat(resumeFrom, 'f', 3, 64)
+	}
+
+	// A session begins at a segment boundary, and the player presents that stream
+	// as starting at zero. So the client is told where the stream begins in file
+	// time, or it would save progress measured from the resume point and line
+	// subtitles up against the wrong clock.
+	streamStart := 0.0
+	if resumeFrom > 0 && s.Cfg.Playback.HLSSessionPackager &&
+		(dec.Mode == "remux" || dec.Mode == "transcode") {
+		segLen := s.Cfg.Playback.SegmentSeconds
+		if segLen <= 0 {
+			segLen = 4
+		}
+		streamStart = math.Floor(resumeFrom/segLen) * segLen
 	}
 
 	switch dec.Mode {
@@ -258,6 +273,12 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		// The subtitle a player should enable by itself (0 = none). Sent both as
 		// a flag per track and once here, so a client can pick either way.
 		"default_subtitle_id": defSubID,
+		// stream_start is the file position an HLS session begins at (0 when the
+		// stream starts at the beginning). Players present a session stream as
+		// starting at zero — hls.js re-aligns it, discarding the absolute
+		// timestamps the segments carry — so the client needs this offset to seek,
+		// to save progress in file time, and to line up absolutely timed subtitles.
+		"stream_start": streamStart,
 	})
 }
 

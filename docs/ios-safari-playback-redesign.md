@@ -603,6 +603,133 @@ Apple 的 HEVC 直拷**默认关闭**（`apple_hevc_copy=false`），一律走�
   （用 headless Chrome 驱动真实播放页，量 resume 与前后 seek），量完再决定是否要补
   `EXT-X-DISCONTINUITY` 或改为客户端上报 seek 位置。
 
+### 12.7 播放器实测（headless Chrome + 真实播放页）与由此发现的缺陷
+
+量法：起测试服务、打开开关、把进度存到片子一半，然后驱动真实播放页
+（`.uitest/check-session-playback.mjs`，不入库），读 `video.currentTime` / `duration` /
+`seekable`。
+
+实测数据（12s 样本，恢复点 6.001s → 会话起点 segment 1 = 4s）：
+
+| 量 | 值 | 含义 |
+| --- | --- | --- |
+| 文件时长 | 12.001s | |
+| 会话起点 | 4s | `MEDIA-SEQUENCE:1` |
+| **播放器 `duration`** | **8.083s** | = 12.001 − 会话起点：**只有剩余部分** |
+| **播放器 `currentTime` 起点** | **0** | 不是 4s |
+
+**结论：hls.js 会把会话流重新对齐到 0，丢弃分片里携带的绝对时间戳。** 也就是说
+`tfdt` 平移（12.3）在 hls.js 这条路上**不产生播放器可见的效果**（对 Safari/AVPlayer 仍然有意义，
+它按 `tfdt` 判时间，且保持一致是安全的）。播放器的时间轴 = **相对会话起点**。
+
+由此暴露一个我此前只验了服务端、没验播放器而漏掉的缺陷：**客户端按绝对时间在使用播放器**。
+
+- `saveProgress()` 送的是 `video.currentTime`（相对），于是一部从 40 分钟恢复的片子看到第 50 分钟时
+  会把进度存成 **10 分钟**，下次「继续观看」被拉回 10 分钟——**静默写坏进度**；
+- 播放页显示的时间与进度条从 0:00 开始，而不是 40:00；
+- 侧挂字幕是绝对时间轴，与相对时间轴对不上 → 字幕不会在正确时刻出现。
+
+**修复（已写入代码，见下）**：由服务端告知偏移，客户端一律用「文件时间」。
+
+- `/api/play` 新增 `stream_start`：当开关打开且决策是 HLS 时 =
+  `floor(已保存进度 / 分片长度) × 分片长度`（与打包器实际起点一致），否则 0；
+- `webui/src/views/Player.vue`：`duration = 元素时长 + stream_start`；恢复播放 seek 到
+  `已保存进度 − stream_start`；`onTimeUpdate` 与 `saveProgress` 一律 `+ stream_start`；
+  拖动进度条写回时 `− stream_start`；
+- **字幕**：侧挂 VTT 里的时间是文件时间，而元素时钟是相对时间，所以启用某条字幕轨时
+  把它的 cue 时间整体减去 `stream_start`（`shiftCues`，每个 `<track>` 只做一次，
+  靠 `el.dataset.cuesShifted` 保证幂等；cue 已加载或随 `load` 事件到达时都处理）。
+
+两个在无法编译的情况下**靠通读发现并修掉**的问题（值得记下来，因为它们正是"没有测试就会漏"的类型）：
+
+- 我第一版写成 `duration = (v.duration || payload.duration) + stream_start`。当元素没报时长、
+  回退到 payload 时，payload 的 duration **本来就是整个文件的**，再加偏移就重复计算了。
+  改成只在元素确实报了时长时加偏移；
+- 初始化时把 `position` 也换算成文件时间，否则起播瞬间界面会先显示 0:00。
+
+**已在真实播放器里验证**（headless Chrome + 120 秒样本；`.uitest/mk-long-fixture.mjs` 与
+`.uitest/check-session-playback.mjs`，该目录不入库）：
+
+```
+fixture: Long Feature Two (file 26) mode=remux duration=120s
+saved position: 60s (file time)
+stream_start: 60s → the element's clock runs 0..60
+url: /api/hls/26/index.m3u8?...&m=remux&start=60.000
+element duration ≈ 62                                    ← 元素时钟只剩「剩余部分」
+resume:  YES (t=0.29，以元素时钟计 ↔ 文件 60s)            ← 恢复落在保存位置
+seek back to stream start: YES (t=3.93)
+seek forward to 48s:       YES (t=52.93)
+playback advanced:         YES (3s)
+progress saved in file time: YES (saved=112.93 = 元素 52.926 + start 60)
+consoleErrors: []                                        ← hls.js 未因序号跳变报错
+```
+
+结论：
+
+1. **修复有效**：`stream_start` 送达客户端后，恢复、seek、进度保存都按文件时间工作；修复前这里会
+   存成 52.9 而不是 112.9（静默写坏进度）。
+2. **序号跳变不会让 hls.js 困惑**——播单 `MEDIA-SEQUENCE` 从 15 起、元素时钟仍从 0 开始，控制台
+   没有任何错误。§12.6 里悬着的那个问题就此有了答案，不需要 `EXT-X-DISCONTINUITY`。
+3. **已知限制（有意保留）**：会话从片中开始时播单只覆盖已打包的部分，**文件开头不在其中**，
+   所以从这种流里回拖到片头到不了——需要播放器用 `start=0` 重新加载 URL（另起会话）。目前拖动被
+   夹在流范围内；等真正需要"回片头"时再让客户端在拖到窗口外时重载。
+
+**仍未解决（下一轮第一件事）**：`stream_start` 是 `/api/play` 那一刻的静态值。播放中 seek 到
+窗口外时，服务端会另起一个从 seek 目标开始的会话（§12.4 第 2 项），播放器那边的时间轴会**再次
+对齐到新的起点**，于是这个静态偏移就过期了——进度保存与字幕会跟着漂。Proper 的解法是让服务端
+把「本播单的起点」写进播单（例如自定义标签 `#EXT-X-DM-STREAM-START:<秒>`），客户端定期读同一
+个播单 URL 来更新 `stream_start`（并重排 cue）。
+
+### 12.8 机器故障记录（已恢复）
+
+现象与证据：
+
+- `pwsh` 一律失败：`Error: spawn C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe ENOENT`；
+  用文件工具确认 `powershell.exe` **存在**（读出来是二进制），所以不是文件丢失；
+- 同一时刻 `glob` 的 ripgrep provider 也失败 —— **任何子进程创建**都失败，不是单个工具的问题；
+- 此前 D: 盘（Samsung 980 PRO）持续报 `Ntfs 140` / `disk 51` / `Flush → A device which does not
+  exist was specified`。本次是否同一块盘、或系统盘（C:）也出问题，**没有 shell 无法确认**；
+- **重启后恢复正常**（`echo ok`、go build、vite build、e2e 全部可用），所以当时是系统级的临时
+  故障状态，文件系统与仓库本身没有损坏（两个未提交文件逐段读过，内容完整）。
+
+未提交、只在 C: 工作区（`C:\Users\Administrator\DoriyaMedia`）里的改动：
+
+| 文件 | 内容 |
+| --- | --- |
+| `internal/api/play_handlers.go` | 新增 `stream_start` 字段与计算（`go build ./...` 曾通过） |
+| `webui/src/views/Player.vue` | 偏移感知：恢复 seek、进度保存、时间显示、拖动 seek |
+| 其余 | 本轮无 |
+
+注意：**前端产物没有重建**（`internal/web/dist` 仍是旧 bundle），所以即使服务跑起来，
+客户端也没有这段修复；`doriyamedia.exe` 也未重建。
+
+恢复步骤（机器能起进程之后）：
+
+1. 重启机器；先确认能创建进程（`echo ok`）与 D:/C: 的事件日志；
+2. `cd C:\Users\Administrator\DoriyaMedia` → `git status`（应看到上面两个文件）；
+3. `go build ./... && go vet ./... && go test ./...`；前端 `vite build`；`.\scripts\e2e-test.ps1`
+   （e2e 7d 现在还会断言 `stream_start == floor(已保存进度/分片长度)×分片长度`）；
+4. 按 12.7 复测恢复与 seek：**样本必须长于 60 秒**（播放器自己有「进度 > 30s 才恢复」的门槛，
+   12s 样本量不出恢复行为，这正是上一轮测量结论不完整的原因）。两步：
+   ```
+   node .uitest/mk-long-fixture.mjs          # 生成 120s 样本 + 建本地源/库 + 扫描，打印 file id
+   node .uitest/check-session-playback.mjs <file_id>
+   ```
+   脚本会在样本短于 60s 时主动警告；
+5. 通过后提交并推送（远端 `origin/main` 停在 `49f5390`）。
+
+**未验证代码批次的清单**（都在 C: 工作区，未提交）：
+
+| 文件 | 内容 | 风险 |
+| --- | --- | --- |
+| `internal/api/play_handlers.go` | `stream_start` 字段与计算、`math` import | 曾 `go build ./...` 通过，之后未再编译 |
+| `webui/src/views/Player.vue` | 偏移感知（恢复 seek、进度保存、时间显示、拖动 seek、字幕 cue 平移） | **前端未重建**，未做任何检查 |
+| `scripts/e2e-test.ps1` | 7d 增加 `stream_start` 断言 | 未运行 |
+| `.uitest/mk-long-fixture.mjs`、`.uitest/check-session-playback.mjs` | 只能靠通读检查（该目录不入库） | 未运行 |
+
+通读时发现并已修掉的两个隐患（记录在此，因为它们是"没有测试就会漏"的典型）：
+`duration` 回退到 payload 时会重复加偏移；初始化时 `position` 未换算成文件时间。
+
 ### 12.5 取舍说明（P4/P5 为什么排在后面）
 
 - **P4**（MP4 byterange）：本库 463 个 MP4 多为 H.264/AAC，iOS 本就原生可播；真正需要它的场景是

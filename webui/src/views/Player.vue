@@ -17,6 +17,10 @@ const stageEl = ref(null)
 const hls = ref(null)
 const currentAudio = ref(0)
 const activeSub = ref(null)
+// streamStart: where the current stream begins in file time. Non-zero when a
+// packaging session started at the viewer's saved position, because players
+// present that stream as starting at zero.
+const streamStart = ref(0)
 const duration = ref(0)
 const position = ref(0)
 const buffered = ref(0)
@@ -128,6 +132,10 @@ async function loadDecision(force) {
     isLoading.value = false
     return
   }
+  // Where the stream begins in file time (0 unless a session packages from a
+  // resume position). Everything the UI and the API show is file time, so this is
+  // the offset between the element's clock and the file's.
+  streamStart.value = Number(play.value?.stream_start) || 0
   if (play.value?.state === 'probing') {
     startProbePoll()
     return
@@ -365,13 +373,22 @@ function onHlsError(_, data) {
 function onLoadedMetadata() {
   isLoading.value = false
   const v = videoEl.value
-  duration.value = v.duration || play.value?.duration || 0
-  // Subtitles come on by themselves; the panel is only there to change or turn
-  // them off.
+  // Everything here is reported in *file* time. A packaged session begins where
+  // the viewer's saved position was, and players present that stream as starting
+  // at zero (hls.js re-aligns it), so the element's own clock is offset from the
+  // file by streamStart.
+  const elDuration = Number(v.duration) || 0
+  // The payload's duration is already the whole file's, so only the element's own
+  // (remaining) duration gets the offset added.
+  duration.value = elDuration > 0 ? elDuration + streamStart.value : (play.value?.duration || 0)
+  position.value = (Number(v.currentTime) || 0) + streamStart.value
+  // Subtitles come on by themselves; the panel is there to change or turn them off.
   autoSelectSub()
   api.get(`/api/progress?file_id=${route.params.fileId}`).then((p) => {
+    const inStream = p ? p.position - streamStart.value : 0
     if (p && p.position > 30 && duration.value > 0 && p.position < duration.value * 0.95) {
-      v.currentTime = p.position
+      v.currentTime = Math.max(0, inStream)
+      position.value = p.position
       toast.info(`已从 ${fmtTime(p.position)} 继续播放`)
     }
   }).catch(() => {})
@@ -391,8 +408,10 @@ function onErr() {
 function onTimeUpdate() {
   const v = videoEl.value
   if (!v) return
-  if (!scrubbing.value) position.value = v.currentTime
-  if (v.buffered.length) buffered.value = v.buffered.end(v.buffered.length - 1)
+  // The element's clock is relative to the stream; everything the UI and the API
+  // deal in is file time, so the session offset is added on the way out.
+  if (!scrubbing.value) position.value = v.currentTime + streamStart.value
+  if (v.buffered.length) buffered.value = v.buffered.end(v.buffered.length - 1) + streamStart.value
   const now = Date.now()
   if (now - lastSave > 10000) { lastSave = now; saveProgress() }
 }
@@ -402,8 +421,10 @@ function saveProgress() {
   if (!v || !v.duration || !isFinite(v.duration)) return
   api.post('/api/progress', {
     file_id: Number(route.params.fileId),
-    position: v.currentTime,
-    duration: v.duration,
+    // File time, not stream time: otherwise resuming a session-packaged playback
+    // would save a position measured from where the session happened to begin.
+    position: v.currentTime + streamStart.value,
+    duration: v.duration + streamStart.value,
   }).catch(() => {})
 }
 
@@ -437,6 +458,23 @@ function findSubTrack(sub) {
   return null
 }
 
+// Subtitle files carry times in *file* time, while the element's clock is
+// relative to a packaged session (see streamStart). Move the cues onto the
+// element's clock, once per track, whenever they arrive.
+function shiftCues(el) {
+  if (!el || el.dataset.cuesShifted === '1' || !streamStart.value) return
+  const t = el.track
+  if (!t || !t.cues || !t.cues.length) return
+  const off = streamStart.value
+  for (const c of t.cues) {
+    try {
+      c.startTime = Math.max(0, c.startTime - off)
+      c.endTime = Math.max(0, c.endTime - off)
+    } catch { /* frozen cue: leave it alone */ }
+  }
+  el.dataset.cuesShifted = '1'
+}
+
 // showSub turns one subtitle track on and the rest off. It goes through the
 // element's own .track rather than indexing v.textTracks, because hls.js
 // registers text tracks of its own and the indices then stop lining up.
@@ -451,6 +489,9 @@ function showSub(sub) {
   const el = findSubTrack(sub)
   if (!el || !el.track) return false
   el.track.mode = 'showing'
+  // The cues may already be loaded, or may arrive with the track's load event.
+  shiftCues(el)
+  el.addEventListener('load', () => shiftCues(el), { once: true })
   activeSub.value = sub
   return true
 }
@@ -529,7 +570,8 @@ function moveScrub(e) {
 function endScrub() {
   const v = videoEl.value
   if (scrubbing.value && v && isFinite(scrubTime.value)) {
-    v.currentTime = scrubTime.value
+    // scrubTime is file time; the element wants stream time.
+    v.currentTime = Math.max(0, scrubTime.value - streamStart.value)
     position.value = scrubTime.value
   }
   scrubbing.value = false

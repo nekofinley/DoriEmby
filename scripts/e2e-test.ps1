@@ -269,6 +269,14 @@ Show "saved position" "$resume / $dur"
 if ($rp.url -notmatch 'start=') {
   throw "the HLS URL must carry the saved position, got '$($rp.url)'"
 }
+# The client cannot see the session offset by itself: players present a packaged
+# stream as starting at zero (hls.js re-aligns it), so /api/play has to say where
+# the stream begins in file time, or progress and subtitles come out shifted.
+$wantStart = [math]::Floor($resume / 4.0) * 4.0
+Show "stream_start" "$($rp.stream_start) (期望 $wantStart)"
+if ([math]::Abs([double]$rp.stream_start - $wantStart) -gt 0.001) {
+  throw "stream_start must be the session's start position, got '$($rp.stream_start)' want $wantStart"
+}
 $rpM3u8 = RawReq $hc "GET" "$Base$($rp.url)" @{}
 $rpTxt = [System.Text.Encoding]::UTF8.GetString($rpM3u8.Bytes)
 if ($rpTxt -notmatch '#EXT-X-MEDIA-SEQUENCE:(\d+)') { throw "no MEDIA-SEQUENCE in the resumed playlist`n$rpTxt" }
