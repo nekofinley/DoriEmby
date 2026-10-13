@@ -18,11 +18,11 @@ import (
 )
 
 type fileRec struct {
-	Path string // driver path, or absolute URL for .strm
-	Dir  string
-	Size int64
+	Path  string // driver path, or absolute URL for .strm
+	Dir   string
+	Size  int64
 	MTime int64
-	Strm bool
+	Strm  bool
 }
 
 type Scanner struct {

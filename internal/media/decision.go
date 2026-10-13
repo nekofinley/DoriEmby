@@ -61,10 +61,10 @@ type DecisionAlt struct {
 }
 
 var (
-	safariVideo = map[string]bool{"h264": true, "hevc": true}
-	safariAudio = map[string]bool{"aac": true, "mp3": true, "flac": true, "alac": true}
-	chromeVideo = map[string]bool{"h264": true, "hevc": true, "av1": true, "vp9": true, "vp8": true}
-	chromeAudio = map[string]bool{"aac": true, "mp3": true, "opus": true, "vorbis": true, "flac": true}
+	safariVideo  = map[string]bool{"h264": true, "hevc": true}
+	safariAudio  = map[string]bool{"aac": true, "mp3": true, "flac": true, "alac": true}
+	chromeVideo  = map[string]bool{"h264": true, "hevc": true, "av1": true, "vp9": true, "vp8": true}
+	chromeAudio  = map[string]bool{"aac": true, "mp3": true, "opus": true, "vorbis": true, "flac": true}
 	firefoxVideo = map[string]bool{"h264": true, "vp9": true, "vp8": true, "av1": true}
 	firefoxAudio = map[string]bool{"aac": true, "mp3": true, "opus": true, "vorbis": true, "flac": true}
 )

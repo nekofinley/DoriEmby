@@ -25,8 +25,8 @@ type NFOMovie struct {
 		Type  string `xml:"type,attr"`
 		Value string `xml:",chardata"`
 	} `xml:"uniqueid"`
-	Thumbs  []string `xml:"thumb"`
-	Fanart  struct {
+	Thumbs []string `xml:"thumb"`
+	Fanart struct {
 		Thumbs []string `xml:"thumb"`
 	} `xml:"fanart"`
 }

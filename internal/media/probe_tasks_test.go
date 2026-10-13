@@ -26,7 +26,9 @@ func (fakeDriver) List(context.Context, string) ([]source.Entry, error) { return
 func (fakeDriver) DirectURL(context.Context, string) (string, map[string]string, error) {
 	return "http://example.invalid/x.mkv", nil, nil
 }
-func (fakeDriver) Open(context.Context, string) (io.ReadCloser, error) { return nil, errors.New("unused") }
+func (fakeDriver) Open(context.Context, string) (io.ReadCloser, error) {
+	return nil, errors.New("unused")
+}
 func (fakeDriver) ProbeURL(context.Context, string) (string, map[string]string, error) {
 	return "http://example.invalid/x.mkv", nil, nil
 }

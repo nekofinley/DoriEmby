@@ -13,13 +13,13 @@ func jsonUnmarshal(s string, v any) error { return json.Unmarshal([]byte(s), v) 
 func jsonMarshal(v any) ([]byte, error) { return json.Marshal(v) }
 
 type videoInfo struct {
-	Codec    string `json:"codec"`
-	Tag      string `json:"tag,omitempty"`
-	Profile  string `json:"profile,omitempty"`
-	Width    int    `json:"width"`
-	Height   int    `json:"height"`
-	DVProfile int   `json:"dv_profile,omitempty"`
-	BitRate  int64  `json:"bit_rate,omitempty"`
+	Codec     string `json:"codec"`
+	Tag       string `json:"tag,omitempty"`
+	Profile   string `json:"profile,omitempty"`
+	Width     int    `json:"width"`
+	Height    int    `json:"height"`
+	DVProfile int    `json:"dv_profile,omitempty"`
+	BitRate   int64  `json:"bit_rate,omitempty"`
 }
 
 type audioInfo struct {

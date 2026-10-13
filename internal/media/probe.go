@@ -12,19 +12,19 @@ import (
 
 // ProbeStream mirrors the ffprobe -show_streams JSON (subset).
 type ProbeStream struct {
-	Index          int             `json:"index"`
-	CodecType      string          `json:"codec_type"`
-	CodecName      string          `json:"codec_name"`
-	CodecTagString string          `json:"codec_tag_string"`
-	CodecTag       string          `json:"codec_tag"`
-	Profile        string          `json:"profile"`
-	Width          int             `json:"width"`
-	Height         int             `json:"height"`
-	Channels       int             `json:"channels"`
-	AvgFrameRate   string          `json:"avg_frame_rate"`
-	BitRate        json.Number     `json:"bit_rate"`
-	SideDataList   []SideData      `json:"side_data_list"`
-	Disposition    json.RawMessage `json:"disposition"`
+	Index          int               `json:"index"`
+	CodecType      string            `json:"codec_type"`
+	CodecName      string            `json:"codec_name"`
+	CodecTagString string            `json:"codec_tag_string"`
+	CodecTag       string            `json:"codec_tag"`
+	Profile        string            `json:"profile"`
+	Width          int               `json:"width"`
+	Height         int               `json:"height"`
+	Channels       int               `json:"channels"`
+	AvgFrameRate   string            `json:"avg_frame_rate"`
+	BitRate        json.Number       `json:"bit_rate"`
+	SideDataList   []SideData        `json:"side_data_list"`
+	Disposition    json.RawMessage   `json:"disposition"`
 	Tags           map[string]string `json:"tags"`
 }
 
@@ -35,11 +35,11 @@ type SideData struct {
 }
 
 type ProbeFormat struct {
-	FormatName  string      `json:"format_name"`
-	Duration    json.Number `json:"duration"`
-	Size        json.Number `json:"size"`
-	BitRate     json.Number `json:"bit_rate"`
-	FormatTags  map[string]string `json:"tags"`
+	FormatName string            `json:"format_name"`
+	Duration   json.Number       `json:"duration"`
+	Size       json.Number       `json:"size"`
+	BitRate    json.Number       `json:"bit_rate"`
+	FormatTags map[string]string `json:"tags"`
 }
 
 type Probe struct {

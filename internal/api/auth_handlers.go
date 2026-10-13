@@ -99,13 +99,13 @@ func (s *Server) handleSystemInfo(w http.ResponseWriter, r *http.Request, user *
 	ffmpegOK := exec.Command(s.Cfg.FFmpeg, "-version").Run() == nil
 	ffprobeOK := exec.Command(s.Cfg.FFProbe, "-version").Run() == nil
 	writeJSON(w, 200, map[string]any{
-		"version":       "0.1.0",
-		"os":            runtime.GOOS,
-		"ffmpeg_ok":     ffmpegOK,
-		"ffprobe_ok":    ffprobeOK,
-		"tmdb_ok":       s.Cfg.TMDB.APIKey != "",
-		"data_dir":      s.Cfg.Abs(),
-		"force_mode":    s.Cfg.Playback.ForceMode,
+		"version":    "0.1.0",
+		"os":         runtime.GOOS,
+		"ffmpeg_ok":  ffmpegOK,
+		"ffprobe_ok": ffprobeOK,
+		"tmdb_ok":    s.Cfg.TMDB.APIKey != "",
+		"data_dir":   s.Cfg.Abs(),
+		"force_mode": s.Cfg.Playback.ForceMode,
 	})
 }
 
@@ -132,14 +132,14 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request, user *m
 
 func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request, user *models.User) {
 	var req struct {
-		Port            *int               `json:"port"`
-		FFmpeg          *string            `json:"ffmpeg"`
-		FFProbe         *string            `json:"ffprobe"`
-		ScanConcurrency *int               `json:"scan_concurrency"`
-		DevWebDir       *string            `json:"dev_web_dir"`
-		TMDB            *configTMDB        `json:"tmdb"`
-		BGM             *configBGM         `json:"bgm"`
-		Playback        *configPlayback    `json:"playback"`
+		Port            *int            `json:"port"`
+		FFmpeg          *string         `json:"ffmpeg"`
+		FFProbe         *string         `json:"ffprobe"`
+		ScanConcurrency *int            `json:"scan_concurrency"`
+		DevWebDir       *string         `json:"dev_web_dir"`
+		TMDB            *configTMDB     `json:"tmdb"`
+		BGM             *configBGM      `json:"bgm"`
+		Playback        *configPlayback `json:"playback"`
 	}
 	if err := readBody(r, &req); err != nil {
 		fail(w, 400, err.Error())
@@ -231,11 +231,11 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request, user *m
 }
 
 type configTMDB = struct {
-	APIKey   string `json:"api_key"`
-	Language string `json:"language"`
-	APIBase  string `json:"api_base"`
-	ImgBase  string `json:"img_base"`
-	UseProxy *bool  `json:"use_proxy"`
+	APIKey   string  `json:"api_key"`
+	Language string  `json:"language"`
+	APIBase  string  `json:"api_base"`
+	ImgBase  string  `json:"img_base"`
+	UseProxy *bool   `json:"use_proxy"`
 	Proxy    *string `json:"proxy"`
 }
 

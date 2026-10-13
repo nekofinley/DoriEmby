@@ -13,11 +13,11 @@ import (
 )
 
 type TMDBClient struct {
-	APIKey  string
+	APIKey   string
 	Language string
-	APIBase string
-	ImgBase string
-	client  *http.Client
+	APIBase  string
+	ImgBase  string
+	client   *http.Client
 }
 
 func NewTMDBClient(apiKey, language, apiBase, imgBase string, client *http.Client) *TMDBClient {
@@ -86,17 +86,17 @@ func (t *TMDBClient) get(ctx context.Context, path string, params map[string]str
 }
 
 type TMDBSearchItem struct {
-	ID           int     `json:"id"`
-	Title        string  `json:"title"`
-	Name         string  `json:"name"`
-	OriginalTitle string `json:"original_title"`
-	OriginalName string `json:"original_name"`
-	Overview     string  `json:"overview"`
-	PosterPath   string  `json:"poster_path"`
-	BackdropPath string  `json:"backdrop_path"`
-	ReleaseDate  string  `json:"release_date"`
-	FirstAirDate string  `json:"first_air_date"`
-	VoteAverage  float64 `json:"vote_average"`
+	ID            int     `json:"id"`
+	Title         string  `json:"title"`
+	Name          string  `json:"name"`
+	OriginalTitle string  `json:"original_title"`
+	OriginalName  string  `json:"original_name"`
+	Overview      string  `json:"overview"`
+	PosterPath    string  `json:"poster_path"`
+	BackdropPath  string  `json:"backdrop_path"`
+	ReleaseDate   string  `json:"release_date"`
+	FirstAirDate  string  `json:"first_air_date"`
+	VoteAverage   float64 `json:"vote_average"`
 }
 
 type TMDBSearchResp struct {
@@ -148,15 +148,15 @@ type TMDBMovieDetail struct {
 }
 
 type TMDBTVDetail struct {
-	ID           int     `json:"id"`
-	Name         string  `json:"name"`
-	OriginalName string  `json:"original_name"`
-	Overview     string  `json:"overview"`
-	PosterPath   string  `json:"poster_path"`
-	BackdropPath string  `json:"backdrop_path"`
-	FirstAirDate string  `json:"first_air_date"`
-	VoteAverage  float64 `json:"vote_average"`
-	NumberOfSeasons int  `json:"number_of_seasons"`
+	ID              int     `json:"id"`
+	Name            string  `json:"name"`
+	OriginalName    string  `json:"original_name"`
+	Overview        string  `json:"overview"`
+	PosterPath      string  `json:"poster_path"`
+	BackdropPath    string  `json:"backdrop_path"`
+	FirstAirDate    string  `json:"first_air_date"`
+	VoteAverage     float64 `json:"vote_average"`
+	NumberOfSeasons int     `json:"number_of_seasons"`
 	TMDBGenres
 }
 

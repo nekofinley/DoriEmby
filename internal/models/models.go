@@ -59,7 +59,7 @@ type Item struct {
 	TMDBID        int       `json:"tmdb_id,omitempty"`
 	BGMID         int       `json:"bgm_id,omitempty"` // Bangumi (bgm.tv) subject id
 	Overview      string    `json:"overview,omitempty"`
-	PosterPath    string    `json:"poster_path,omitempty"`  // local cache file name
+	PosterPath    string    `json:"poster_path,omitempty"` // local cache file name
 	BackdropPath  string    `json:"backdrop_path,omitempty"`
 	StillPath     string    `json:"still_path,omitempty"`
 	Rating        float64   `json:"rating,omitempty"`
@@ -82,23 +82,23 @@ type MediaFile struct {
 }
 
 type Subtitle struct {
-	ID        int64   `json:"id"`
-	FileID    int64   `json:"file_id"`
-	Path      string  `json:"path"` // driver path (external) or empty
-	Lang      string  `json:"lang,omitempty"`
-	Title     string  `json:"title,omitempty"`
-	Format    string  `json:"format,omitempty"` // subrip|ass|webvtt|hdmv_pgs_subtitle...
-	Embedded  bool    `json:"embedded"`
-	StreamIdx int     `json:"stream_idx,omitempty"`
-	Convertible bool  `json:"convertible"`
+	ID          int64  `json:"id"`
+	FileID      int64  `json:"file_id"`
+	Path        string `json:"path"` // driver path (external) or empty
+	Lang        string `json:"lang,omitempty"`
+	Title       string `json:"title,omitempty"`
+	Format      string `json:"format,omitempty"` // subrip|ass|webvtt|hdmv_pgs_subtitle...
+	Embedded    bool   `json:"embedded"`
+	StreamIdx   int    `json:"stream_idx,omitempty"`
+	Convertible bool   `json:"convertible"`
 }
 
 type Progress struct {
-	UserID   int64     `json:"user_id"`
-	FileID   int64     `json:"file_id"`
-	ItemID   int64     `json:"item_id"`
-	Position float64   `json:"position"`
-	Duration float64   `json:"duration"`
+	UserID    int64     `json:"user_id"`
+	FileID    int64     `json:"file_id"`
+	ItemID    int64     `json:"item_id"`
+	Position  float64   `json:"position"`
+	Duration  float64   `json:"duration"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 

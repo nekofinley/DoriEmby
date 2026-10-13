@@ -222,9 +222,9 @@ func (c *Config) Abs() string {
 	return filepath.Join(wd, c.DataDir)
 }
 
-func (c *Config) DBPath() string     { return filepath.Join(c.Abs(), "doriyamedia.db") }
-func (c *Config) ImagesDir() string  { return filepath.Join(c.Abs(), "images") }
-func (c *Config) LogsDir() string    { return filepath.Join(c.Abs(), "logs") }
+func (c *Config) DBPath() string    { return filepath.Join(c.Abs(), "doriyamedia.db") }
+func (c *Config) ImagesDir() string { return filepath.Join(c.Abs(), "images") }
+func (c *Config) LogsDir() string   { return filepath.Join(c.Abs(), "logs") }
 
 func randomSecret() string {
 	b := make([]byte, 32)
