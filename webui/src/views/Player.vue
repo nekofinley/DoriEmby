@@ -148,10 +148,29 @@ async function loadDecision(force) {
   attachSource()
 }
 
+// Ask the browser what it can actually decode, rather than assuming. A machine
+// with hardware HEVC support answers yes, and the server then copies the video
+// instead of transcoding it; a machine that answers no gets a transcode instead
+// of a stream it would only fail to decode. The report is a result either way,
+// because "no answer" means "unknown" and must keep the old behaviour.
+const clientCaps = (() => {
+  try {
+    if (typeof MediaSource === 'undefined' || !MediaSource.isTypeSupported) return ''
+    const hevc = [
+      'video/mp4; codecs="hvc1.1.6.L123.B0"', // Main
+      'video/mp4; codecs="hvc1.2.4.L153.B0"', // Main 10
+    ].some((t) => MediaSource.isTypeSupported(t))
+    return hevc ? 'hevc' : 'nohevc'
+  } catch {
+    return ''
+  }
+})()
+
 function fetchPlay() {
   const params = new URLSearchParams({ client: detectClient() })
   if (forceMode.value) params.set('force', forceMode.value)
   if (currentAudio.value) params.set('a', String(currentAudio.value))
+  if (clientCaps) params.set('caps', clientCaps)
   return api.get(`/api/play/${route.params.fileId}?${params}`)
 }
 

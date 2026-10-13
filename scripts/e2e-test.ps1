@@ -220,6 +220,29 @@ if ($forced.reason -notmatch 'HEVC') {
   throw "the fallback reason must name the codec, got '$($forced.reason)'"
 }
 
+Write-Host "==> 7b2. the client's own codec report (P3)"
+# The page asks MediaSource what it can decode and passes the result along; the
+# server must honour both directions. Absent a report, nothing changes (7b above).
+# The packager has to be on for a copy to be worth allowing at all — without it
+# the copy would be MPEG-TS, which an MSE client cannot demux.
+Invoke-RestMethod -Uri "$Base/api/config" -Method Put -WebSession $sess -ContentType "application/json" `
+  -Body (J @{playback=@{hls_session_packager=$true}}) | Out-Null
+$capYes = Invoke-RestMethod -Uri "$Base/api/play/$hev1`?client=chrome&force=remux&caps=hevc" -WebSession $sess
+Show "reported HEVC support" "$($capYes.mode) | $($capYes.reason)"
+if ($capYes.mode -ne "remux") {
+  throw "a client reporting HEVC support may copy, got '$($capYes.mode)'"
+}
+$capNo = Invoke-RestMethod -Uri "$Base/api/play/$hev1`?client=chrome&caps=nohevc" -WebSession $sess
+Show "reported no HEVC" "$($capNo.mode) | $($capNo.reason)"
+if ($capNo.mode -ne "transcode") {
+  throw "a client reporting no HEVC must be transcoded, got '$($capNo.mode)'"
+}
+# The reason names the self-report; matched in ASCII, because this script is read
+# as ANSI by Windows PowerShell and CJK literals in code can decode into quotes.
+if ($capNo.reason -notmatch 'HEVC') {
+  throw "the reason must explain the codec, got '$($capNo.reason)'"
+}
+
 Write-Host "==> 7c. session packager: Apple-valid fMP4 for copied HEVC"
 # Apple will not decode HEVC from MPEG-TS, so copied HEVC has to be fMP4 with a
 # proper init segment. This is the whole point of the session packager.

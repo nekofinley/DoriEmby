@@ -214,9 +214,11 @@ func CanDirectPlay(probe *Probe, path string, client ClientKind) (bool, string) 
 //
 // HEVC for Apple is gated on appleHEVCCopy because Apple's HLS stack does not
 // decode HEVC carried in MPEG-TS: the copy plays audio with no picture at all.
-// Copying HEVC for Apple needs fMP4, which the on-demand segmenter cannot emit
-// correctly yet (docs/ios-safari-playback-redesign.md §11.3).
-func hlsVideoCopyOK(v *ProbeStream, client ClientKind, appleHEVCCopy bool) bool {
+// With the session packager on, the copy is fMP4 with an hvc1 sample entry, which
+// is what Apple actually wants — and what a browser may support too, which is why
+// an MSE client is allowed to copy HEVC when it says its MediaSource handles it
+// (caps.HEVC). Without that report the safe answer stays "transcode".
+func hlsVideoCopyOK(v *ProbeStream, client ClientKind, appleHEVCCopy, clientHEVC bool) bool {
 	if v == nil {
 		return false
 	}
@@ -225,7 +227,11 @@ func hlsVideoCopyOK(v *ProbeStream, client ClientKind, appleHEVCCopy bool) bool 
 		// "High 10" / "Main 10" profiles are 10-bit — not playable via MSE
 		return !strings.Contains(strings.ToLower(v.Profile), "10")
 	case "hevc":
-		return client == ClientSafari && appleHEVCCopy
+		if client == ClientSafari {
+			return appleHEVCCopy
+		}
+		// Other clients only copy HEVC fMP4 if they reported the capability.
+		return clientHEVC
 	}
 	return false
 }
@@ -260,6 +266,16 @@ type DecideOptions struct {
 	// stream plays audio with no picture. Turn it on only for a device verified
 	// to play HEVC-in-TS.
 	AppleHEVCCopy bool
+	// ClientHEVC is the client's own report that its playback stack handles HEVC.
+	// A browser answers this by asking MediaSource about an hvc1 codec string, so
+	// a machine with hardware HEVC support copies instead of transcoding; without
+	// the report nothing changes.
+	ClientHEVC bool
+	// ClientNoHEVC is the opposite report: the client looked and cannot play HEVC.
+	// The codec tables assume a browser can, which is wrong on plenty of machines,
+	// and handing such a client a stream it cannot decode just looks broken. So a
+	// negative report rules out both direct play and copying.
+	ClientNoHEVC bool
 }
 
 // Decide produces the playback plan.
@@ -307,7 +323,7 @@ func Decide(probe *Probe, path string, client ClientKind, opts DecideOptions) *D
 		// a codec it cannot decode (AV1 / VP9 / MPEG-2 / 10-bit H.264 …) produced
 		// a stream with working audio and no picture at all — on every client —
 		// so fall back to a real transcode and say why.
-		if hlsVideoCopyOK(v, client, opts.AppleHEVCCopy) {
+		if hlsVideoCopyOK(v, client, opts.AppleHEVCCopy, opts.ClientHEVC) {
 			d.Mode, d.Kind, d.Reason = "remux", "hls", "手动指定转封装"
 			return d
 		}
@@ -325,6 +341,11 @@ func Decide(probe *Probe, path string, client ClientKind, opts DecideOptions) *D
 	}
 
 	can, why := CanDirectPlay(probe, path, client)
+	// A client that examined itself and found no HEVC decoder must not be handed
+	// HEVC just because the generic codec table assumes browsers cope.
+	if can && opts.ClientNoHEVC && v != nil && v.CodecName == "hevc" {
+		can, why = false, "客户端自报不支持 HEVC"
+	}
 	if can {
 		if hasDirect && len(directHeaders) == 0 {
 			d.Mode, d.Kind, d.Reason = "direct", "mp4", "客户端原生支持,302 直连"
@@ -336,7 +357,7 @@ func Decide(probe *Probe, path string, client ClientKind, opts DecideOptions) *D
 
 	// Video copy is only possible when the client's HLS stack can actually
 	// decode the copied stream; otherwise fall through to real transcode.
-	if hlsVideoCopyOK(v, client, opts.AppleHEVCCopy) {
+	if hlsVideoCopyOK(v, client, opts.AppleHEVCCopy, opts.ClientHEVC) {
 		d.Mode, d.Kind = "remux", "hls"
 		d.Reason = why + " → HLS 转封装(视频流直拷)"
 		return d

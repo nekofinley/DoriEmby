@@ -101,6 +101,13 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		// session packager produces; without it, Apple gets MPEG-TS it cannot
 		// decode (audio, no picture) — so the packager implies the copy is allowed.
 		AppleHEVCCopy: s.Cfg.Playback.AppleHEVCCopy || s.Cfg.Playback.HLSSessionPackager,
+		// A browser says whether its MediaSource handles HEVC. Honouring that lets
+		// a machine with hardware support copy instead of transcoding — but only
+		// with the packager on, since the copy has to be fMP4 to be playable.
+		ClientHEVC: capsHas(r.URL.Query().Get("caps"), "hevc") && s.Cfg.Playback.HLSSessionPackager,
+		// The same report, negative: this browser looked and cannot play HEVC, so
+		// neither direct play nor copying is on offer for it.
+		ClientNoHEVC: capsHas(r.URL.Query().Get("caps"), "nohevc"),
 	})
 
 	// Resume support: tell the HLS packager where the viewer left off, so a

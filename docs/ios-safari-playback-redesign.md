@@ -305,7 +305,7 @@ client_capabilities{ua_hash, mse, webcodecs}
 | **P0** | 降低探测参数（8MB/4s）+ 异步探测 + 状态接口 + 前端状态文案 | 起播从「分钟」到「秒」；不再「不知道在等还是挂了」 | 低 | ✅ **已完成** |
 | **P1** | 扫描期后台批量预探 + 探测结果缓存落库 | 绝大多数文件点开即 ready | 低（注意限流，避免扫描把带宽打满） | ✅ **已完成** |
 | **P2** | 会话化转封装/转码 + 分片缓存 + 增量 event 播单 + 缓存淘汰 | 消除 25× 放大；连续播放不卡；二次播放秒开 | 中（会话生命周期、磁盘占用） | ✅ **已完成**：所有 HLS 播放走一次长驻 ffmpeg（fMP4/event 播单）；已完成产物留在缓存里、二次播放秒开；容量上限 + LRU 淘汰 + 启动清理残留 —— 见 §12 |
-| **P3** | 放宽 copy 判据（iOS Hi10P）+ fMP4 + `-tag:v hvc1` + 客户端能力自报 | 更多片源从「全量转码」降级为「转封装」 | 中（需要真机验证各机型） | 🟡 **部分完成**：fMP4 + `hvc1` 已落地；能力仍是手动开关 `apple_hevc_copy`，未做自报 |
+| **P3** | 放宽 copy 判据（iOS Hi10P）+ fMP4 + `-tag:v hvc1` + 客户端能力自报 | 更多片源从「全量转码」降级为「转封装」 | 中（需要真机验证各机型） | ✅ **已完成**：fMP4 + `hvc1` 与「直拷 HEVC（含 Hi10P）」随会话打包落地（真机 ma10p 可播）；客户端自报能力（`caps=hevc` / `caps=nohevc`）双向生效 —— 见 §15 |
 | **P4** | MP4 `moov` 解析 + `EXT-X-BYTERANGE` 直取 + Range 补丁 | MP4 全部零转码、零 CPU | 高（新解析器，需充分测试） | 未开始（`internal/media/mp4box.go` 已提供 box 解析底座，见 §12） |
 | **P5** | 渐进代理加固（Range 能力探测、206 校验、HEAD） | WebDAV/不可 302 场景可用 | 低 | ✅ **已完成** —— 见 §14 |
 | **P6** | 字幕轨（HLS WebVTT）+ PGS 按需烧录缓存 | 补齐已知限制 | 中 | 🟡 **大部分完成**：自动载入 + 文本轨转 WebVTT + **HLS `EXT-X-MEDIA` 字幕轨**（Safari 原生菜单可用）已落地；**PGS 烧录未做** —— 见 §13 |
@@ -825,6 +825,29 @@ rendition 播单有 `#EXTINF` 与 `#EXT-X-ENDLIST`。
   `Accept-Ranges`）、开区间到文件尾截断、无法解析的 206 → 502、HEAD 被拒时的回退探测；
 - e2e 第 9 步新增：对**远端（mock openlist）文件**走我们自己的代理请求 `bytes=100-199` →
   `status=206 len=100 cr=bytes 100-199/2405972`。
+
+## 15. P3 收尾：客户端能力自报
+
+**问题**：决策引擎的编码表假设"浏览器能播 HEVC"（`chromeVideo["hevc"] = true`），但现实里大量
+Chrome/Edge 装不出 HEVC 解码器（Linux、老 Windows、无硬件支持）。对这类客户端，直连是**撒谎**：
+播放器拿到解不开的流，只能靠客户端自己回退；而能解的设备则白白付了转码的代价。
+
+**做法**：让**要播的那个设备自己回答**。播放页用 `MediaSource.isTypeSupported()` 探一次
+（Main 与 Main10 两个 `hvc1` 编码串），把结果随播放请求带给服务端：
+
+| 客户端上报 | 服务端行为 |
+| --- | --- |
+| `caps=hevc` | 允许**直拷**（`remux`）——省掉整次转码；直连判据也照旧 |
+| `caps=nohevc` | **禁止直连与直拷**，走转码，并在原因里写明「客户端自报不支持 HEVC」 |
+| 不发（旧客户端 / Safari 无 MSE） | 维持原判据，**不改变行为**（"不知道"不能当成"不支持"） |
+
+两个约束写死在实现里：**直拷需要会话打包器打开**（否则拷出来是 MPEG-TS，MSE 根本没法 demux），
+以及 **Apple 不受此报告影响**（它由自己的开关管，因为限制在容器而不是解码器）。
+
+验证：`TestClientHEVCReportAllowsCopy`（上报支持 → 允许直拷；无上报 → 仍转码；AV1 不受影响；
+Apple 不受影响）、`TestClientNoHEVCReportRulesOutDirectAndCopy`（无上报时 Chrome+MKV 走直连；
+上报 nohevc → 转码且原因点明自报；H.264 不受影响；Apple 自己的开关仍生效）；e2e 7b2 断言两个
+方向：`reported HEVC support → remux`、`reported no HEVC → transcode`。
 
 
 

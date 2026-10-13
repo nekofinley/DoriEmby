@@ -126,3 +126,77 @@ func TestAppleHEVCCopyPolicy(t *testing.T) {
 		t.Fatalf("Chrome forced-remux mode = %q, want transcode even with AppleHEVCCopy", chrome.Mode)
 	}
 }
+
+// A client that reports it can decode HEVC may copy instead of transcoding —
+// that is the whole point of asking it. Without the report nothing changes.
+func TestClientHEVCReportAllowsCopy(t *testing.T) {
+	// Reported capability: copying is allowed for an MSE client.
+	reported := decideWith("hevc", "Main 10", "hvc1", ClientChrome,
+		DecideOptions{Force: "remux", ClientHEVC: true})
+	if reported.Mode != "remux" {
+		t.Fatalf("mode=%q, want remux when the client reports HEVC support", reported.Mode)
+	}
+	if reported.Reason != "手动指定转封装" {
+		t.Errorf("reason=%q, want the plain forced-remux reason", reported.Reason)
+	}
+
+	// No report: keep transcoding, and keep explaining why.
+	silent := decideWith("hevc", "Main 10", "hvc1", ClientChrome, DecideOptions{Force: "remux"})
+	if silent.Mode != "transcode" {
+		t.Fatalf("mode=%q, want transcode without a capability report", silent.Mode)
+	}
+
+	// The report must not make undecodable-for-everyone codecs copyable.
+	av1 := decideWith("av1", "", "", ClientChrome, DecideOptions{Force: "remux", ClientHEVC: true})
+	if av1.Mode != "transcode" {
+		t.Fatalf("AV1 mode=%q: a HEVC report must not affect other codecs", av1.Mode)
+	}
+
+	// Apple's behaviour is unchanged by the report: it is governed by its own
+	// switch, because the constraint there is the container, not the decoder.
+	apple := decideWith("hevc", "Main 10", "hvc1", ClientSafari, DecideOptions{ClientHEVC: true})
+	if apple.Mode != "transcode" {
+		t.Fatalf("Apple mode=%q, want transcode: the report is not Apple's switch", apple.Mode)
+	}
+
+	// The automatic path for Chrome offers a direct play of Matroska (the client
+	// falls back if the container turns out to be unplayable), so the capability
+	// shows up in that branch rather than in the copy branch — see the negative
+	// report below, which is what actually rules it out.
+	auto := decideWith("hevc", "Main 10", "hvc1", ClientChrome, DecideOptions{ClientHEVC: true})
+	if auto.Mode != "proxy" && auto.Mode != "direct" {
+		t.Fatalf("automatic mode=%q, want a direct/proxy play for Chrome Matroska", auto.Mode)
+	}
+}
+
+// A client that says it cannot play HEVC must not be handed HEVC. The codec table
+// assumes browsers cope, which is not true on every machine.
+func TestClientNoHEVCReportRulesOutDirectAndCopy(t *testing.T) {
+	// Without a report, Chrome+Matroska is offered a direct play (the status quo).
+	optimistic := decideWith("hevc", "Main 10", "hvc1", ClientChrome, DecideOptions{})
+	if optimistic.Mode != "proxy" && optimistic.Mode != "direct" {
+		t.Fatalf("baseline mode=%q, want a direct play", optimistic.Mode)
+	}
+
+	// With a negative report it cannot be, and the reason says why.
+	reported := decideWith("hevc", "Main 10", "hvc1", ClientChrome, DecideOptions{ClientNoHEVC: true})
+	if reported.Mode != "transcode" {
+		t.Fatalf("mode=%q, want transcode when the client reports no HEVC", reported.Mode)
+	}
+	if !strings.Contains(reported.Reason, "客户端自报不支持 HEVC") {
+		t.Errorf("reason should name the self-report, got: %s", reported.Reason)
+	}
+
+	// It must not affect codecs the client can play.
+	h264 := decideWith("h264", "High", "avc1", ClientChrome, DecideOptions{ClientNoHEVC: true})
+	if h264.Mode != "proxy" && h264.Mode != "direct" {
+		t.Fatalf("H.264 mode=%q: a HEVC report must not affect other codecs", h264.Mode)
+	}
+
+	// Nor somebody else's switch: Apple's copy policy is its own.
+	apple := decideWith("hevc", "Main 10", "hvc1", ClientSafari,
+		DecideOptions{AppleHEVCCopy: true, ClientNoHEVC: true})
+	if apple.Mode != "remux" {
+		t.Fatalf("Apple mode=%q: its own opt-in still governs", apple.Mode)
+	}
+}

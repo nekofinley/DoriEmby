@@ -98,6 +98,16 @@ func parseContentRange(v string) (start, end, total int64, ok bool) {
 	return start, end, total, true
 }
 
+// capsHas reports whether a client capability list ("hevc,av1") contains a name.
+func capsHas(caps, name string) bool {
+	for _, c := range strings.Split(caps, ",") {
+		if strings.EqualFold(strings.TrimSpace(c), name) {
+			return true
+		}
+	}
+	return false
+}
+
 // proxyRemote streams an upstream response, keeping range semantics honest.
 func proxyRemote(w http.ResponseWriter, r *http.Request, target string, headers map[string]string) {
 	ctx := r.Context()
