@@ -74,7 +74,8 @@ func ParseFragmentedMP4(f io.ReaderAt, size int64) (*FragmentedMP4, error) {
 			}
 			return nil, err
 		}
-		switch typ {		case "ftyp", "styp", "free", "skip", "wide":
+		switch typ {
+		case "ftyp", "styp", "free", "skip", "wide":
 			if initStart < 0 && typ == "ftyp" {
 				initStart = off
 			}
