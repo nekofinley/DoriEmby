@@ -507,39 +507,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	proxyRemote(w, r, target, headers)
 }
 
-func proxyRemote(w http.ResponseWriter, r *http.Request, target string, headers map[string]string) {
-	ctx := r.Context()
-	req, err := http.NewRequestWithContext(ctx, r.Method, target, nil)
-	if err != nil {
-		fail(w, 500, err.Error())
-		return
-	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	if rng := r.Header.Get("Range"); rng != "" {
-		req.Header.Set("Range", rng)
-	}
-	if req.Header.Get("User-Agent") == "" {
-		req.Header.Set("User-Agent", "DoriyaMedia/0.1")
-	}
-	resp, err := proxyClient.Do(req)
-	if err != nil {
-		if ctx.Err() == nil {
-			fail(w, 502, "源请求失败: "+err.Error())
-		}
-		return
-	}
-	defer resp.Body.Close()
-	for _, h := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag"} {
-		if v := resp.Header.Get(h); v != "" {
-			w.Header().Set(h, v)
-		}
-	}
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
-}
+// proxyRemote and the range handling live in proxy_range.go.
 
 // ---------- /api/hls/{id}/... ----------
 

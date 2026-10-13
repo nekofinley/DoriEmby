@@ -505,7 +505,18 @@ if ($oplay.mode -eq "direct") {
   Show "302 location" $loc
   $rcdn = RawReq $hcNoRedir "GET" $loc @{Range="bytes=0-99"}
   Show "CDN range follow" "$($rcdn.Status) len=$($rcdn.Bytes.Length)"
-} else {
+}
+
+# Our own proxy has to honour a range for a remote source as well: that is what
+# lets a player seek while the server does no transcoding at all. What an upstream
+# does when it *ignores* a range (the proxy answers it itself) is covered by the
+# handler tests in internal/api/proxy_range_test.go, which drive real HTTP.
+$prng = RawReq $hc "GET" "$Base/api/stream/$ofile`?proxy=1" @{Range="bytes=100-199"}
+$pcr = "$($prng.ContentHeaders.ContentRange)"
+Show "proxy range (cloud)" "status=$($prng.Status) len=$($prng.Bytes.Length) cr=$pcr"
+if ($prng.Status -ne 206) { throw "the proxy must answer a range with 206, got $($prng.Status)" }
+if ($prng.Bytes.Length -ne 100) { throw "the proxy returned $($prng.Bytes.Length) bytes, want 100" }
+if ($pcr -notmatch '^bytes 100-199/\d+$') { throw "the proxy's Content-Range is wrong: '$pcr'" } else {
   Show "cloud play url" $oplay.url
 }
 
