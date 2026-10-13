@@ -32,6 +32,17 @@ const (
 	// sessionFileWait bounds how long one HTTP request waits for a segment that
 	// ffmpeg has not produced yet.
 	sessionFileWait = 45 * time.Second
+	// SessionSeekAhead is how far past what has already been packaged a request
+	// may be before it is treated as a seek rather than as buffering. Below it,
+	// waiting is right: a player asking for the next segment of a slow transcode
+	// is buffering, and restarting the packager for that would thrash. Above it,
+	// the player has jumped somewhere the running packager will not reach soon.
+	SessionSeekAhead = 12
+	// SessionActiveFor is how recently a session must have served a segment to
+	// count as a playback in progress. A playlist request while one is active has
+	// to follow it (a seek moved it); a playlist request when nothing has been
+	// consumed for this long starts a new playback, and its position wins.
+	SessionActiveFor = 15 * time.Second
 )
 
 var reSessionSegment = regexp.MustCompile(`^seg\d+\.m4s$`)
@@ -143,6 +154,12 @@ func (s *Session) idleFor() time.Duration {
 	return time.Since(s.lastUsed)
 }
 
+// IdleFor reports how long this session has gone without serving a request.
+func (s *Session) IdleFor() time.Duration { return s.idleFor() }
+
+// ActiveFor reporting whether a playback is in progress here.
+func (s *Session) activeWithin(d time.Duration) bool { return s.idleFor() <= d }
+
 // Dir is the session's output directory.
 func (s *Session) Dir() string { return s.dir }
 
@@ -157,6 +174,9 @@ func (s *Session) SegmentPath(i int) string { return s.pack.SegmentPath(i) }
 
 // Failed reports a packaging failure that has already happened.
 func (s *Session) Failed() error {
+	if s.pack == nil {
+		return nil // not started yet
+	}
 	select {
 	case <-s.pack.Done():
 		return s.pack.Err()
@@ -170,6 +190,10 @@ func (s *Session) Failed() error {
 // 404) keeps the player from treating a not-yet-packaged segment as fatal.
 func (s *Session) WaitForFile(ctx context.Context, path string, max time.Duration) error {
 	deadline := time.Now().Add(max)
+	var done <-chan struct{}
+	if s.pack != nil {
+		done = s.pack.Done()
+	}
 	for {
 		if fi, err := os.Stat(path); err == nil && fi.Size() > 0 {
 			s.Touch()
@@ -178,7 +202,7 @@ func (s *Session) WaitForFile(ctx context.Context, path string, max time.Duratio
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-s.pack.Done():
+		case <-done:
 			if fi, err := os.Stat(path); err == nil && fi.Size() > 0 {
 				s.Touch()
 				return nil
@@ -210,9 +234,11 @@ func (s *Session) close() {
 	}
 	// Give the child a moment to die before removing its output, otherwise it
 	// may recreate a file inside a directory we are deleting.
-	select {
-	case <-s.pack.Done():
-	case <-time.After(3 * time.Second):
+	if s.pack != nil {
+		select {
+		case <-s.pack.Done():
+		case <-time.After(3 * time.Second):
+		}
 	}
 	_ = os.RemoveAll(s.dir)
 }
@@ -288,6 +314,102 @@ func (e *Engine) CloseSessions() {
 	}
 	e.sessMu.Unlock()
 	for _, s := range all {
+		s.close()
+	}
+}
+
+// Produced reports the highest segment number this session has packaged so far,
+// or one before its first segment when nothing has landed yet.
+func (s *Session) Produced() int {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return s.key.start - 1
+	}
+	best := s.key.start - 1
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if n, ok := ParseSessionSegment(e.Name()); ok && n > best {
+			best = n
+		}
+	}
+	return best
+}
+
+func (s *Session) lastUsedTime() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastUsed
+}
+
+// streamSessions lists the live sessions serving one stream, whatever position
+// each of them started at.
+func (e *Engine) streamSessions(fileID int64, mode string, audio, vindex, height int) []*Session {
+	e.sessMu.Lock()
+	defer e.sessMu.Unlock()
+	var out []*Session
+	for k, s := range e.sessions {
+		if k.fileID == fileID && k.mode == mode && k.audio == audio &&
+			k.vindex == vindex && k.height == height {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// SessionForStream returns the stream's most recently used live session, or nil.
+// The playlist uses this, so after a seek the refreshed playlist follows the
+// session that is actually packaging, rather than racing back to the position
+// the URL was originally built with.
+func (e *Engine) SessionForStream(fileID int64, mode string, audio, vindex, height int) *Session {
+	var best *Session
+	for _, s := range e.streamSessions(fileID, mode, audio, vindex, height) {
+		if best == nil || s.lastUsedTime().After(best.lastUsedTime()) {
+			best = s
+		}
+	}
+	return best
+}
+
+// SessionForSegment picks the live session that can serve segment idx: the one
+// that started latest without starting after idx. A session that has fallen more
+// than seekAhead segments behind is rejected — waiting for it would take longer
+// than packaging from where the player actually is, which is what a seek means.
+func (e *Engine) SessionForSegment(fileID int64, mode string, audio, vindex, height, idx, seekAhead int) *Session {
+	var best *Session
+	for _, s := range e.streamSessions(fileID, mode, audio, vindex, height) {
+		if s.StartSegment() > idx {
+			continue // began after this segment: it never packaged it
+		}
+		if idx > s.Produced()+seekAhead {
+			continue // too far behind to wait for
+		}
+		if best == nil || s.StartSegment() > best.StartSegment() {
+			best = s
+		}
+	}
+	return best
+}
+
+// CloseStreamSessions closes every live session for these parameters except
+// keep. A player can only be in one place, so the sessions a seek leaves behind
+// would otherwise keep reading the same source and filling the disk.
+func (e *Engine) CloseStreamSessions(fileID int64, mode string, audio, vindex, height int, keep *Session) {
+	e.sessMu.Lock()
+	var dead []*Session
+	for k, s := range e.sessions {
+		if s == keep {
+			continue
+		}
+		if k.fileID == fileID && k.mode == mode && k.audio == audio &&
+			k.vindex == vindex && k.height == height {
+			dead = append(dead, s)
+			delete(e.sessions, k)
+		}
+	}
+	e.sessMu.Unlock()
+	for _, s := range dead {
 		s.close()
 	}
 }

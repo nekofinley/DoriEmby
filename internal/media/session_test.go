@@ -248,3 +248,94 @@ func TestSessionKeyIncludesStart(t *testing.T) {
 		t.Fatal("sessions with different start positions must not share an identity")
 	}
 }
+
+// fakeSession registers a session with a chosen start and production point, so
+// the selection rules can be tested without running ffmpeg.
+func fakeSession(t *testing.T, e *Engine, fileID int64, start, produced int) *Session {
+	t.Helper()
+	dir := t.TempDir()
+	for i := start; i <= produced; i++ {
+		name := filepath.Join(dir, fmt.Sprintf("seg%05d.m4s", i))
+		if err := os.WriteFile(name, []byte("x"), 0o644); err != nil {
+			t.Fatalf("seed segment: %v", err)
+		}
+	}
+	s := &Session{key: SessionKey(fileID, "remux", 0, 0, 1080, start), dir: dir, lastUsed: time.Now()}
+	e.sessMu.Lock()
+	e.sessions[s.key] = s
+	e.sessMu.Unlock()
+	return s
+}
+
+// Which session serves a request is what decides whether a seek works. Inside
+// the packaged window an existing session answers; far outside it the caller has
+// to start a new one, because waiting would be slower than packaging afresh.
+func TestSessionSelectionForSegment(t *testing.T) {
+	e := newTestEngine(t, nil)
+	e.Cfg.DataDir = t.TempDir()
+
+	early := fakeSession(t, e, 7, 0, 20)    // started at the top, 20 segments in hand
+	late := fakeSession(t, e, 7, 10, 30)    // started at segment 10
+	other := fakeSession(t, e, 8, 0, 30)    // a different file
+	_ = other
+
+	// Inside a session's window: the latest session that had already begun wins.
+	if got := e.SessionForSegment(7, "remux", 0, 0, 1080, 15, SessionSeekAhead); got != late {
+		t.Errorf("segment 15 should be served by the session that started at 10")
+	}
+	if got := e.SessionForSegment(7, "remux", 0, 0, 1080, 5, SessionSeekAhead); got != early {
+		t.Errorf("segment 5 predates the late session, so the early one must serve it")
+	}
+	// A seek far past what is packaged cannot be served by waiting.
+	if got := e.SessionForSegment(7, "remux", 0, 0, 1080, 500, SessionSeekAhead); got != nil {
+		t.Errorf("a request far ahead must not attach to a session that cannot reach it")
+	}
+	// Nor can a position before every session's start.
+	e2 := newTestEngine(t, nil)
+	e2.Cfg.DataDir = t.TempDir()
+	fakeSession(t, e2, 7, 10, 20)
+	if got := e2.SessionForSegment(7, "remux", 0, 0, 1080, 3, SessionSeekAhead); got != nil {
+		t.Errorf("a request before a session's start must not attach to it")
+	}
+	// Buffering (just past production) must NOT look like a seek, or a slow
+	// transcode would restart the packager on every request.
+	if got := e.SessionForSegment(7, "remux", 0, 0, 1080, 25, SessionSeekAhead); got != late {
+		t.Errorf("a request just past production must keep waiting on the live session")
+	}
+	// Sessions of another file or mode are never borrowed.
+	if got := e.SessionForSegment(7, "transcode", 0, 0, 1080, 15, SessionSeekAhead); got != nil {
+		t.Errorf("another mode's session must not be reused")
+	}
+	if got := e.SessionForSegment(9, "remux", 0, 0, 1080, 15, SessionSeekAhead); got != nil {
+		t.Errorf("another file's session must not be reused")
+	}
+}
+
+// The playlist follows whatever session is actually packaging, so a refreshed
+// playlist after a seek does not resurrect the abandoned position.
+func TestSessionForStreamFollowsLatestUse(t *testing.T) {
+	e := newTestEngine(t, nil)
+	e.Cfg.DataDir = t.TempDir()
+
+	first := fakeSession(t, e, 7, 0, 5)
+	second := fakeSession(t, e, 7, 40, 45)
+	first.lastUsed = time.Now().Add(-time.Minute)
+	if got := e.SessionForStream(7, "remux", 0, 0, 1080); got != second {
+		t.Fatal("the most recently used session must answer the playlist")
+	}
+	if got := e.SessionForStream(7, "transcode", 0, 0, 1080); got != nil {
+		t.Fatal("another mode has no session")
+	}
+
+	// Closing the abandoned ones leaves exactly the live session.
+	e.CloseStreamSessions(7, "remux", 0, 0, 1080, second)
+	if got := e.SessionForStream(7, "remux", 0, 0, 1080); got != second {
+		t.Fatal("the kept session must survive")
+	}
+	e.sessMu.Lock()
+	n := len(e.sessions)
+	e.sessMu.Unlock()
+	if n != 1 {
+		t.Fatalf("expected only the kept session to remain, got %d", n)
+	}
+}

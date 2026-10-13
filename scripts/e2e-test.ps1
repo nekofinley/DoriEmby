@@ -257,11 +257,14 @@ Write-Host "==> 7d. resuming begins the session at the saved position"
 # ffmpeg rebases timestamps to zero when it seeks, so a session that starts
 # mid-file has to be put back on the absolute timeline when served: otherwise the
 # player places the whole stream at zero and "continue watching" lands wrong.
+# A different file than 7c on purpose: a fresh playback on a stream that has no
+# session yet is exactly the case where the requested position must win.
+$mkvFile = ($targets | Where-Object { $_.media.video.codec -eq "hevc" -and $_.media.audio.codec -eq "eac3" } | Select-Object -First 1).file
 $dur = [double]$sp.duration
 $resume = [math]::Round($dur * 0.5, 3)
 Invoke-RestMethod -Uri "$Base/api/progress" -Method Post -WebSession $sess -ContentType "application/json" `
-  -Body (J @{file_id=$hev1; position=$resume; duration=$dur}) | Out-Null
-$rp = PlayDecision $hev1 "ios"
+  -Body (J @{file_id=$mkvFile; position=$resume; duration=$dur}) | Out-Null
+$rp = PlayDecision $mkvFile "ios"
 Show "saved position" "$resume / $dur"
 if ($rp.url -notmatch 'start=') {
   throw "the HLS URL must carry the saved position, got '$($rp.url)'"
@@ -279,8 +282,10 @@ if ([math]::Abs($seq - $wantSeq) -gt 1) {
 }
 $rpSegLine = ($rpTxt -split "`n" | Where-Object { $_ -and $_ -notmatch '^#' } | Select-Object -First 1).Trim()
 $rpSeg = RawReq $hc "GET" "$Base$rpSegLine" @{}
+if ($rpTxt -notmatch '#EXT-X-MAP:URI="([^"]+)"') { throw "no EXT-X-MAP in the resumed playlist`n$rpTxt" }
+$rpInit = RawReq $hc "GET" "$Base$($Matches[1])" @{}
 $comb2 = Join-Path $env:TEMP "doriya-e2e-resume.mp4"
-[System.IO.File]::WriteAllBytes($comb2, $initR.Bytes + $rpSeg.Bytes)
+[System.IO.File]::WriteAllBytes($comb2, $rpInit.Bytes + $rpSeg.Bytes)
 $ptsOut = ((& ffprobe -v error -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 `
   -read_intervals '%+#1' $comb2 2>&1) | Out-String).Trim()
 if (-not $ptsOut) { throw "ffprobe returned no pts for the resumed segment" }
@@ -292,7 +297,7 @@ if ([math]::Abs($gotPts - $wantPts) -gt 0.3) {
 Remove-Item $comb2 -ErrorAction SilentlyContinue
 # Leave no saved position behind for the remaining steps.
 Invoke-RestMethod -Uri "$Base/api/progress" -Method Post -WebSession $sess -ContentType "application/json" `
-  -Body (J @{file_id=$hev1; position=0; duration=$dur}) | Out-Null
+  -Body (J @{file_id=$mkvFile; position=0; duration=$dur}) | Out-Null
 
 Write-Host "==> 7e. with the packager on, a transcode is session-packaged too"
 # The point of P2: one long-lived ffmpeg per playback rather than a process per
@@ -323,6 +328,40 @@ $tcErr = (& ffmpeg -v error -i $tcComb -frames:v 1 -f null - 2>&1 | Out-String).
 if ($tcErr) { throw "transcoded session segment does not decode: $tcErr" }
 Show "transcode session decodes" "OK"
 Remove-Item $tcComb -ErrorAction SilentlyContinue
+
+Write-Host "==> 7f. a seek outside the packaged window is still served"
+# A session packages from the resume position forwards, so a viewer who then
+# jumps back to the beginning asks for a segment that session will never produce.
+# It has to start packaging from there, not wait for a segment that cannot come.
+# Uses 7d's file, whose session is the one that started mid-file.
+Invoke-RestMethod -Uri "$Base/api/progress" -Method Post -WebSession $sess -ContentType "application/json" `
+  -Body (J @{file_id=$mkvFile; position=$resume; duration=$dur}) | Out-Null
+$rs = PlayDecision $mkvFile "ios"
+$rsM3u8 = RawReq $hc "GET" "$Base$($rs.url)" @{}
+$rsTxt = [System.Text.Encoding]::UTF8.GetString($rsM3u8.Bytes)
+if ($rsTxt -notmatch '#EXT-X-MEDIA-SEQUENCE:(\d+)') { throw "no MEDIA-SEQUENCE in the resumed playlist`n$rsTxt" }
+$rsSeq = [int]$Matches[1]
+if ($rsSeq -lt 1) { throw "expected this session to start past the beginning, got $rsSeq" }
+$rsSegUrl = ($rsTxt -split "`n" | Where-Object { $_ -and $_ -notmatch '^#' } | Select-Object -First 1).Trim()
+$wantUrl = $rsSegUrl -replace 'seg\d+\.m4s', 'seg00000.m4s'
+Show "session starts at" "segment $rsSeq; asking for seg00000"
+$rsSeg = RawReq $hc "GET" "$Base$wantUrl" @{}
+Show "seek-back segment" "$($rsSeg.Status) type=$($rsSeg.ContentHeaders.ContentType) bytes=$($rsSeg.Bytes.Length)"
+if ($rsSeg.Status -ne 200 -or $rsSeg.Bytes.Length -eq 0) {
+  throw "a seek before the session start must be served, got status $($rsSeg.Status)"
+}
+# Fetch the init afterwards, so it comes from the session just started at 0.
+if ($rsTxt -notmatch '#EXT-X-MAP:URI="([^"]+)"') { throw "no EXT-X-MAP in the resumed playlist" }
+$rsInit = RawReq $hc "GET" "$Base$($Matches[1])" @{}
+$rsComb = Join-Path $env:TEMP "doriya-e2e-seekback.mp4"
+[System.IO.File]::WriteAllBytes($rsComb, $rsInit.Bytes + $rsSeg.Bytes)
+$rsErr = (& ffmpeg -v error -i $rsComb -frames:v 1 -f null - 2>&1 | Out-String).Trim()
+if ($rsErr) { throw "seek-back segment does not decode: $rsErr" }
+Show "seek-back segment decodes" "OK"
+Remove-Item $rsComb -ErrorAction SilentlyContinue
+# Leave no saved position behind for the remaining steps.
+Invoke-RestMethod -Uri "$Base/api/progress" -Method Post -WebSession $sess -ContentType "application/json" `
+  -Body (J @{file_id=$hev1; position=0; duration=$dur}) | Out-Null
 
 # Back to the default so the remaining steps see ordinary behaviour.
 Invoke-RestMethod -Uri "$Base/api/config" -Method Put -WebSession $sess -ContentType "application/json" `

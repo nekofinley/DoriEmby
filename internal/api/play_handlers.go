@@ -696,25 +696,56 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 		StartSeconds:    sessionStart,
 		StartSegment:    startSeg,
 	}
-	key := media.SessionKey(file.ID, mode, audioOrdinal, videoIndex, s.Cfg.Playback.TranscodeHeight, startSeg)
-	sess, err := s.Engine.EnsureSession(ctx, key, opts)
-	if err != nil {
-		log.Printf("hls session for file %d failed to start: %v", file.ID, err)
-		fail(w, 502, "打包会话启动失败: "+err.Error())
-		return
-	}
-
 	sig := signedQuery(s.Cfg.Secret, file.ID, sigTTL) + "&m=" + mode
 	if a := q.Get("a"); a != "" {
 		sig += "&a=" + a
 	}
-	if startSeg > 0 {
-		sig += "&start=" + strconv.FormatFloat(sessionStart, 'f', 3, 64)
-	}
 	base := fmt.Sprintf("/api/hls/%d", file.ID)
+
+	// Packaging can only start where a session is; which session answers a
+	// request depends on where in the file the request asks for.
+	height := s.Cfg.Playback.TranscodeHeight
+	ensureAt := func(startSeg int) (*media.Session, error) {
+		o := opts
+		o.StartSegment = startSeg
+		o.StartSeconds = float64(startSeg) * segLen
+		return s.Engine.EnsureSession(ctx,
+			media.SessionKey(file.ID, mode, audioOrdinal, videoIndex, height, startSeg), o)
+	}
+	// Pick the session that answers a playlist request. Two cases pull in opposite
+	// directions: a refreshed playlist during playback must follow the session the
+	// player is actually consuming (a seek moved it, and the URL still carries the
+	// position this playback began at), while a playlist request that starts a
+	// playback must honour its position — otherwise "continue watching" streams
+	// from whatever session was left over.
+	streamSession := func() (*media.Session, error) {
+		sess := s.Engine.SessionForStream(file.ID, mode, audioOrdinal, videoIndex, height)
+		switch {
+		case sess == nil:
+			return ensureAt(startSeg)
+		case sess.StartSegment() == startSeg:
+			sess.Touch()
+			return sess, nil
+		case sess.IdleFor() < media.SessionActiveFor:
+			// Playback in progress: follow it.
+			sess.Touch()
+			return sess, nil
+		default:
+			// Nothing has been consumed here for a while, so treat this as a new
+			// playback and begin where it asks.
+			s.Engine.CloseStreamSessions(file.ID, mode, audioOrdinal, videoIndex, height, nil)
+			return ensureAt(startSeg)
+		}
+	}
 
 	switch {
 	case rest == "" || strings.HasPrefix(rest, "index") || strings.HasPrefix(rest, "playlist"):
+		sess, err := streamSession()
+		if err != nil {
+			log.Printf("hls session for file %d failed to start: %v", file.ID, err)
+			fail(w, 502, "打包会话启动失败: "+err.Error())
+			return
+		}
 		if err := sess.WaitForFile(ctx, sess.PlaylistPath(), 45*time.Second); err != nil {
 			fail(w, 502, "打包播放列表未就绪: "+err.Error())
 			return
@@ -729,6 +760,11 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 		_, _ = w.Write([]byte(media.RewriteSessionPlaylist(string(pl), base, sig)))
 
 	case rest == "init.mp4":
+		sess, err := streamSession()
+		if err != nil {
+			fail(w, 502, "打包会话启动失败: "+err.Error())
+			return
+		}
 		s.serveSessionFile(w, r, ctx, sess, sess.InitPath(), false)
 
 	default:
@@ -736,6 +772,22 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 		if !ok {
 			fail(w, 404, "未知 HLS 资源")
 			return
+		}
+		sess := s.Engine.SessionForSegment(file.ID, mode, audioOrdinal, videoIndex, height, idx, media.SessionSeekAhead)
+		if sess == nil {
+			// Outside what is packaged (a seek, forwards or backwards): package
+			// from there instead of waiting for a session that will never reach
+			// it. Yesterday's sessions go, since the player has moved on.
+			s.Engine.CloseStreamSessions(file.ID, mode, audioOrdinal, videoIndex, height, nil)
+			next, err := ensureAt(idx)
+			if err != nil {
+				log.Printf("hls session for file %d failed to start at segment %d: %v", file.ID, idx, err)
+				fail(w, 502, "打包会话启动失败: "+err.Error())
+				return
+			}
+			sess = next
+		} else {
+			sess.Touch()
 		}
 		s.serveSessionFile(w, r, ctx, sess, sess.SegmentPath(idx), true)
 	}
