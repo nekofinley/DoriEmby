@@ -27,10 +27,14 @@ type Server struct {
 	Engine     *media.Engine
 	WebFS      fs.FS // embedded dist root
 	DevWeb     string
+	// Version is the build version the linker stamped into main.version, so the
+	// UI can report the binary it is actually talking to rather than a constant
+	// someone has to remember to bump.
+	Version string
 }
 
-func New(store *db.Store, cfg *config.Config, scanner *scan.Scanner, meta *metadata.Manager, engine *media.Engine, webFS fs.FS) *Server {
-	return &Server{Store: store, Cfg: cfg, Scanner: scanner, Metadata: meta, Engine: engine, WebFS: webFS, DevWeb: cfg.DevWebDir}
+func New(store *db.Store, cfg *config.Config, scanner *scan.Scanner, meta *metadata.Manager, engine *media.Engine, webFS fs.FS, version string) *Server {
+	return &Server{Store: store, Cfg: cfg, Scanner: scanner, Metadata: meta, Engine: engine, WebFS: webFS, DevWeb: cfg.DevWebDir, Version: version}
 }
 
 // ---------- helpers ----------

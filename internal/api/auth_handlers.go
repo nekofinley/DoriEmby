@@ -98,8 +98,14 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, user *models.U
 func (s *Server) handleSystemInfo(w http.ResponseWriter, r *http.Request, user *models.User) {
 	ffmpegOK := exec.Command(s.Cfg.FFmpeg, "-version").Run() == nil
 	ffprobeOK := exec.Command(s.Cfg.FFProbe, "-version").Run() == nil
+	// An unstamped build says "dev", the same word `-version` prints, rather than
+	// a release number it cannot know.
+	version := s.Version
+	if version == "" {
+		version = "dev"
+	}
 	writeJSON(w, 200, map[string]any{
-		"version":    "0.1.0",
+		"version":    version,
 		"os":         runtime.GOOS,
 		"ffmpeg_ok":  ffmpegOK,
 		"ffprobe_ok": ffprobeOK,

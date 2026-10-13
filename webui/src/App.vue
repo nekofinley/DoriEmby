@@ -8,13 +8,20 @@ import ToastHost from './components/ToastHost.vue'
 
 const route = useRoute()
 const me = ref(null)
+const version = ref('')
 
 const fullscreen = computed(() => !!route.meta.fullscreen)
 const bare = computed(() => route.meta.chrome === false)
 const overlay = computed(() => !!route.meta.overlay)
 
 onMounted(async () => {
-  try { me.value = (await api.get('/api/auth/me')).user } catch {}
+  try {
+    me.value = (await api.get('/api/auth/me')).user
+    // The footer names the binary it is talking to. /api/system/info is
+    // authenticated, so it is asked for only once there is a session; if it
+    // fails the footer simply omits the version.
+    version.value = (await api.get('/api/system/info')).version || ''
+  } catch {}
 })
 </script>
 
@@ -39,7 +46,7 @@ onMounted(async () => {
         </Transition>
       </router-view>
     </main>
-    <AppFooter :me="me" />
+    <AppFooter :me="me" :version="version" />
     <ToastHost />
   </div>
 </template>

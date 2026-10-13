@@ -78,7 +78,7 @@ func main() {
 		engine.PreProbeFiles(files)
 	}
 
-	srv := api.New(store, cfg, scanner, manager, engine, web.Dist())
+	srv := api.New(store, cfg, scanner, manager, engine, web.Dist(), version)
 	srv.ConfigPath = *cfgPath
 
 	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Port)

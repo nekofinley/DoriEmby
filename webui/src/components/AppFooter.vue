@@ -1,7 +1,12 @@
 <script setup>
 import AppIcon from './AppIcon.vue'
 
-defineProps({ me: { type: Object, default: null } })
+// version comes from the server's own /api/system/info, so the footer reports
+// the running binary rather than a number baked into the bundle.
+defineProps({
+  me: { type: Object, default: null },
+  version: { type: String, default: '' },
+})
 </script>
 
 <template>
@@ -18,7 +23,7 @@ defineProps({ me: { type: Object, default: null } })
         </p>
         <div class="status">
           <span class="pulse"></span>
-          <span class="tiny">本地服务运行中 · v0.1.0</span>
+          <span class="tiny">本地服务运行中<template v-if="version"> · {{ version }}</template></span>
         </div>
       </div>
 
