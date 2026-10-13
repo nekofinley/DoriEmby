@@ -257,8 +257,24 @@ Invoke-RestMethod -Uri "$Base/api/config" -Method Put -WebSession $sess -Content
 Write-Host "==> 8. subtitles"
 $epFile = ($targets | Where-Object { $_.title -match "^E1 " } | Select-Object -First 1).file
 $playEp = PlayDecision $epFile "ios"
-foreach ($sub in $playEp.subtitles) { Show "subtitle" "$($sub.label) -> $($sub.url)" }
+foreach ($sub in $playEp.subtitles) {
+  Show "subtitle" "$($sub.label) -> $($sub.url)$(if ($sub.default) { '  [默认]' })"
+}
 if (@($playEp.subtitles).Count -gt 0) {
+  # The client turns subtitles on by itself, so the server has to say which one
+  # is worth showing; otherwise every client invents its own rule.
+  $marked = @($playEp.subtitles | Where-Object { $_.default })
+  Show "default subtitle id" "$($playEp.default_subtitle_id)"
+  if ($marked.Count -ne 1) {
+    throw "exactly one subtitle must be marked default, got $($marked.Count)"
+  }
+  if ($marked[0].id -ne $playEp.default_subtitle_id) {
+    throw "the default flag and default_subtitle_id disagree"
+  }
+  # The test episode carries a Chinese sidecar; that is what a viewer reads.
+  if ($marked[0].lang -ne "chi") {
+    throw "the Chinese sidecar should win, got lang='$($marked[0].lang)'"
+  }
   $vtt = RawReq $hc "GET" "$Base$($playEp.subtitles[0].url)" @{}
   $vtxt = [System.Text.Encoding]::UTF8.GetString($vtt.Bytes)
   Show "vtt head" ((($vtxt -split "`n")[0..2]) -join " / ")

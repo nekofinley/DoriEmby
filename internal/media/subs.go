@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"doriyamedia/internal/models"
 )
 
 // DetectSubFormat classifies an external subtitle file.
@@ -25,17 +27,21 @@ func DetectSubFormat(name string) (format string, convertible bool) {
 	}
 }
 
+// langPatterns map a file or track name to a language. The ASCII alternatives
+// are word-anchored, but the CJK ones cannot be: Go's \b is an ASCII word
+// boundary, so `\b简\b` never matches text such as ".简日." — which is exactly
+// how Chinese subtitles are named in practice.
 var langPatterns = []struct {
-	re  *regexp.Regexp
+	re   *regexp.Regexp
 	lang string
 }{
-	{regexp.MustCompile(`(?i)\b(chs|sc|gb|zhhans|hans|简[体中]|简中|中字|中文)\b`), "chi"},
-	{regexp.MustCompile(`(?i)\b(cht|tc|big5|zhhant|hant|繁[体中])\b`), "chi"},
-	{regexp.MustCompile(`(?i)\b(eng|english|英[文语])\b`), "eng"},
-	{regexp.MustCompile(`(?i)\b(jpn|japanese|日[文语])\b`), "jpn"},
-	{regexp.MustCompile(`(?i)\b(kor|korean|韩[文语])\b`), "kor"},
+	{regexp.MustCompile(`(?i)(\b(chs|sc|gb|zhhans|hans)\b|简[体中日英]|简中|中字|中文)`), "chi"},
+	{regexp.MustCompile(`(?i)(\b(cht|tc|big5|zhhant|hant)\b|繁[体中日英]|繁中)`), "chi"},
+	{regexp.MustCompile(`(?i)(\b(eng|english)\b|英[文语])`), "eng"},
+	{regexp.MustCompile(`(?i)(\b(jpn|japanese)\b|日[文语])`), "jpn"},
+	{regexp.MustCompile(`(?i)(\b(kor|korean)\b|韩[文语])`), "kor"},
 	{regexp.MustCompile(`(?i)国语|普通话|mandarin`), "chi"},
-	{regexp.MustCompile(`(?i)粤语|cantonese`), "yue"},
+	{regexp.MustCompile(`(?i)粤语|粵語|cantonese`), "yue"},
 }
 
 func GuessLang(name string) string {
@@ -166,4 +172,84 @@ func ToVTT(format string, data []byte) []byte {
 	default:
 		return SRTToVTT(data)
 	}
+}
+
+// ---------- automatic subtitle selection ----------
+
+var (
+	reSimplified  = regexp.MustCompile(`(?i)(简|chs|hans|\bsc\b|\bgb\b|zh[-_]cn)`)
+	reTraditional = regexp.MustCompile(`(?i)(繁|cht|hant|\btc\b|big5|zh[-_]tw)`)
+)
+
+// subtitleRank orders subtitle tracks for automatic selection; the
+// lexicographically smallest rank wins. Order of preference:
+//
+//  1. Chinese, then Cantonese, then an identified other language, then an
+//     untagged track. Chinese first because this library (and its viewers) are
+//     Chinese; an untagged track last because we cannot tell what it is.
+//  2. Simplified before Traditional — the two share an ISO code, and a viewer
+//     who reads one usually cannot comfortably read the other.
+//  3. Tracks whose language is known before untagged ones.
+//  4. Registration order, which follows the file's own track order.
+func subtitleRank(s models.Subtitle) [4]int {
+	lang := strings.ToLower(strings.TrimSpace(s.Lang))
+	// "und" is the container's way of saying "no idea", so treat it as untagged.
+	if lang == "und" {
+		lang = ""
+	}
+	// When the container has no usable tag, the title usually still says it
+	// ("简日", "繁體", "English").
+	if lang == "" {
+		lang = GuessLang(s.Title)
+	}
+	// Both the tag and the human title carry hints ("简日", "SC", "繁體").
+	text := strings.ToLower(s.Title + " " + s.Path)
+
+	langRank := 3
+	switch {
+	case lang == "chi" || lang == "zho" || lang == "zh" || strings.HasPrefix(lang, "zh"):
+		langRank = 0
+	case lang == "yue":
+		langRank = 1
+	case lang != "":
+		langRank = 2
+	}
+
+	scriptRank := 1
+	switch {
+	case reSimplified.MatchString(text):
+		scriptRank = 0
+	case reTraditional.MatchString(text):
+		scriptRank = 2
+	}
+
+	untagged := 0
+	if lang == "" {
+		untagged = 1
+	}
+	return [4]int{langRank, scriptRank, untagged, int(s.ID)}
+}
+
+func lessRank(a, b [4]int) bool {
+	for i := range a {
+		if a[i] != b[i] {
+			return a[i] < b[i]
+		}
+	}
+	return false
+}
+
+// PickDefaultSubtitle returns the id of the subtitle to enable automatically
+// when a file starts playing, or 0 when there is nothing to pick. Callers must
+// pass only subtitles they can actually serve (see Subtitle.Convertible).
+func PickDefaultSubtitle(subs []models.Subtitle) int64 {
+	var best int64
+	var bestRank [4]int
+	for _, s := range subs {
+		r := subtitleRank(s)
+		if best == 0 || lessRank(r, bestRank) {
+			best, bestRank = s.ID, r
+		}
+	}
+	return best
 }

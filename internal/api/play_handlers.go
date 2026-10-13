@@ -159,22 +159,35 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		})
 	}
 
-	// subtitles
+	// subtitles: only convertible (text) tracks can be served as WebVTT, and the
+	// one worth turning on automatically is picked here so every client agrees.
 	subs := s.discoverSubtitles(ctx, drv, file)
+	servable := make([]models.Subtitle, 0, len(subs))
+	for _, sub := range subs {
+		if sub.Convertible {
+			servable = append(servable, sub)
+		}
+	}
+	defSubID := media.PickDefaultSubtitle(servable)
+
 	type subDTO struct {
 		ID       int64  `json:"id"`
 		Label    string `json:"label"`
 		Lang     string `json:"lang"`
 		Embedded bool   `json:"embedded"`
+		Default  bool   `json:"default"`
 		URL      string `json:"url,omitempty"`
 	}
-	subDTOs := make([]subDTO, 0, len(subs))
-	for _, sub := range subs {
-		dto := subDTO{ID: sub.ID, Label: sub.Title, Lang: sub.Lang, Embedded: sub.Embedded}
-		if sub.Convertible {
-			dto.URL = fmt.Sprintf("/api/subs/%d/%d.vtt%s", file.ID, sub.ID, signedQuery(s.Cfg.Secret, file.ID, sigTTL))
-			subDTOs = append(subDTOs, dto)
-		}
+	subDTOs := make([]subDTO, 0, len(servable))
+	for _, sub := range servable {
+		subDTOs = append(subDTOs, subDTO{
+			ID:       sub.ID,
+			Label:    sub.Title,
+			Lang:     sub.Lang,
+			Embedded: sub.Embedded,
+			Default:  sub.ID == defSubID,
+			URL:      fmt.Sprintf("/api/subs/%d/%d.vtt%s", file.ID, sub.ID, signedQuery(s.Cfg.Secret, file.ID, sigTTL)),
+		})
 	}
 
 	// item context
@@ -206,6 +219,9 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		"audio_tracks": tracks,
 		"versions":     s.versionsFor(file.ItemID, file.ID),
 		"subtitles":    subDTOs,
+		// The subtitle a player should enable by itself (0 = none). Sent both as
+		// a flag per track and once here, so a client can pick either way.
+		"default_subtitle_id": defSubID,
 	})
 }
 

@@ -366,6 +366,9 @@ function onLoadedMetadata() {
   isLoading.value = false
   const v = videoEl.value
   duration.value = v.duration || play.value?.duration || 0
+  // Subtitles come on by themselves; the panel is only there to change or turn
+  // them off.
+  autoSelectSub()
   api.get(`/api/progress?file_id=${route.params.fileId}`).then((p) => {
     if (p && p.position > 30 && duration.value > 0 && p.position < duration.value * 0.95) {
       v.currentTime = p.position
@@ -421,20 +424,69 @@ function selectAudio(i) {
   loadDecision(play.value.mode === 'transcode' ? 'transcode' : undefined)
 }
 
-function selectSub(sub) {
+// Subtitle preference: 'auto' (follow the server's ranking), 'off', or a
+// language code the viewer picked. Kept across files so a viewing habit sticks.
+const SUB_PREF_KEY = 'dm:subPref'
+
+function findSubTrack(sub) {
   const v = videoEl.value
-  if (!v) return
+  if (!v) return null
+  for (const el of v.querySelectorAll('track')) {
+    if (el.src.includes(`/${sub.id}.vtt`)) return el
+  }
+  return null
+}
+
+// showSub turns one subtitle track on and the rest off. It goes through the
+// element's own .track rather than indexing v.textTracks, because hls.js
+// registers text tracks of its own and the indices then stop lining up.
+function showSub(sub) {
+  const v = videoEl.value
+  if (!v) return false
   for (const t of v.textTracks) t.mode = 'disabled'
-  if (sub === null || activeSub.value === sub) {
+  if (!sub) {
+    activeSub.value = null
+    return true
+  }
+  const el = findSubTrack(sub)
+  if (!el || !el.track) return false
+  el.track.mode = 'showing'
+  activeSub.value = sub
+  return true
+}
+
+function selectSub(sub) {
+  const isActive = sub && activeSub.value && activeSub.value.id === sub.id
+  if (!sub || isActive) {
+    showSub(null)
+    localStorage.setItem(SUB_PREF_KEY, 'off')
+    return
+  }
+  if (!showSub(sub)) return
+  localStorage.setItem(SUB_PREF_KEY, sub.lang || 'auto')
+  toast.info(`字幕:${sub.label || sub.lang || '已开启'}`)
+}
+
+// autoSelectSub turns subtitles on without being asked: the track the server
+// ranked best, unless the viewer already turned them off or picked a language.
+function autoSelectSub() {
+  const subs = play.value?.subtitles || []
+  if (!subs.length) {
     activeSub.value = null
     return
   }
-  activeSub.value = sub
-  const tracks = v.querySelectorAll('track')
-  tracks.forEach((t, i) => {
-    if (t.src.includes(`/${sub.id}.vtt`) && v.textTracks[i]) v.textTracks[i].mode = 'showing'
+  const pref = localStorage.getItem(SUB_PREF_KEY) || 'auto'
+  if (pref === 'off') {
+    // The server marks a track as default, which lets the browser turn it on by
+    // itself; make sure "off" still wins.
+    showSub(null)
+    return
+  }
+  const wanted = pref !== 'auto' ? subs.find((s) => s.lang === pref) : null
+  const pick = wanted || subs.find((s) => s.default) || subs[0]
+  nextTick(() => {
+    if (!showSub(pick)) activeSub.value = null
   })
-  toast.info(`字幕:${sub.label || sub.lang || '已开启'}`)
 }
 
 /* ------------------------------------------------------------------ controls */
@@ -624,6 +676,7 @@ onBeforeUnmount(() => {
         <track
           v-for="sub in play?.subtitles || []" :key="sub.id" kind="subtitles"
           :src="sub.url" :label="sub.label || sub.lang || '字幕'"
+          :default="!!sub.default"
         />
       </video>
 
