@@ -49,11 +49,14 @@ type Decision struct {
 	Resolution string  `json:"resolution,omitempty"`
 
 	// Alternates are fallback strategies the client may auto-try when the
-	// primary one fails (e.g. native MKV/HEVC unsupported → cloud transcode).
+	// primary one fails, in the order they should be tried. Only strategies that
+	// can work for this client are listed — see fallbackPlan.
 	Alternates []DecisionAlt `json:"alternates,omitempty"`
 }
 
-// DecisionAlt is one fallback playback strategy.
+// DecisionAlt is one fallback playback strategy. Decide fills in the Mode; the
+// API layer adds the URL, because building a signed link is its job, not the
+// decision engine's.
 type DecisionAlt struct {
 	Mode     string `json:"mode"`
 	URL      string `json:"url"`
@@ -116,7 +119,14 @@ func extOf(path string) string {
 
 // CanDirectPlay checks whether the probe is playable natively by the client
 // straight from a progressive URL (no server-side work).
-func CanDirectPlay(probe *Probe, path string, client ClientKind) (bool, string) {
+//
+// reportedAudio is what the client said it can decode (ffprobe codec names), or
+// nil when it said nothing. A report only ever widens the answer: AC-3/E-AC-3/DTS
+// live in the OS on Windows and Android and nowhere on Linux, so which of them a
+// browser plays is a property of the machine, not of the browser's name — and the
+// audio tables below can only ever guess. Codecs the client did not mention keep
+// the table's verdict, so an older client changes nothing.
+func CanDirectPlay(probe *Probe, path string, client ClientKind, reportedAudio map[string]bool) (bool, string) {
 	if probe == nil || probe.Video() == nil {
 		return false, "无法识别视频流"
 	}
@@ -148,6 +158,12 @@ func CanDirectPlay(probe *Probe, path string, client ClientKind) (bool, string) 
 	var videoOK, audioOK bool
 	var audioFail string
 
+	// audioPlayable: the codec table's answer, unless the client itself said it
+	// can decode this one.
+	audioPlayable := func(table map[string]bool, codec string) bool {
+		return table[codec] || reportedAudio[codec]
+	}
+
 	// 10-bit H.264 (Hi10P) has no consumer hardware decode path — no client
 	// can direct-play it; everything else is gated per client below.
 	if v != nil && v.CodecName == "h264" && strings.Contains(strings.ToLower(v.Profile), "10") {
@@ -168,7 +184,7 @@ func CanDirectPlay(probe *Probe, path string, client ClientKind) (bool, string) 
 			videoOK = safariVideo[v.CodecName]
 		}
 		if a := firstAudio(probe); a != nil {
-			audioOK = safariAudio[a.CodecName]
+			audioOK = audioPlayable(safariAudio, a.CodecName)
 			if !audioOK {
 				audioFail = "音频 " + strings.ToUpper(a.CodecName) + " iOS 不支持"
 			}
@@ -178,7 +194,7 @@ func CanDirectPlay(probe *Probe, path string, client ClientKind) (bool, string) 
 	case ClientChrome:
 		videoOK = chromeVideo[v.CodecName]
 		if a := firstAudio(probe); a != nil {
-			audioOK = chromeAudio[a.CodecName]
+			audioOK = audioPlayable(chromeAudio, a.CodecName)
 			if !audioOK {
 				audioFail = "音频 " + strings.ToUpper(a.CodecName) + " 不支持"
 			}
@@ -188,7 +204,7 @@ func CanDirectPlay(probe *Probe, path string, client ClientKind) (bool, string) 
 	case ClientFirefox:
 		videoOK = firefoxVideo[v.CodecName]
 		if a := firstAudio(probe); a != nil {
-			audioOK = firefoxAudio[a.CodecName]
+			audioOK = audioPlayable(firefoxAudio, a.CodecName)
 			if !audioOK {
 				audioFail = "音频 " + strings.ToUpper(a.CodecName) + " 不支持"
 			}
@@ -276,10 +292,86 @@ type DecideOptions struct {
 	// and handing such a client a stream it cannot decode just looks broken. So a
 	// negative report rules out both direct play and copying.
 	ClientNoHEVC bool
+	// ClientAudio is the set of audio codecs the client reported it can decode
+	// (ffprobe names, e.g. "eac3"). It only ever widens direct play; see
+	// CanDirectPlay.
+	ClientAudio map[string]bool
+	// TranscodeFallback offers a real re-encode as a *fallback*, to be tried when
+	// the chosen strategy fails. Off by default, and deliberately so: a fallback
+	// is there to rescue a cheap plan, and a realtime H.264 encode is not cheap —
+	// on a small server it burns the CPU and still cannot keep up, so the viewer
+	// waits for a stream that will never arrive. This flag does not govern the
+	// decision itself: a file nothing else can play (AV1, 10-bit H.264) is still
+	// transcoded, because that is the only way to watch it at all.
+	TranscodeFallback bool
 }
 
-// Decide produces the playback plan.
+// Decide produces the playback plan: what to play first, and which strategies are
+// worth falling back to if that fails on this client.
 func Decide(probe *Probe, path string, client ClientKind, opts DecideOptions) *Decision {
+	d := decide(probe, path, client, opts)
+	if probe != nil {
+		for _, m := range fallbackPlan(probe, path, client, opts, d) {
+			// Only the strategy is decided here; the API layer turns each one
+			// into a signed URL.
+			d.Alternates = append(d.Alternates, DecisionAlt{Mode: m})
+		}
+	}
+	return d
+}
+
+// canDirectPlay is CanDirectPlay plus the client's own report: a client that
+// examined itself and found no HEVC decoder must not be handed HEVC just because
+// the generic codec table assumes browsers cope.
+func canDirectPlay(probe *Probe, path string, client ClientKind, opts DecideOptions) (bool, string) {
+	can, why := CanDirectPlay(probe, path, client, opts.ClientAudio)
+	if can && opts.ClientNoHEVC {
+		if v := probe.Video(); v != nil && v.CodecName == "hevc" {
+			return false, "客户端自报不支持 HEVC"
+		}
+	}
+	return can, why
+}
+
+// fallbackPlan lists the strategies a client may try after the primary one fails,
+// cheapest first, and only those that could actually work for this client:
+//
+//	direct   the same bytes over the source's own URL  — only if the client can
+//	                                                      natively play the file
+//	proxy    the same bytes through this server        — same condition; this is a
+//	                                                      transport fallback, not a
+//	                                                      codec one
+//	remux    video stream copied into HLS              — only if the client's own
+//	                                                      stack can decode the copy
+//	transcode  video re-encoded to H.264               — only when opted in
+//
+// The filtering is the point. Offering "direct" for a file the client cannot
+// play is not a fallback but a guaranteed dead end, and it is reached precisely
+// when the viewer is already waiting: a slow first segment used to look like a
+// failure, and the chain answered with a 302 to a Matroska file on iOS — the one
+// thing that client can never open.
+func fallbackPlan(probe *Probe, path string, client ClientKind, opts DecideOptions, primary *Decision) []string {
+	var out []string
+	canDirect, _ := canDirectPlay(probe, path, client, opts)
+	if canDirect {
+		if opts.HasDirect && len(opts.DirectHeaders) == 0 && primary.Mode != "direct" {
+			out = append(out, "direct")
+		}
+		if primary.Mode != "proxy" {
+			out = append(out, "proxy")
+		}
+	}
+	if primary.Mode != "remux" && hlsVideoCopyOK(probe.Video(), client, opts.AppleHEVCCopy, opts.ClientHEVC) {
+		out = append(out, "remux")
+	}
+	if opts.TranscodeFallback && primary.Mode != "transcode" {
+		out = append(out, "transcode")
+	}
+	return out
+}
+
+// decide is the decision proper: the single strategy to start with.
+func decide(probe *Probe, path string, client ClientKind, opts DecideOptions) *Decision {
 	force := opts.Force
 	hasDirect := opts.HasDirect
 	directHeaders := opts.DirectHeaders
@@ -340,12 +432,7 @@ func Decide(probe *Probe, path string, client ClientKind, opts DecideOptions) *D
 		return d
 	}
 
-	can, why := CanDirectPlay(probe, path, client)
-	// A client that examined itself and found no HEVC decoder must not be handed
-	// HEVC just because the generic codec table assumes browsers cope.
-	if can && opts.ClientNoHEVC && v != nil && v.CodecName == "hevc" {
-		can, why = false, "客户端自报不支持 HEVC"
-	}
+	can, why := canDirectPlay(probe, path, client, opts)
 	if can {
 		if hasDirect && len(directHeaders) == 0 {
 			d.Mode, d.Kind, d.Reason = "direct", "mp4", "客户端原生支持,302 直连"

@@ -5,18 +5,43 @@ import (
 	"testing"
 )
 
-func decisionProbe(codec, profile, tag string) *Probe {
+func probeFor(codec, profile, tag, audio, format string) *Probe {
 	p := &Probe{}
-	p.Format.FormatName = "matroska,webm"
+	p.Format.FormatName = format
 	p.Streams = append(p.Streams,
 		ProbeStream{Index: 0, CodecType: "video", CodecName: codec, Profile: profile, CodecTagString: tag, Width: 1920, Height: 1080},
-		ProbeStream{Index: 1, CodecType: "audio", CodecName: "aac"},
+		ProbeStream{Index: 1, CodecType: "audio", CodecName: audio},
 	)
 	return p
 }
 
+func decisionProbe(codec, profile, tag string) *Probe {
+	return probeFor(codec, profile, tag, "aac", "matroska,webm")
+}
+
 func decideWith(codec, profile, tag string, client ClientKind, opts DecideOptions) *Decision {
 	return Decide(decisionProbe(codec, profile, tag), "/m/x.mkv", client, opts)
+}
+
+// altModes is the fallback chain as plain mode names, for readable assertions.
+func altModes(d *Decision) []string {
+	out := make([]string, 0, len(d.Alternates))
+	for _, a := range d.Alternates {
+		out = append(out, a.Mode)
+	}
+	return out
+}
+
+func equalModes(got []string, want ...string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // Forcing a remux must not copy a video stream the client cannot decode: the
@@ -198,5 +223,90 @@ func TestClientNoHEVCReportRulesOutDirectAndCopy(t *testing.T) {
 		DecideOptions{AppleHEVCCopy: true, ClientNoHEVC: true})
 	if apple.Mode != "remux" {
 		t.Fatalf("Apple mode=%q: its own opt-in still governs", apple.Mode)
+	}
+}
+
+// ---------- the fallback chain ----------
+
+// A fallback must be able to work, or it is not a fallback. The chain used to
+// offer "direct" for every file the source could 302 — including a Matroska file
+// on iOS, which that device can never open — and the client reached it exactly
+// when a slow first segment looked like a failure. That is the bug this pins.
+func TestFallbackChainNeverOffersAModeTheClientCannotUse(t *testing.T) {
+	opts := DecideOptions{AppleHEVCCopy: true, HasDirect: true}
+	d := decideWith("hevc", "Main 10", "hvc1", ClientSafari, opts)
+	if d.Mode != "remux" {
+		t.Fatalf("mode=%q, want remux (reason: %s)", d.Mode, d.Reason)
+	}
+	for _, a := range d.Alternates {
+		if a.Mode == "direct" || a.Mode == "proxy" {
+			t.Fatalf("chain offers %q for a file this client cannot play: %v", a.Mode, altModes(d))
+		}
+	}
+	// The copy is the only thing that could play this file, and a real re-encode
+	// is not a fallback by default — so there is nothing left to try, which is
+	// the honest answer (the player says so instead of switching into a dead end).
+	if len(d.Alternates) != 0 {
+		t.Fatalf("chain = %v, want nothing", altModes(d))
+	}
+
+	// Opting the transcode back in offers it — and only it.
+	opts.TranscodeFallback = true
+	on := decideWith("hevc", "Main 10", "hvc1", ClientSafari, opts)
+	if !equalModes(altModes(on), "transcode") {
+		t.Fatalf("chain = %v, want [transcode]", altModes(on))
+	}
+}
+
+// The order is cost: same bytes elsewhere, then a copy, then a re-encode. A
+// re-encode was previously offered *before* the copy.
+func TestFallbackChainRunsCheapToExpensive(t *testing.T) {
+	d := Decide(probeFor("h264", "High", "avc1", "aac", "mov,mp4,m4a,3gp,3g2,mj2"),
+		"/m/x.mp4", ClientChrome, DecideOptions{HasDirect: true, TranscodeFallback: true})
+	if d.Mode != "direct" {
+		t.Fatalf("mode=%q, want direct (reason: %s)", d.Mode, d.Reason)
+	}
+	if !equalModes(altModes(d), "proxy", "remux", "transcode") {
+		t.Fatalf("chain = %v, want [proxy remux transcode]", altModes(d))
+	}
+
+	// Without a 302-able source the direct play *is* the proxy, so it is the
+	// primary and not repeated as a fallback.
+	noDirect := Decide(probeFor("h264", "High", "avc1", "aac", "mov,mp4,m4a,3gp,3g2,mj2"),
+		"/m/x.mp4", ClientChrome, DecideOptions{})
+	if noDirect.Mode != "proxy" {
+		t.Fatalf("mode=%q, want proxy", noDirect.Mode)
+	}
+	if !equalModes(altModes(noDirect), "remux") {
+		t.Fatalf("chain = %v, want [remux]", altModes(noDirect))
+	}
+}
+
+// Whether a browser decodes AC-3/E-AC-3/DTS is a property of the machine (the
+// decoders come from the OS), so the client's own answer is the only honest
+// source — without it the tables remux files the browser could have played.
+func TestClientAudioReportWidensDirectPlay(t *testing.T) {
+	eac3 := func(reported map[string]bool) *Decision {
+		return Decide(probeFor("h264", "High", "avc1", "eac3", "matroska,webm"),
+			"/m/x.mkv", ClientChrome, DecideOptions{HasDirect: true, ClientAudio: reported})
+	}
+
+	silent := eac3(nil)
+	if silent.Mode != "remux" {
+		t.Fatalf("mode=%q, want remux: the table cannot vouch for E-AC-3", silent.Mode)
+	}
+	reported := eac3(map[string]bool{"eac3": true})
+	if reported.Mode != "direct" {
+		t.Fatalf("mode=%q, want direct when the client reports E-AC-3 (reason: %s)", reported.Mode, reported.Reason)
+	}
+	// A report stands for the codec it names and no other.
+	if other := eac3(map[string]bool{"ac3": true}); other.Mode != "remux" {
+		t.Fatalf("mode=%q: an AC-3 report must not speak for E-AC-3", other.Mode)
+	}
+	// And it says nothing about video: a codec no browser decodes stays undecodable.
+	old := Decide(probeFor("mpeg2video", "", "", "eac3", "matroska,webm"), "/m/x.mkv", ClientChrome,
+		DecideOptions{HasDirect: true, ClientAudio: map[string]bool{"eac3": true}})
+	if old.Mode != "transcode" {
+		t.Fatalf("mode=%q, want transcode for MPEG-2 whatever the audio report says", old.Mode)
 	}
 }

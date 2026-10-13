@@ -108,6 +108,32 @@ func capsHas(caps, name string) bool {
 	return false
 }
 
+// audioReports are the audio codecs a client is allowed to vouch for, named the
+// way ffprobe names them. The tables in media/decision.go cover what every
+// browser of that family plays; these are the ones that depend on the machine
+// rather than the browser — AC-3/E-AC-3/DTS decoders live in the OS, so Windows
+// and Android usually have them and Linux usually does not.
+var audioReports = []string{"ac3", "eac3", "dts", "truehd", "flac", "opus", "vorbis", "alac", "aac", "mp3"}
+
+// reportedAudio reads those tokens out of a capability list ("hevc,eac3"). An
+// empty or irrelevant list returns nil — "the client said nothing" — which leaves
+// every table verdict exactly as it was.
+func reportedAudio(caps string) map[string]bool {
+	if strings.TrimSpace(caps) == "" {
+		return nil
+	}
+	var out map[string]bool
+	for _, name := range audioReports {
+		if capsHas(caps, name) {
+			if out == nil {
+				out = map[string]bool{}
+			}
+			out[name] = true
+		}
+	}
+	return out
+}
+
 // proxyRemote streams an upstream response, keeping range semantics honest.
 func proxyRemote(w http.ResponseWriter, r *http.Request, target string, headers map[string]string) {
 	ctx := r.Context()

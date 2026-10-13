@@ -344,6 +344,43 @@ if (-not $replayTxt.Contains('#EXT-X-ENDLIST')) {
   throw "the packaging should have finished by now; its output must be kept for replay"
 }
 
+Write-Host "==> 7c2. the fallback chain only offers modes this client can use"
+# The decision names the strategies the player may fall back to, in the order it
+# should try them. It must never offer a 302 for a file the client cannot play:
+# reaching that is exactly how a slow first segment used to turn into "switched to
+# 302 直连 and nothing played" on iOS.
+$chain = PlayDecision $hev1 "ios"
+$chainModes = @($chain.alternates | ForEach-Object { $_.mode })
+Show "ios fallback chain" $(if ($chainModes.Count) { $chainModes -join " -> " } else { "(none)" })
+if ($chainModes -contains "direct" -or $chainModes -contains "proxy") {
+  throw "the chain offers a direct play for a Matroska/HEVC file on iOS: $($chainModes -join ',')"
+}
+# A real re-encode is not a fallback by default: the decision already transcodes
+# when nothing else can play the file, so falling back into one usually means
+# re-encoding something the client could not play, on a server that cannot keep up.
+if ($chainModes -contains "transcode") {
+  throw "transcode must not be offered as a fallback by default: $($chainModes -join ',')"
+}
+Invoke-RestMethod -Uri "$Base/api/config" -Method Put -WebSession $sess -ContentType "application/json" `
+  -Body (J @{playback=@{transcode_fallback=$true}}) | Out-Null
+$chainOn = PlayDecision $hev1 "ios"
+$chainOnModes = @($chainOn.alternates | ForEach-Object { $_.mode })
+Show "ios fallback chain (opt-in)" $(if ($chainOnModes.Count) { $chainOnModes -join " -> " } else { "(none)" })
+if ($chainOnModes.Count -ne 1 -or $chainOnModes[0] -ne "transcode") {
+  throw "with the opt-in, the transcode is the only thing left worth trying, got '$($chainOnModes -join ',')'"
+}
+Invoke-RestMethod -Uri "$Base/api/config" -Method Put -WebSession $sess -ContentType "application/json" `
+  -Body (J @{playback=@{transcode_fallback=$false}}) | Out-Null
+
+# A browser that says it can decode the file gets the *copy* as its fallback —
+# the cheap way back — and never the re-encode first.
+$pcChain = Invoke-RestMethod -Uri "$Base/api/play/$hev1`?client=chrome&caps=hevc" -WebSession $sess
+$pcModes = @($pcChain.alternates | ForEach-Object { $_.mode })
+Show "chrome fallback chain" "$($pcChain.mode) -> $($pcModes -join " -> ")"
+if ($pcModes.Count -ne 1 -or $pcModes[0] -ne "remux") {
+  throw "a browser that can play the file should fall back to the copy, got '$($pcModes -join ',')'"
+}
+
 Write-Host "==> 7d. resuming begins the session at the saved position"
 # ffmpeg rebases timestamps to zero when it seeks, so a session that starts
 # mid-file has to be put back on the absolute timeline when served: otherwise the

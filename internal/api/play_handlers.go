@@ -108,6 +108,12 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		// The same report, negative: this browser looked and cannot play HEVC, so
 		// neither direct play nor copying is on offer for it.
 		ClientNoHEVC: capsHas(r.URL.Query().Get("caps"), "nohevc"),
+		// The client's own audio report, if it made one: a codec the machine says
+		// it can decode is allowed to direct-play even where the server's tables
+		// guessed otherwise. Absent tokens keep the tables' verdict.
+		ClientAudio: reportedAudio(r.URL.Query().Get("caps")),
+		// A real re-encode as a fallback, opt-in: see config.Playback.
+		TranscodeFallback: s.Cfg.Playback.TranscodeFallback,
 	})
 
 	// Resume support: tell the HLS packager where the viewer left off, so a
@@ -248,39 +254,39 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		dec.MimeType = "application/vnd.apple.mpegurl"
 	}
 
-	// Fallback strategies for the player to auto-try when the primary mode
-	// fails on this client (e.g. HEVC MKV native → cloud transcode).
+	// Fallback strategies for the player to auto-try when the primary mode fails
+	// on this client. The decision already worked out *which* strategies can work
+	// for this client and in what order; here each one only becomes a signed URL.
 	sq := signedQuery(s.Cfg.Secret, file.ID, sigTTL)
 	proxyURL := fmt.Sprintf("/api/stream/%d?proxy=1", file.ID) + strings.Replace(sq, "?", "&", 1)
 	directURL := fmt.Sprintf("/api/stream/%d%s", file.ID, sq)
 	hlsURL := func(m string) string {
 		return fmt.Sprintf("/api/hls/%d/%s%s&m=%s%s", file.ID, playlist, sq, m, startQ)
 	}
-	addAlt := func(mode, url, mime string) {
-		if url == dec.URL {
-			return
+	alts := make([]media.DecisionAlt, 0, len(dec.Alternates))
+	for _, a := range dec.Alternates {
+		if dec.Duration <= 0 && (a.Mode == "remux" || a.Mode == "transcode") {
+			// HLS needs a duration to build a playlist; without one there is no
+			// stream to fall back to.
+			continue
 		}
-		for _, a := range dec.Alternates {
-			if a.URL == url {
-				return
-			}
+		switch a.Mode {
+		case "direct":
+			a.URL, a.MimeType = directURL, "video/mp4"
+		case "proxy":
+			a.URL, a.MimeType = proxyURL, "video/mp4"
+		case "remux", "transcode":
+			a.URL, a.MimeType = hlsURL(a.Mode), "application/vnd.apple.mpegurl"
+		default:
+			continue
 		}
-		dec.Alternates = append(dec.Alternates, media.DecisionAlt{Mode: mode, URL: url, MimeType: mime})
-	}
-	if hasDirect && len(directHeaders) == 0 && dec.Mode != "direct" {
-		addAlt("direct", directURL, "video/mp4")
-	}
-	if dec.Mode != "proxy" {
-		addAlt("proxy", proxyURL, "video/mp4")
-	}
-	if dec.Duration > 0 {
-		if dec.Mode != "transcode" {
-			addAlt("transcode", hlsURL("transcode"), "application/vnd.apple.mpegurl")
+		// A URL the client already has is not a fallback.
+		if a.URL == dec.URL {
+			continue
 		}
-		if dec.Mode != "remux" {
-			addAlt("remux", hlsURL("remux"), "application/vnd.apple.mpegurl")
-		}
+		alts = append(alts, a)
 	}
+	dec.Alternates = alts
 
 	// audio tracks
 	auds := probe.AudioStreams()
