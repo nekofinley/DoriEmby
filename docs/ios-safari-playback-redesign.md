@@ -308,7 +308,7 @@ client_capabilities{ua_hash, mse, webcodecs}
 | **P3** | 放宽 copy 判据（iOS Hi10P）+ fMP4 + `-tag:v hvc1` + 客户端能力自报 | 更多片源从「全量转码」降级为「转封装」 | 中（需要真机验证各机型） | ✅ **已完成**：fMP4 + `hvc1` 与「直拷 HEVC（含 Hi10P）」随会话打包落地（真机 ma10p 可播）；客户端自报能力（`caps=hevc` / `caps=nohevc`）双向生效 —— 见 §15 |
 | **P4** | MP4 `moov` 解析 + `EXT-X-BYTERANGE` 直取 + Range 补丁 | MP4 全部零转码、零 CPU | 高（新解析器，需充分测试） | 未开始（`internal/media/mp4box.go` 已提供 box 解析底座，见 §12） |
 | **P5** | 渐进代理加固（Range 能力探测、206 校验、HEAD） | WebDAV/不可 302 场景可用 | 低 | ✅ **已完成** —— 见 §14 |
-| **P6** | 字幕轨（HLS WebVTT）+ PGS 按需烧录缓存 | 补齐已知限制 | 中 | 🟡 **大部分完成**：自动载入 + 文本轨转 WebVTT + **HLS `EXT-X-MEDIA` 字幕轨**（Safari 原生菜单可用）已落地；**PGS 烧录未做** —— 见 §13 |
+| **P6** | 字幕轨（HLS WebVTT）+ PGS 按需烧录缓存 | 补齐已知限制 | 中 | ✅ **已完成**：自动载入 + 文本轨转 WebVTT + HLS `EXT-X-MEDIA` 字幕轨（§13）+ **图形/文本字幕按需烧录并复用缓存**（§16） |
 
 先做 P0 + P1，能立刻回答「到底卡在探测还是卡在分片」；P2 是根治读取放大的主刀。
 
@@ -795,13 +795,9 @@ index.m3u8?…
 `master.m3u8`、`native_subtitles` 为真、恰好一条 `DEFAULT=YES`、变体声明 `SUBTITLES="subs"`、
 rendition 播单有 `#EXTINF` 与 `#EXT-X-ENDLIST`。
 
-### 13.4 P6 仍未做
+### 13.4 P6 的 PGS 部分
 
-- **PGS / VobSub 按需烧录**：图形字幕无法转成文本，只能烧进画面（重编码）。设计应当是新增一种
-  会话模式（`-filter_complex` 叠加字幕流）并复用 P2 的缓存与淘汰，让"同一部片子第二次看"不必
-  重烧。这是 P6 剩下的唯一一块，工作量不小，因为它是"转码 + 字幕"两条链路的组合。
-- 真机验证：iOS 上字幕是否出现在系统字幕菜单里、默认项是否正确——**这只在真机可见**，
-  本地只能验到播单结构（上文 e2e）。
+图形字幕（PGS/VobSub）无法转成文本，只能**烧录**——见 §16（已完成）。
 
 ## 14. P5：渐进代理加固
 
@@ -848,6 +844,39 @@ Chrome/Edge 装不出 HEVC 解码器（Linux、老 Windows、无硬件支持）�
 Apple 不受影响）、`TestClientNoHEVCReportRulesOutDirectAndCopy`（无上报时 Chrome+MKV 走直连；
 上报 nohevc → 转码且原因点明自报；H.264 不受影响；Apple 自己的开关仍生效）；e2e 7b2 断言两个
 方向：`reported HEVC support → remux`、`reported no HEVC → transcode`。
+
+## 16. P6 收尾：图形字幕烧录
+
+**为什么只能烧**：PGS/VobSub 是**图像**，没有文本层可转，唯一能显示的办法是把它们叠加进画面，
+也就是重新编码。顺带这条路径对**文本字幕**也有用：ASS 的排版/特效在转 WebVTT 时会被压平，
+烧录则原样保留。
+
+**实现**：把烧录做成**又一种会话模式**，于是 P2 的全部机制自动继承——长驻 ffmpeg、fMP4（Apple
+可播）、绝对时间轴与 `stream_start`、以及**缓存与淘汰**：
+
+- 模式串 `burn.<字幕ID>`：会话按字幕区分，所以"看 A 字幕的烧录结果"和"看 B 字幕的"互不覆盖，
+  而"同一部片子第二次看同一字幕"直接命中缓存（P2 的规则：成功的产物保留）。
+- 图形字幕：`-filter_complex "[0:v]scale…[vin];[vin][0:<流号>]overlay[vout]"` + `-map [vout]`
+  ——按**源流号**叠加，视频必然重编码（不能 `-c:v copy`）。
+- 文本字幕：`[0:v]scale…[vin];[vin]subtitles=<文件>[vout]`。文件由 `PrepareDir` 在 ffmpeg 启动前
+  写进会话目录，**子进程的工作目录就是那里**，所以滤镜参数里只有一个纯文件名——在 Windows 上
+  否则要转义盘符冒号和反斜杠。
+- 客户端：面板里图形字幕多一个「· 烧录」标记；选中即重载（`burn=` 参数）。**从烧录切回普通字幕
+  也必须重载**——那些字已经烤进画面了，不是能"切掉"的轨道。
+
+**验证**：`TestBurnOverlaysSubtitleAndReencodes`（真实烧录一条文本字幕：`PrepareDir` 落在会话
+目录、输出是 fMP4 且带 `avc1`、init+segment 拼接后可解码）、
+`TestPackagerBurnArgsForBitmapSubtitle`（图形字幕的滤镜图与"不能 copy"逐项固定，普通会话不带
+`-filter_complex`）；e2e 8c 走真实链路：`burn decision → burn.1`、URL 带 `burn=`、
+`burned stream init=1353 seg=3673527 decodes=True`。
+
+**诚实说明**：**PGS 那一路只有参数级单测**——ffmpeg 没有 PGS 编码器，造不出带图形字幕的测试
+样本，所以"真实烧录"的 e2e 用的是文本字幕（走的是同一套会话机制与同一个 `-map [vout]` 重编码
+路径，差别只在滤镜名）。真机上字幕的观感同样只能真机验证。
+
+**踩坑记录**：模式串最初写成 `burn:<id>`，测试立刻炸出 Windows 不允许目录名含冒号
+（`The directory name is invalid`）——改成 `burn.<id>`，并保持**会话键可被目录名反解**，
+否则 `LoadCache()` 收养不到缓存。
 
 
 

@@ -43,6 +43,9 @@ const scrubTime = ref(0)
 const hoverTime = ref(null)
 const hoverX = ref(0)
 const forceMode = ref('')      // current override, reapplied when re-fetching
+// burnSub: the subtitle id being overlaid onto the video. Burning re-encodes, so
+// it is opt-in, and it changes the stream identity — hence a reload, not a toggle.
+const burnSub = ref(0)
 const probeElapsed = ref(0)    // seconds the background probe has been running
 const stallSeconds = ref(0)    // seconds spent waiting on data mid-playback
 const streamStatus = ref(null) // segment-generation progress from the server
@@ -169,6 +172,7 @@ const clientCaps = (() => {
 function fetchPlay() {
   const params = new URLSearchParams({ client: detectClient() })
   if (forceMode.value) params.set('force', forceMode.value)
+  if (burnSub.value) params.set('burn', String(burnSub.value))
   if (currentAudio.value) params.set('a', String(currentAudio.value))
   if (clientCaps) params.set('caps', clientCaps)
   return api.get(`/api/play/${route.params.fileId}?${params}`)
@@ -520,15 +524,32 @@ function showSub(sub) {
 }
 
 function selectSub(sub) {
+  // A track the server marked as burn-only is images (PGS/VobSub) or was chosen
+  // for faithful typesetting: it can only be shown by re-encoding the video with
+  // it overlaid, so switching to it reloads the stream.
+  if (sub && sub.burn) {
+    burnSub.value = sub.id
+    activeSub.value = null
+    panelOpen.value = false
+    toast.info(`烧录字幕:${sub.label || '图形字幕'}（需要重新编码,稍等）`)
+    loadDecision(forceMode.value || undefined)
+    return
+  }
+  // Leaving a burned stream behind also needs a reload: those pixels are part of
+  // the picture now, so the track list cannot simply be switched.
+  const wasBurning = burnSub.value !== 0
+  burnSub.value = 0
   const isActive = sub && activeSub.value && activeSub.value.id === sub.id
   if (!sub || isActive) {
     showSub(null)
     localStorage.setItem(SUB_PREF_KEY, 'off')
+    if (wasBurning) loadDecision(forceMode.value || undefined)
     return
   }
   if (!showSub(sub)) return
   localStorage.setItem(SUB_PREF_KEY, sub.lang || 'auto')
   toast.info(`字幕:${sub.label || sub.lang || '已开启'}`)
+  if (wasBurning) loadDecision(forceMode.value || undefined)
 }
 
 // autoSelectSub turns subtitles on without being asked: the track the server
@@ -746,7 +767,7 @@ onBeforeUnmount(() => {
       >
         <template v-if="!nativeSubs">
           <track
-            v-for="sub in play?.subtitles || []" :key="sub.id" kind="subtitles"
+            v-for="sub in (play?.subtitles || []).filter(s => s.url)" :key="sub.id" kind="subtitles"
             :src="sub.url" :label="sub.label || sub.lang || '字幕'"
             :default="!!sub.default"
           />
@@ -952,9 +973,9 @@ onBeforeUnmount(() => {
             <button class="chip" :class="{ on: activeSub === null }" @click="selectSub(null)">关闭</button>
             <button
               v-for="sub in play.subtitles" :key="sub.id"
-              class="chip" :class="{ on: activeSub && activeSub.id === sub.id }"
+              class="chip" :class="{ on: activeSub && activeSub.id === sub.id || (sub.burn && burnSub === sub.id) }"
               @click="selectSub(sub)"
-            >{{ sub.label || sub.lang || '字幕' }}</button>
+            >{{ sub.label || sub.lang || '字幕' }}<span v-if="sub.burn" class="tiny"> · 烧录</span></button>
           </div>
 
           <div v-if="play?.reason" class="pn-reason tiny">

@@ -475,7 +475,8 @@ func (e *Engine) EnsureSession(ctx context.Context, key sessionKey, opts Package
 	e.evictCache(nil)
 
 	// The packager needs an existing directory and runs with it as its working
-	// directory (see packager.go for why).
+	// directory (see packager.go for why). EnsureSession lets the caller fill it
+	// first, which is how a subtitle to burn gets there.
 	dir := filepath.Join(e.Cfg.Abs(), "cache", "hls", key.dirName())
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create session dir: %w", err)

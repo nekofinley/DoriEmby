@@ -489,6 +489,38 @@ if ($subTxt -notmatch '(/api/subs/\d+/\d+\.vtt[^\s]*\.vtt|/api/subs/\d+/\d+\.vtt
   throw "the rendition playlist must point at the WebVTT document`n$subTxt"
 }
 
+Write-Host "==> 8c. burning a subtitle into the picture (P6)"
+# A bitmap track (PGS/VobSub) can only be shown by overlaying it onto the video,
+# which means re-encoding; the same route burns a text track faithfully for ASS
+# typesetting. The packager has to be on (7b2 enabled it). Real burn, real bytes.
+$burnID = $playEp.subtitles[0].id
+$burnPlay = Invoke-RestMethod -Uri "$Base/api/play/$epFile`?client=desktop&burn=$burnID" -WebSession $sess
+Show "burn decision" "$($burnPlay.mode) | $($burnPlay.reason)"
+if ($burnPlay.mode -notmatch '^burn\.') {
+  throw "a burn request must switch to the burn mode, got '$($burnPlay.mode)'"
+}
+if ($burnPlay.url -notmatch "burn=$burnID") {
+  throw "the burn must be carried into the stream URL, got '$($burnPlay.url)'"
+}
+$burnM3u8 = RawReq $hc "GET" "$Base$($burnPlay.url)" @{}
+$burnTxt = [System.Text.Encoding]::UTF8.GetString($burnM3u8.Bytes)
+if ($burnM3u8.Status -ne 200 -or $burnTxt -notmatch '#EXT-X-MAP:URI="([^"]+)"') {
+  throw "a burned stream is fMP4 and needs an init segment (status $($burnM3u8.Status))`n$burnTxt"
+}
+$bInitUrl = $Matches[1]
+$bSegLine = ($burnTxt -split "`n" | Where-Object { $_ -and $_ -notmatch '^#' } | Select-Object -First 1).Trim()
+$bInit = RawReq $hc "GET" "$Base$bInitUrl" @{}
+$bSeg = RawReq $hc "GET" "$Base$bSegLine" @{}
+$bComb = Join-Path $env:TEMP "doriya-e2e-burn.mp4"
+[System.IO.File]::WriteAllBytes($bComb, $bInit.Bytes + $bSeg.Bytes)
+$bErr = (& ffmpeg -v error -i $bComb -frames:v 1 -f null - 2>&1 | Out-String).Trim()
+Remove-Item $bComb -ErrorAction SilentlyContinue
+Show "burned stream" "init=$($bInit.Bytes.Length) seg=$($bSeg.Bytes.Length) decodes=$([bool](-not $bErr))"
+if ($bInit.Bytes.Length -eq 0 -or $bSeg.Bytes.Length -eq 0) {
+  throw "the burned session served an empty init or segment"
+}
+if ($bErr) { throw "the burned segment does not decode: $bErr" }
+
 Write-Host "==> 9. openlist source (mock) + 302 direct"
 $osrc = Invoke-RestMethod -Uri "$Base/api/sources" -Method Post -WebSession $sess -ContentType "application/json" -Body (J @{name="Mock OpenList"; type="openlist"; config=@{base_url=$MockBase}})
 $olib = Invoke-RestMethod -Uri "$Base/api/libraries" -Method Post -WebSession $sess -ContentType "application/json" -Body (J @{name="网盘电影"; type="movie"; source_id=$osrc.id; path="/movies"})

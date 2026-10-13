@@ -64,7 +64,27 @@ type PackagerOptions struct {
 	// the file" wherever the session started.
 	StartSegment int
 
+	// Burn overlays a subtitle onto the video, which necessarily re-encodes it.
+	// Either a stream index (a bitmap track, the only way to show PGS/VobSub) or a
+	// file inside the output directory (a text track already written there).
+	Burn *BurnRequest
+
+	// PrepareDir runs after the output directory exists and before ffmpeg starts,
+	// so a caller can put something in it — the subtitle file to burn, for
+	// instance. Its error aborts the session.
+	PrepareDir func(dir string) error
+
 	Dir string // output directory; must already exist
+}
+
+// BurnRequest picks the subtitle to overlay onto the video.
+type BurnRequest struct {
+	// StreamIndex is the source's own stream index for an embedded track. A
+	// bitmap subtitle decodes to video and is overlaid; this is set for those.
+	StreamIndex int
+	// File is the name of a subtitle file inside the session directory, for the
+	// text case (already converted to a format the filter reads).
+	File string
 }
 
 // Packager is a running (or finished) fMP4 HLS packaging session.
@@ -98,6 +118,12 @@ func StartPackager(ctx context.Context, o PackagerOptions) (*Packager, error) {
 	}
 	if fi, err := os.Stat(o.Dir); err != nil || !fi.IsDir() {
 		return nil, fmt.Errorf("packager: output directory %s is not usable: %v", o.Dir, err)
+	}
+	// Let the caller place what ffmpeg needs (a subtitle to burn) before it runs.
+	if o.PrepareDir != nil {
+		if err := o.PrepareDir(o.Dir); err != nil {
+			return nil, fmt.Errorf("packager: preparing %s: %w", o.Dir, err)
+		}
 	}
 
 	args, err := packagerArgs(o)
@@ -176,36 +202,69 @@ func packagerArgs(o PackagerOptions) ([]string, error) {
 	}
 	args = append(args, "-i", target)
 
-	if o.VideoIndex >= 0 {
-		args = append(args, "-map", fmt.Sprintf("0:%d", o.VideoIndex))
-	} else {
-		args = append(args, "-map", "0:v:0")
-	}
-	if o.AudioOrdinal >= 0 {
-		args = append(args, "-map", fmt.Sprintf("0:a:%d", o.AudioOrdinal))
-	} else {
-		args = append(args, "-an")
-	}
-
-	if o.VideoMode == "transcode" {
+	// Burning a subtitle means re-encoding the video with it overlaid: a bitmap
+	// track (PGS/VobSub) cannot be converted to text at all, and burning is also
+	// the faithful way to show ASS typesetting that a WebVTT conversion flattens.
+	// That path builds a filter graph instead of mapping the video directly.
+	if o.Burn != nil {
 		height := o.TranscodeHeight
 		if height <= 0 {
 			height = 1080
 		}
+		scale := fmt.Sprintf("scale=-2:min(ih\\,%d)", height)
+		var graph string
+		if o.Burn.StreamIndex >= 0 {
+			// A bitmap subtitle decodes to video, so it is overlaid by stream index.
+			graph = fmt.Sprintf("[0:v]%s[vin];[vin][0:%d]overlay[vout]", scale, o.Burn.StreamIndex)
+		} else {
+			// A text subtitle is read from a file inside the session directory.
+			// The child's working directory is there, so the name carries no drive
+			// letter or backslash to escape.
+			graph = fmt.Sprintf("[0:v]%s[vin];[vin]subtitles=%s[vout]", scale, o.Burn.File)
+		}
 		args = append(args,
-			"-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
-			"-pix_fmt", "yuv420p",
-			"-vf", fmt.Sprintf("scale=-2:min(ih\\,%d)", height),
+			"-filter_complex", graph,
+			"-map", "[vout]",
+			"-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
 		)
+		if o.AudioOrdinal >= 0 {
+			args = append(args, "-map", fmt.Sprintf("0:a:%d", o.AudioOrdinal))
+		} else {
+			args = append(args, "-an")
+		}
+		args = append(args, "-c:a", "aac", "-b:a", "192k", "-ac", "2")
 	} else {
-		args = append(args, "-c:v", "copy")
-		// Apple rejects the `hev1` sample entry ffmpeg writes by default.
-		if o.VideoCodec == "hevc" {
-			args = append(args, "-tag:v", "hvc1")
+		if o.VideoIndex >= 0 {
+			args = append(args, "-map", fmt.Sprintf("0:%d", o.VideoIndex))
+		} else {
+			args = append(args, "-map", "0:v:0")
+		}
+		if o.AudioOrdinal >= 0 {
+			args = append(args, "-map", fmt.Sprintf("0:a:%d", o.AudioOrdinal))
+		} else {
+			args = append(args, "-an")
+		}
+
+		if o.VideoMode == "transcode" {
+			height := o.TranscodeHeight
+			if height <= 0 {
+				height = 1080
+			}
+			args = append(args,
+				"-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+				"-pix_fmt", "yuv420p",
+				"-vf", fmt.Sprintf("scale=-2:min(ih\\,%d)", height),
+			)
+		} else {
+			args = append(args, "-c:v", "copy")
+			// Apple rejects the `hev1` sample entry ffmpeg writes by default.
+			if o.VideoCodec == "hevc" {
+				args = append(args, "-tag:v", "hvc1")
+			}
 		}
 	}
 
-	if o.VideoMode == "transcode" || o.AudioMode == "aac" {
+	if o.Burn == nil && (o.VideoMode == "transcode" || o.AudioMode == "aac") {
 		args = append(args, "-c:a", "aac", "-b:a", "192k", "-ac", "2")
 	} else {
 		args = append(args, "-c:a", "copy")

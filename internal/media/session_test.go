@@ -1,6 +1,7 @@
 package media
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -520,5 +521,123 @@ func TestSessionForStreamFollowsLatestUse(t *testing.T) {
 	e.sessMu.Unlock()
 	if n != 1 {
 		t.Fatalf("expected only the kept session to remain, got %d", n)
+	}
+}
+
+// Burning a subtitle is the only way to show a bitmap track (PGS/VobSub) at all,
+// so it runs through the ordinary session machinery: a long-lived packager that
+// re-encodes the video with the subtitle overlaid, cacheable like any other.
+func TestBurnOverlaysSubtitleAndReencodes(t *testing.T) {
+	requireFFmpeg(t)
+	dir := t.TempDir()
+	src := requireSeekableSource(t, dir, 8)
+
+	e := newTestEngine(t, nil)
+	e.Cfg.DataDir = t.TempDir()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	prepared := ""
+	// The mode carries a dot rather than a colon: it becomes part of the session's
+	// directory name, and Windows forbids a colon there.
+	sess, err := e.EnsureSession(ctx, SessionKey(77, "burn.5", 0, 0, 1080, 0), PackagerOptions{
+		Target: src, VideoIndex: 0, AudioOrdinal: -1,
+		VideoMode: "transcode", AudioMode: "aac",
+		Burn: &BurnRequest{StreamIndex: -1, File: "burn.srt"},
+		PrepareDir: func(d string) error {
+			prepared = d
+			// The packager runs with the directory as its working directory, so a
+			// bare name is what the filter gets.
+			return os.WriteFile(filepath.Join(d, "burn.srt"),
+				[]byte("1\n00:00:00,200 --> 00:00:02,000\nhello\n"), 0o644)
+		},
+	})
+	if err != nil {
+		t.Fatalf("EnsureSession: %v", err)
+	}
+	if prepared != sess.Dir() {
+		t.Fatalf("PrepareDir ran in %q, want the session directory %q", prepared, sess.Dir())
+	}
+	// A filter that does not work means ffmpeg exits at once, so the playlist
+	// never appears and this waits out its timeout — the failure is visible.
+	if err := sess.WaitForFile(ctx, sess.PlaylistPath(), 90*time.Second); err != nil {
+		t.Fatalf("burning produced no playlist: %v", err)
+	}
+	if err := sess.WaitForFile(ctx, sess.SegmentPath(0), 90*time.Second); err != nil {
+		t.Fatalf("burning produced no segment: %v", err)
+	}
+
+	// The video must have been re-encoded (a copy cannot carry an overlay), and
+	// the output must still be the fMP4 that Apple needs.
+	init, err := os.ReadFile(sess.InitPath())
+	if err != nil {
+		t.Fatalf("read init: %v", err)
+	}
+	if !bytes.Contains(init, []byte("avc1")) {
+		t.Error("the burned stream should carry a re-encoded avc1 track")
+	}
+	if bytes.Contains(init, []byte("hvc1")) || bytes.Contains(init, []byte("hev1")) {
+		t.Error("a burned stream must not copy HEVC")
+	}
+
+	// And it decodes. A bare .m4s segment cannot be read on its own — the fMP4 is
+	// split across the init and the media segments — so they are concatenated
+	// first, exactly as a player's buffer would hold them.
+	seg, err := os.ReadFile(sess.SegmentPath(0))
+	if err != nil {
+		t.Fatalf("read segment: %v", err)
+	}
+	combined := filepath.Join(dir, "burned.mp4")
+	if err := os.WriteFile(combined, append(append([]byte{}, init...), seg...), 0o644); err != nil {
+		t.Fatalf("write combined: %v", err)
+	}
+	decOut, err := exec.Command("ffmpeg", "-v", "error", "-i", combined,
+		"-frames:v", "1", "-f", "null", "-").CombinedOutput()
+	if err != nil {
+		t.Fatalf("burned segment does not decode: %v: %s", err, decOut)
+	}
+}
+
+// The PGS case cannot be synthesised (ffmpeg has no PGS encoder), so its
+// arguments are pinned directly: the subtitle stream is overlaid by index, and
+// the video cannot be copied.
+func TestPackagerBurnArgsForBitmapSubtitle(t *testing.T) {
+	args, err := packagerArgs(PackagerOptions{
+		Target: "/x/movie.mkv", VideoIndex: 0, AudioOrdinal: 0,
+		VideoMode: "transcode", AudioMode: "aac", TranscodeHeight: 720,
+		Burn: &BurnRequest{StreamIndex: 3}, Dir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("packagerArgs: %v", err)
+	}
+	joined := strings.Join(args, " ")
+	want := `[0:v]scale=-2:min(ih\,720)[vin];[vin][0:3]overlay[vout]`
+	if !strings.Contains(joined, want) {
+		t.Errorf("bitmap burn graph missing.\n got: %s\nwant: %s", joined, want)
+	}
+	if !strings.Contains(joined, "-map [vout]") {
+		t.Errorf("the overlay output must be mapped: %s", joined)
+	}
+	if strings.Contains(joined, "-c:v copy") {
+		t.Errorf("a burned video cannot be copied: %s", joined)
+	}
+	if !strings.Contains(joined, "-c:v libx264") {
+		t.Errorf("a burned video must be re-encoded: %s", joined)
+	}
+	if strings.Contains(joined, "-vf ") {
+		t.Errorf("with a filter graph the scale must be inside it, not a -vf: %s", joined)
+	}
+
+	// A plain session must not grow a filter graph.
+	plain, err := packagerArgs(PackagerOptions{
+		Target: "/x/movie.mkv", VideoIndex: 0, AudioOrdinal: 0,
+		VideoMode: "remux", AudioMode: "copy", Dir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("packagerArgs: %v", err)
+	}
+	if strings.Contains(strings.Join(plain, " "), "-filter_complex") {
+		t.Error("an ordinary session must not use a filter graph")
 	}
 }

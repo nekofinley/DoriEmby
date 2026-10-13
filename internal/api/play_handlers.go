@@ -158,10 +158,24 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		Lang     string `json:"lang"`
 		Embedded bool   `json:"embedded"`
 		Default  bool   `json:"default"`
-		URL      string `json:"url,omitempty"`
+		// Burn marks a track that cannot be served as text and has to be overlaid
+		// onto the video instead — the client offers it, knowing it re-encodes.
+		Burn bool   `json:"burn,omitempty"`
+		URL  string `json:"url,omitempty"`
 	}
-	subDTOs := make([]subDTO, 0, len(servable))
-	for _, sub := range servable {
+	subDTOs := make([]subDTO, 0, len(subs))
+	for _, sub := range subs {
+		if !sub.Convertible {
+			// Only image tracks are worth offering this way: overlaying them is the
+			// only way to show them at all.
+			if burnIsBitmap(&sub) {
+				subDTOs = append(subDTOs, subDTO{
+					ID: sub.ID, Label: sub.Title, Lang: sub.Lang,
+					Embedded: sub.Embedded, Burn: true,
+				})
+			}
+			continue
+		}
 		subDTOs = append(subDTOs, subDTO{
 			ID:       sub.ID,
 			Label:    sub.Title,
@@ -170,6 +184,21 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 			Default:  sub.ID == defSubID,
 			URL:      fmt.Sprintf("/api/subs/%d/%d.vtt%s", file.ID, sub.ID, signedQuery(s.Cfg.Secret, file.ID, sigTTL)),
 		})
+	}
+
+	// A burn request wins over the decision: overlaying a subtitle means
+	// re-encoding the video, whatever the client could otherwise have played.
+	burnSub := int64(0)
+	if v := r.URL.Query().Get("burn"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			burnSub = n
+		}
+	}
+	if burnSub > 0 {
+		dec.Mode = fmt.Sprintf("burn.%d", burnSub)
+		dec.Kind = "hls"
+		dec.Reason = "烧录字幕(图形字幕只能叠加,需要重新编码)"
+		dec.URL = ""
 	}
 
 	// A session begins at a segment boundary, and the player presents that stream
@@ -198,7 +227,11 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		dec.MimeType = "video/mp4"
 	default: // remux / transcode → HLS
 		sq := signedQuery(s.Cfg.Secret, file.ID, sigTTL)
-		dec.URL = fmt.Sprintf("/api/hls/%d/%s%s&m=%s%s", file.ID, playlist, sq, dec.Mode, startQ)
+		burnQ := ""
+		if burnSub > 0 {
+			burnQ = "&burn=" + strconv.FormatInt(burnSub, 10)
+		}
+		dec.URL = fmt.Sprintf("/api/hls/%d/%s%s&m=%s%s%s", file.ID, playlist, sq, dec.Mode, startQ, burnQ)
 		dec.MimeType = "application/vnd.apple.mpegurl"
 	}
 
@@ -307,7 +340,7 @@ func (s *Server) streamStartFor(mode string, startSec float64) float64 {
 	if startSec <= 0 || !s.Cfg.Playback.HLSSessionPackager {
 		return 0
 	}
-	if mode != "remux" && mode != "transcode" {
+	if mode != "remux" && mode != "transcode" && !strings.HasPrefix(mode, "burn.") {
 		return 0
 	}
 	segLen := s.Cfg.Playback.SegmentSeconds
@@ -559,6 +592,20 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// burn asks for a subtitle to be overlaid onto the video. That necessarily
+	// re-encodes, and it is the only way to show a bitmap track (PGS/VobSub) at
+	// all — so it takes precedence over the packaging mode.
+	burnSubID := int64(0)
+	if v := q.Get("burn"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			burnSubID = n
+		}
+	}
+	if burnSubID > 0 {
+		s.serveBurnHLS(w, r, ctx, file, drv, rest, q, segLen, startSec, burnSubID)
+		return
+	}
+
 	// With the session packager on, every HLS playback runs through one long-lived
 	// ffmpeg: it reads the source once instead of re-seeking and re-reading a
 	// probe window for each and every segment, and it is also what produces the
@@ -568,7 +615,8 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 	if s.Cfg.Playback.HLSSessionPackager {
 		if mode := q.Get("m"); mode == "remux" || mode == "transcode" {
 			if probe, err := s.Engine.EnsureProbe(ctx, file, drv); err == nil {
-				s.serveSessionHLS(w, r, ctx, file, drv, probe, mode, rest, q, segLen, startSec)
+				s.serveSessionHLS(w, r, ctx, file, drv, probe,
+					sessionRequest{keyMode: mode, videoMode: mode}, rest, q, segLen, startSec)
 				return
 			}
 		}
@@ -663,9 +711,110 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 // segment, and the media segments. A resource the packager has not produced yet
 // is waited for rather than 404'd — the player would otherwise treat a segment
 // that is merely early as fatal.
-func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx context.Context,
-	file *models.MediaFile, drv source.Driver, probe *media.Probe, mode, rest string, q url.Values, segLen, startSec float64) {
+// sessionRequest is what a caller wants packaged: the mode that identifies the
+// session, how the video is handled, and optionally a subtitle to burn in.
+type sessionRequest struct {
+	keyMode   string // the session's identity, e.g. "remux" or "burn.12"
+	videoMode string // what the packager does: remux (copy) or transcode
+	burn      *media.BurnRequest
+	burnID    int64 // the subtitle being burned, for the signed URL
+	prepare   func(dir string) error
+}
 
+// serveBurnHLS packages a stream with a subtitle overlaid onto the video.
+//
+// A bitmap track (PGS/VobSub) cannot be converted to text, so overlaying it is
+// the only way to show it at all; text tracks are burned too when asked, which
+// keeps ASS typesetting that a WebVTT conversion would flatten. Either way the
+// video is re-encoded, so this is opt-in per playback. Everything else — the
+// long-lived packager, fMP4 for Apple, the absolute timeline, the cache — is the
+// ordinary session machinery.
+func (s *Server) serveBurnHLS(w http.ResponseWriter, r *http.Request, ctx context.Context,
+	file *models.MediaFile, drv source.Driver, rest string, q url.Values, segLen, startSec float64, subID int64) {
+
+	sub, err := s.Store.SubtitleByID(subID)
+	if err != nil || sub.FileID != file.ID {
+		fail(w, 404, "字幕不存在")
+		return
+	}
+	probe, err := s.Engine.EnsureProbe(ctx, file, drv)
+	if err != nil {
+		fail(w, 500, "媒体探测失败: "+err.Error())
+		return
+	}
+
+	burn := &media.BurnRequest{StreamIndex: sub.StreamIdx}
+	var prepare func(dir string) error
+	if !burnIsBitmap(sub) {
+		data, ext, err := s.burnSubtitleFile(ctx, file, drv, sub)
+		if err != nil {
+			fail(w, 502, "字幕读取失败: "+err.Error())
+			return
+		}
+		// The child runs with the session directory as its working directory, so a
+		// bare file name needs no escaping — on Windows the alternative means
+		// escaping drive colons and backslashes inside a filter argument.
+		burn = &media.BurnRequest{StreamIndex: -1, File: "burn." + ext}
+		prepare = func(dir string) error {
+			return os.WriteFile(filepath.Join(dir, "burn."+ext), data, 0o644)
+		}
+	}
+
+	s.serveSessionHLS(w, r, ctx, file, drv, probe, sessionRequest{
+		keyMode:   fmt.Sprintf("burn.%d", subID),
+		videoMode: "transcode",
+		burn:      burn,
+		burnID:    subID,
+		prepare:   prepare,
+	}, rest, q, segLen, startSec)
+}
+
+// burnIsBitmap reports whether a subtitle track is images, which can only be
+// overlaid and never converted to text.
+func burnIsBitmap(sub *models.Subtitle) bool {
+	switch strings.ToLower(sub.Format) {
+	case "hdmv_pgs_subtitle", "pgs", "dvd_subtitle", "dvdsub",
+		"dvb_subtitle", "dvbsub", "xsub":
+		return true
+	}
+	return false
+}
+
+// burnSubtitleFile fetches a text subtitle and returns it in a format the
+// subtitles filter reads, plus the extension to name it.
+func (s *Server) burnSubtitleFile(ctx context.Context, file *models.MediaFile, drv source.Driver, sub *models.Subtitle) ([]byte, string, error) {
+	if sub.Embedded {
+		data, err := s.Engine.ExtractEmbeddedSubtitle(ctx, file, drv, sub.StreamIdx)
+		if err != nil {
+			return nil, "", err
+		}
+		return data, "vtt", nil
+	}
+	rc, err := drv.Open(ctx, sub.Path)
+	if err != nil {
+		return nil, "", err
+	}
+	defer rc.Close()
+	raw, err := io.ReadAll(io.LimitReader(rc, 8<<20))
+	if err != nil {
+		return nil, "", err
+	}
+	switch strings.ToLower(sub.Format) {
+	case "subrip", "srt":
+		return raw, "srt", nil
+	case "ass", "ssa":
+		return raw, "ass", nil
+	case "webvtt", "vtt":
+		return raw, "vtt", nil
+	}
+	return media.SRTToVTT(raw), "vtt", nil
+}
+
+func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx context.Context,
+	file *models.MediaFile, drv source.Driver, probe *media.Probe, req sessionRequest,
+	rest string, q url.Values, segLen, startSec float64) {
+
+	mode := req.keyMode
 	audioOrdinal := 0
 	if a := q.Get("a"); a != "" {
 		if n, e := strconv.Atoi(a); e == nil {
@@ -720,17 +869,22 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 		Headers:         headers,
 		VideoIndex:      videoIndex,
 		AudioOrdinal:    audioOrdinal,
-		VideoMode:       mode,
+		VideoMode:       req.videoMode,
 		AudioMode:       audioMode,
 		VideoCodec:      videoCodec,
 		TranscodeHeight: s.Cfg.Playback.TranscodeHeight,
 		SegmentSeconds:  segLen,
 		StartSeconds:    sessionStart,
 		StartSegment:    startSeg,
+		Burn:            req.burn,
+		PrepareDir:      req.prepare,
 	}
 	sig := signedQuery(s.Cfg.Secret, file.ID, sigTTL) + "&m=" + mode
 	if a := q.Get("a"); a != "" {
 		sig += "&a=" + a
+	}
+	if req.burn != nil {
+		sig += "&burn=" + strconv.FormatInt(req.burnID, 10)
 	}
 	base := fmt.Sprintf("/api/hls/%d", file.ID)
 
