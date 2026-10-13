@@ -527,14 +527,16 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// HEVC copy for Apple cannot be MPEG-TS: Apple does not decode HEVC from TS,
-	// and fMP4 needs a continuous timeline that only a long-lived packager
-	// produces. Everything else stays on the on-demand TS path, which needs no
-	// temporary disk. See media/session.go.
-	if s.Cfg.Playback.HLSSessionPackager && q.Get("m") != "transcode" {
-		if probe, err := s.Engine.EnsureProbe(ctx, file, drv); err == nil {
-			if v := probe.Video(); v != nil && v.CodecName == "hevc" {
-				s.serveSessionHLS(w, r, ctx, file, drv, probe, rest, q, segLen, startSec)
+	// With the session packager on, every HLS playback runs through one long-lived
+	// ffmpeg: it reads the source once instead of re-seeking and re-reading a
+	// probe window for each and every segment, and it is also what produces the
+	// fMP4 that copied HEVC for Apple requires (Apple does not decode HEVC from
+	// MPEG-TS). With the flag off, everything keeps using the on-demand MPEG-TS
+	// path, which needs no temporary disk. See media/session.go.
+	if s.Cfg.Playback.HLSSessionPackager {
+		if mode := q.Get("m"); mode == "remux" || mode == "transcode" {
+			if probe, err := s.Engine.EnsureProbe(ctx, file, drv); err == nil {
+				s.serveSessionHLS(w, r, ctx, file, drv, probe, mode, rest, q, segLen, startSec)
 				return
 			}
 		}
@@ -630,7 +632,7 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 // is waited for rather than 404'd — the player would otherwise treat a segment
 // that is merely early as fatal.
 func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx context.Context,
-	file *models.MediaFile, drv source.Driver, probe *media.Probe, rest string, q url.Values, segLen, startSec float64) {
+	file *models.MediaFile, drv source.Driver, probe *media.Probe, mode, rest string, q url.Values, segLen, startSec float64) {
 
 	audioOrdinal := 0
 	if a := q.Get("a"); a != "" {
@@ -686,7 +688,7 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 		Headers:         headers,
 		VideoIndex:      videoIndex,
 		AudioOrdinal:    audioOrdinal,
-		VideoMode:       "remux",
+		VideoMode:       mode,
 		AudioMode:       audioMode,
 		VideoCodec:      videoCodec,
 		TranscodeHeight: s.Cfg.Playback.TranscodeHeight,
@@ -694,7 +696,7 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 		StartSeconds:    sessionStart,
 		StartSegment:    startSeg,
 	}
-	key := media.SessionKey(file.ID, "remux", audioOrdinal, videoIndex, s.Cfg.Playback.TranscodeHeight, startSeg)
+	key := media.SessionKey(file.ID, mode, audioOrdinal, videoIndex, s.Cfg.Playback.TranscodeHeight, startSeg)
 	sess, err := s.Engine.EnsureSession(ctx, key, opts)
 	if err != nil {
 		log.Printf("hls session for file %d failed to start: %v", file.ID, err)
@@ -702,7 +704,7 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 		return
 	}
 
-	sig := signedQuery(s.Cfg.Secret, file.ID, sigTTL) + "&m=remux"
+	sig := signedQuery(s.Cfg.Secret, file.ID, sigTTL) + "&m=" + mode
 	if a := q.Get("a"); a != "" {
 		sig += "&a=" + a
 	}

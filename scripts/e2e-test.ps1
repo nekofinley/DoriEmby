@@ -79,8 +79,10 @@ Write-Host "==> 3. scan (post-scan pre-probe OFF so the async path is observable
 # The scan below must NOT warm the probe cache, otherwise step 5a would find a
 # cached probe and the async contract would go untested. Set it explicitly: the
 # server persists config, so relying on the file's current value is not enough.
+# The session packager is pinned off for the same reason — a run that aborted
+# before restoring it would otherwise change how steps 7 and 7b behave.
 Invoke-RestMethod -Uri "$Base/api/config" -Method Put -WebSession $sess -ContentType "application/json" `
-  -Body (J @{playback=@{preprobe_after_scan=$false}}) | Out-Null
+  -Body (J @{playback=@{preprobe_after_scan=$false; hls_session_packager=$false}}) | Out-Null
 $pre0 = (Invoke-RestMethod -Uri "$Base/api/config" -WebSession $sess).playback.preprobe_after_scan
 Show "preprobe_after_scan (before scan)" $pre0
 if ($pre0) { throw "could not disable pre-probe for the async probe check" }
@@ -291,6 +293,36 @@ Remove-Item $comb2 -ErrorAction SilentlyContinue
 # Leave no saved position behind for the remaining steps.
 Invoke-RestMethod -Uri "$Base/api/progress" -Method Post -WebSession $sess -ContentType "application/json" `
   -Body (J @{file_id=$hev1; position=0; duration=$dur}) | Out-Null
+
+Write-Host "==> 7e. with the packager on, a transcode is session-packaged too"
+# The point of P2: one long-lived ffmpeg per playback rather than a process per
+# segment — for transcodes as well, and the result is fMP4, not MPEG-TS.
+# Forced, because with the packager on the HEVC fixtures legitimately copy
+# instead of transcoding.
+$tc = Invoke-RestMethod -Uri "$Base/api/play/$hev1`?client=ios&force=transcode" -WebSession $sess
+Show "transcode decision" "$($tc.mode) | $($tc.reason)"
+if ($tc.mode -ne "transcode") { throw "forced transcode must be honoured, got '$($tc.mode)'" }
+$tcM3u8 = RawReq $hc "GET" "$Base$($tc.url)" @{}
+$tcTxt = [System.Text.Encoding]::UTF8.GetString($tcM3u8.Bytes)
+if ($tcTxt -notmatch '#EXT-X-MAP:URI="([^"]+)"') {
+  throw "a transcoded session must still be fMP4 with an init segment`n$tcTxt"
+}
+$tcInit = RawReq $hc "GET" "$Base$($Matches[1])" @{}
+$tcSegLine = ($tcTxt -split "`n" | Where-Object { $_ -and $_ -notmatch '^#' } | Select-Object -First 1).Trim()
+$tcSeg = RawReq $hc "GET" "$Base$tcSegLine" @{}
+Show "transcode session segment" "$($tcSeg.Status) type=$($tcSeg.ContentHeaders.ContentType) bytes=$($tcSeg.Bytes.Length)"
+if ($tcSeg.ContentHeaders.ContentType -notmatch 'mp4') {
+  throw "a session must serve fMP4 segments, got '$($tcSeg.ContentHeaders.ContentType)'"
+}
+$tcComb = Join-Path $env:TEMP "doriya-e2e-transcode.mp4"
+[System.IO.File]::WriteAllBytes($tcComb, $tcInit.Bytes + $tcSeg.Bytes)
+$tcCodec = ((& ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 $tcComb 2>&1) | Out-String).Trim()
+Show "transcode session codec" $tcCodec
+if ($tcCodec -notmatch 'h264') { throw "a transcode must produce H.264, got '$tcCodec'" }
+$tcErr = (& ffmpeg -v error -i $tcComb -frames:v 1 -f null - 2>&1 | Out-String).Trim()
+if ($tcErr) { throw "transcoded session segment does not decode: $tcErr" }
+Show "transcode session decodes" "OK"
+Remove-Item $tcComb -ErrorAction SilentlyContinue
 
 # Back to the default so the remaining steps see ordinary behaviour.
 Invoke-RestMethod -Uri "$Base/api/config" -Method Put -WebSession $sess -ContentType "application/json" `
