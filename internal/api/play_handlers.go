@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -29,6 +30,12 @@ var proxyClient = &http.Client{
 }
 
 const sigTTL = 12 * time.Hour
+
+// resumeMinSeconds is how far into a file a saved position must be before it is
+// worth starting a packaging session there. It scales down for clips shorter
+// than a couple of minutes (see playFile), where any real position is already
+// past this.
+const resumeMinSeconds = 30.0
 
 // ---------- /api/play/{id} ----------
 
@@ -95,6 +102,35 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		AppleHEVCCopy: s.Cfg.Playback.AppleHEVCCopy || s.Cfg.Playback.HLSSessionPackager,
 	})
 
+	// Resume support: tell the HLS packager where the viewer left off, so a
+	// session does not have to package everything ahead of that point. Only HLS
+	// URLs carry it: the 302/proxy paths stream from the start and let the player
+	// seek, and on-demand segments are addressed by absolute index anyway.
+	resumeFrom := 0.0
+	if u := s.currentUser(r); u != nil {
+		if p, err := s.Store.ProgressForFile(u.ID, file.ID); err == nil && p != nil {
+			dur := p.Duration
+			if dur <= 0 {
+				dur = dec.Duration
+			}
+			// Resuming from the opening moments is not worth a session boundary,
+			// so a flat minimum applies — but it scales down for short clips,
+			// where any meaningful position is already past it. The final stretch
+			// is an ending, not a place to resume.
+			minPos := resumeMinSeconds
+			if dur > 0 && dur*0.05 < minPos {
+				minPos = dur * 0.05
+			}
+			if p.Position > minPos && (dur <= 0 || p.Position < dur*0.95) {
+				resumeFrom = p.Position
+			}
+		}
+	}
+	startQ := ""
+	if resumeFrom > 0 {
+		startQ = "&start=" + strconv.FormatFloat(resumeFrom, 'f', 3, 64)
+	}
+
 	switch dec.Mode {
 	case "direct":
 		dec.URL = fmt.Sprintf("/api/stream/%d%s", file.ID, signedQuery(s.Cfg.Secret, file.ID, sigTTL))
@@ -105,7 +141,7 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		dec.MimeType = "video/mp4"
 	default: // remux / transcode → HLS
 		sq := signedQuery(s.Cfg.Secret, file.ID, sigTTL)
-		dec.URL = fmt.Sprintf("/api/hls/%d/index.m3u8%s&m=%s", file.ID, sq, dec.Mode)
+		dec.URL = fmt.Sprintf("/api/hls/%d/index.m3u8%s&m=%s%s", file.ID, sq, dec.Mode, startQ)
 		dec.MimeType = "application/vnd.apple.mpegurl"
 	}
 
@@ -115,7 +151,7 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 	proxyURL := fmt.Sprintf("/api/stream/%d?proxy=1", file.ID) + strings.Replace(sq, "?", "&", 1)
 	directURL := fmt.Sprintf("/api/stream/%d%s", file.ID, sq)
 	hlsURL := func(m string) string {
-		return fmt.Sprintf("/api/hls/%d/index.m3u8%s&m=%s", file.ID, sq, m)
+		return fmt.Sprintf("/api/hls/%d/index.m3u8%s&m=%s%s", file.ID, sq, m, startQ)
 	}
 	addAlt := func(mode, url, mime string) {
 		if url == dec.URL {
@@ -481,6 +517,16 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	segLen := s.Cfg.Playback.SegmentSeconds
 
+	// Where to begin packaging. /api/play passes the viewer's saved position, so
+	// "continue watching" does not make the packager work through everything
+	// before it first.
+	startSec := 0.0
+	if v := q.Get("start"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			startSec = f
+		}
+	}
+
 	// HEVC copy for Apple cannot be MPEG-TS: Apple does not decode HEVC from TS,
 	// and fMP4 needs a continuous timeline that only a long-lived packager
 	// produces. Everything else stays on the on-demand TS path, which needs no
@@ -488,7 +534,7 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 	if s.Cfg.Playback.HLSSessionPackager && q.Get("m") != "transcode" {
 		if probe, err := s.Engine.EnsureProbe(ctx, file, drv); err == nil {
 			if v := probe.Video(); v != nil && v.CodecName == "hevc" {
-				s.serveSessionHLS(w, r, ctx, file, drv, probe, rest, q, segLen)
+				s.serveSessionHLS(w, r, ctx, file, drv, probe, rest, q, segLen, startSec)
 				return
 			}
 		}
@@ -584,7 +630,7 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 // is waited for rather than 404'd — the player would otherwise treat a segment
 // that is merely early as fatal.
 func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx context.Context,
-	file *models.MediaFile, drv source.Driver, probe *media.Probe, rest string, q url.Values, segLen float64) {
+	file *models.MediaFile, drv source.Driver, probe *media.Probe, rest string, q url.Values, segLen, startSec float64) {
 
 	audioOrdinal := 0
 	if a := q.Get("a"); a != "" {
@@ -601,6 +647,23 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 	if v := probe.Video(); v != nil {
 		videoIndex = v.Index
 		videoCodec = v.CodecName
+	}
+
+	// Sessions are addressed by segment, so snap the requested position down to a
+	// segment boundary: segment N then always means "N*segLen into the file", and
+	// the playlist's MEDIA-SEQUENCE agrees with the timestamps we serve.
+	if segLen <= 0 {
+		segLen = 4
+	}
+	startSeg := 0
+	sessionStart := 0.0
+	if startSec > 0 {
+		startSeg = int(startSec / segLen)
+		sessionStart = float64(startSeg) * segLen
+		if d := probe.Duration(); d > 0 && sessionStart >= d {
+			// Past the end: nothing to resume, play from the start.
+			startSeg, sessionStart = 0, 0
+		}
 	}
 
 	// Re-resolve so a link the cloud refused is replaced (see resolveTarget).
@@ -628,8 +691,10 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 		VideoCodec:      videoCodec,
 		TranscodeHeight: s.Cfg.Playback.TranscodeHeight,
 		SegmentSeconds:  segLen,
+		StartSeconds:    sessionStart,
+		StartSegment:    startSeg,
 	}
-	key := media.SessionKey(file.ID, "remux", audioOrdinal, videoIndex, s.Cfg.Playback.TranscodeHeight)
+	key := media.SessionKey(file.ID, "remux", audioOrdinal, videoIndex, s.Cfg.Playback.TranscodeHeight, startSeg)
 	sess, err := s.Engine.EnsureSession(ctx, key, opts)
 	if err != nil {
 		log.Printf("hls session for file %d failed to start: %v", file.ID, err)
@@ -640,6 +705,9 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 	sig := signedQuery(s.Cfg.Secret, file.ID, sigTTL) + "&m=remux"
 	if a := q.Get("a"); a != "" {
 		sig += "&a=" + a
+	}
+	if startSeg > 0 {
+		sig += "&start=" + strconv.FormatFloat(sessionStart, 'f', 3, 64)
 	}
 	base := fmt.Sprintf("/api/hls/%d", file.ID)
 
@@ -659,7 +727,7 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 		_, _ = w.Write([]byte(media.RewriteSessionPlaylist(string(pl), base, sig)))
 
 	case rest == "init.mp4":
-		s.serveSessionFile(w, r, ctx, sess, sess.InitPath())
+		s.serveSessionFile(w, r, ctx, sess, sess.InitPath(), false)
 
 	default:
 		idx, ok := media.ParseSessionSegment(rest)
@@ -667,34 +735,48 @@ func (s *Server) serveSessionHLS(w http.ResponseWriter, r *http.Request, ctx con
 			fail(w, 404, "未知 HLS 资源")
 			return
 		}
-		s.serveSessionFile(w, r, ctx, sess, sess.SegmentPath(idx))
+		s.serveSessionFile(w, r, ctx, sess, sess.SegmentPath(idx), true)
 	}
 }
 
 // serveSessionFile waits for a packaged file and serves it with Range support.
-func (s *Server) serveSessionFile(w http.ResponseWriter, r *http.Request, ctx context.Context, sess *media.Session, path string) {
+// Media segments are shifted onto the absolute timeline first (see
+// Session.ShiftSegment); the init segment carries no timestamps.
+func (s *Server) serveSessionFile(w http.ResponseWriter, r *http.Request, ctx context.Context, sess *media.Session, path string, shift bool) {
 	if err := sess.WaitForFile(ctx, path, 45*time.Second); err != nil {
 		log.Printf("hls session %s: %v", filepath.Base(path), err)
 		w.Header().Set("Retry-After", "2")
 		http.Error(w, "分片尚未就绪,请重试", http.StatusBadGateway)
 		return
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		fail(w, 502, "读取分片失败: "+err.Error())
-		return
-	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		fail(w, 502, "读取分片失败: "+err.Error())
-		return
-	}
 	w.Header().Set("Content-Type", "video/mp4")
 	// Segments are transient: the session directory goes away when the session
 	// closes, so nothing here may be cached by the client.
 	w.Header().Set("Cache-Control", "no-store")
-	http.ServeContent(w, r, filepath.Base(path), fi.ModTime(), f)
+
+	if !shift {
+		f, err := os.Open(path)
+		if err != nil {
+			fail(w, 502, "读取分片失败: "+err.Error())
+			return
+		}
+		defer f.Close()
+		fi, err := f.Stat()
+		if err != nil {
+			fail(w, 502, "读取分片失败: "+err.Error())
+			return
+		}
+		http.ServeContent(w, r, filepath.Base(path), fi.ModTime(), f)
+		return
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		fail(w, 502, "读取分片失败: "+err.Error())
+		return
+	}
+	data = sess.ShiftSegment(data)
+	http.ServeContent(w, r, filepath.Base(path), time.Now(), bytes.NewReader(data))
 }
 
 // ---------- /api/subs/{id}/{sub}.vtt ----------

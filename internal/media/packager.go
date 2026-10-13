@@ -50,7 +50,21 @@ type PackagerOptions struct {
 
 	TranscodeHeight int
 	SegmentSeconds  float64
-	Dir             string // output directory; must already exist
+
+	// StartSeconds makes packaging begin here instead of at the start of the
+	// file, so resuming a playback does not have to package everything ahead of
+	// the viewer's position first.
+	//
+	// ffmpeg rebases the output timeline to zero even when seeking, so segments
+	// from a session that began mid-file carry timestamps relative to the
+	// session; Session.ShiftSegment moves them back onto the absolute timeline.
+	StartSeconds float64
+	// StartSegment is this session's first segment number. ffmpeg writes it as
+	// #EXT-X-MEDIA-SEQUENCE, which keeps segment N meaning "N*SegmentSeconds into
+	// the file" wherever the session started.
+	StartSegment int
+
+	Dir string // output directory; must already exist
 }
 
 // Packager is a running (or finished) fMP4 HLS packaging session.
@@ -155,6 +169,11 @@ func packagerArgs(o PackagerOptions) ([]string, error) {
 	if isHTTPPath(target) {
 		args = append(args, "-reconnect", "1", "-reconnect_streamed", "1")
 	}
+	// -ss belongs before -i (input seek): ffmpeg then starts reading near that
+	// position instead of decoding from the beginning.
+	if o.StartSeconds > 0 {
+		args = append(args, "-ss", strconv.FormatFloat(o.StartSeconds, 'f', 3, 64))
+	}
 	args = append(args, "-i", target)
 
 	if o.VideoIndex >= 0 {
@@ -195,6 +214,11 @@ func packagerArgs(o PackagerOptions) ([]string, error) {
 	seg := o.SegmentSeconds
 	if seg <= 0 {
 		seg = 4
+	}
+	// -start_number keeps the numbering on the absolute timeline, so a session
+	// that began at segment K still calls its first segment K.
+	if o.StartSegment > 0 {
+		args = append(args, "-start_number", strconv.Itoa(o.StartSegment))
 	}
 	args = append(args,
 		"-f", "hls",

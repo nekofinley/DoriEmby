@@ -250,6 +250,48 @@ $decErr = (& ffmpeg -v error -i $comb -frames:v 1 -f null - 2>&1 | Out-String).T
 if ($decErr) { throw "fMP4 init+segment does not decode: $decErr" }
 Show "fMP4 init+segment decodes" "OK"
 Remove-Item $comb -ErrorAction SilentlyContinue
+
+Write-Host "==> 7d. resuming begins the session at the saved position"
+# ffmpeg rebases timestamps to zero when it seeks, so a session that starts
+# mid-file has to be put back on the absolute timeline when served: otherwise the
+# player places the whole stream at zero and "continue watching" lands wrong.
+$dur = [double]$sp.duration
+$resume = [math]::Round($dur * 0.5, 3)
+Invoke-RestMethod -Uri "$Base/api/progress" -Method Post -WebSession $sess -ContentType "application/json" `
+  -Body (J @{file_id=$hev1; position=$resume; duration=$dur}) | Out-Null
+$rp = PlayDecision $hev1 "ios"
+Show "saved position" "$resume / $dur"
+if ($rp.url -notmatch 'start=') {
+  throw "the HLS URL must carry the saved position, got '$($rp.url)'"
+}
+$rpM3u8 = RawReq $hc "GET" "$Base$($rp.url)" @{}
+$rpTxt = [System.Text.Encoding]::UTF8.GetString($rpM3u8.Bytes)
+if ($rpTxt -notmatch '#EXT-X-MEDIA-SEQUENCE:(\d+)') { throw "no MEDIA-SEQUENCE in the resumed playlist`n$rpTxt" }
+$seq = [int]$Matches[1]
+$segLen = 4.0
+$wantSeq = [math]::Floor($resume / $segLen)
+$wantPts = $seq * $segLen
+Show "resumed playlist" "MEDIA-SEQUENCE=$seq (期望 $wantSeq)"
+if ([math]::Abs($seq - $wantSeq) -gt 1) {
+  throw "MEDIA-SEQUENCE $seq does not match the saved position $resume"
+}
+$rpSegLine = ($rpTxt -split "`n" | Where-Object { $_ -and $_ -notmatch '^#' } | Select-Object -First 1).Trim()
+$rpSeg = RawReq $hc "GET" "$Base$rpSegLine" @{}
+$comb2 = Join-Path $env:TEMP "doriya-e2e-resume.mp4"
+[System.IO.File]::WriteAllBytes($comb2, $initR.Bytes + $rpSeg.Bytes)
+$ptsOut = ((& ffprobe -v error -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 `
+  -read_intervals '%+#1' $comb2 2>&1) | Out-String).Trim()
+if (-not $ptsOut) { throw "ffprobe returned no pts for the resumed segment" }
+$gotPts = [double](($ptsOut -split "`n")[0] -split ',')[0]
+Show "resumed first video pts" "$gotPts (期望 ~$wantPts)"
+if ([math]::Abs($gotPts - $wantPts) -gt 0.3) {
+  throw "the resumed segment starts at ${gotPts}s, want ~${wantPts}s on the absolute timeline"
+}
+Remove-Item $comb2 -ErrorAction SilentlyContinue
+# Leave no saved position behind for the remaining steps.
+Invoke-RestMethod -Uri "$Base/api/progress" -Method Post -WebSession $sess -ContentType "application/json" `
+  -Body (J @{file_id=$hev1; position=0; duration=$dur}) | Out-Null
+
 # Back to the default so the remaining steps see ordinary behaviour.
 Invoke-RestMethod -Uri "$Base/api/config" -Method Put -WebSession $sess -ContentType "application/json" `
   -Body (J @{playback=@{hls_session_packager=$false}}) | Out-Null

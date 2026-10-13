@@ -2,7 +2,10 @@ package media
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -73,7 +76,7 @@ func TestSessionLifecycle(t *testing.T) {
 	e := newTestEngine(t, nil)
 	e.Cfg.DataDir = t.TempDir() // never write into the package directory
 
-	key := SessionKey(42, "remux", 0, 0, 1080)
+	key := SessionKey(42, "remux", 0, 0, 1080, 0)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
@@ -146,7 +149,7 @@ func TestSessionWaitForFileTimesOut(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	sess, err := e.EnsureSession(ctx, SessionKey(1, "remux", 0, 0, 1080), PackagerOptions{
+	sess, err := e.EnsureSession(ctx, SessionKey(1, "remux", 0, 0, 1080, 0), PackagerOptions{
 		Target: testMKV, VideoIndex: 0, AudioOrdinal: 0, VideoMode: "copy", AudioMode: "aac", VideoCodec: "hevc",
 	})
 	if err != nil {
@@ -159,5 +162,89 @@ func TestSessionWaitForFileTimesOut(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("timeout was not honoured (took %v)", elapsed)
+	}
+}
+
+// requireSeekableSource builds a source with real keyframes, so seeking has
+// something to land on. The committed fixtures carry a single keyframe, which
+// makes every -ss snap back to zero and would hide the bug this guards.
+func requireSeekableSource(t *testing.T, dir string, seconds int) string {
+	t.Helper()
+	src := filepath.Join(dir, "src.mp4")
+	out, err := exec.Command("ffmpeg", "-y", "-v", "error",
+		"-f", "lavfi", "-i", fmt.Sprintf("testsrc=size=320x240:rate=25:duration=%d", seconds),
+		"-c:v", "libx264", "-preset", "ultrafast", "-g", "50", "-keyint_min", "50",
+		"-sc_threshold", "0", "-pix_fmt", "yuv420p", src).CombinedOutput()
+	if err != nil {
+		t.Fatalf("build test source: %v: %s", err, out)
+	}
+	return src
+}
+
+// A session that begins mid-file must still describe itself in absolute terms:
+// segment N covers N*segLen, and the media it serves must be timestamped at that
+// position — otherwise a player places a resumed stream at zero.
+func TestSessionStartingMidFile(t *testing.T) {
+	requireFFmpeg(t)
+	dir := t.TempDir()
+	src := requireSeekableSource(t, dir, 40)
+
+	e := newTestEngine(t, nil)
+	e.Cfg.DataDir = t.TempDir()
+	defer e.CloseSessions()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	const startSeg = 2
+	const segLen = 4.0
+	opts := PackagerOptions{
+		Target: src, VideoIndex: 0, AudioOrdinal: -1,
+		VideoMode: "copy", VideoCodec: "h264",
+		SegmentSeconds: segLen, StartSeconds: startSeg * segLen, StartSegment: startSeg,
+	}
+	sess, err := e.EnsureSession(ctx, SessionKey(9, "remux", 0, 0, 1080, startSeg), opts)
+	if err != nil {
+		t.Fatalf("EnsureSession: %v", err)
+	}
+	if err := sess.WaitForFile(ctx, sess.PlaylistPath(), 30*time.Second); err != nil {
+		t.Fatalf("waiting for playlist: %v", err)
+	}
+	pl, err := os.ReadFile(sess.PlaylistPath())
+	if err != nil {
+		t.Fatalf("read playlist: %v", err)
+	}
+	if !strings.Contains(string(pl), "#EXT-X-MEDIA-SEQUENCE:2") {
+		t.Errorf("playlist must keep absolute numbering:\n%s", pl)
+	}
+	if !strings.Contains(string(pl), "seg00002.m4s") {
+		t.Errorf("segments must keep absolute naming:\n%s", pl)
+	}
+
+	segPath := sess.SegmentPath(startSeg)
+	if err := sess.WaitForFile(ctx, segPath, 30*time.Second); err != nil {
+		t.Fatalf("waiting for the first segment: %v", err)
+	}
+	raw := readFileT(t, segPath)
+
+	// The premise: ffmpeg rebased the timeline to zero.
+	if v := tfdtValues(raw); len(v) == 0 || v[0] != 0 {
+		t.Fatalf("expected the raw segment to start at 0, got %v", v)
+	}
+
+	initBytes := readFileT(t, sess.InitPath())
+	comb := filepath.Join(dir, "shifted.mp4")
+	if err := os.WriteFile(comb, append(append([]byte(nil), initBytes...), sess.ShiftSegment(raw)...), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if got := firstVideoPTS(t, comb); got < 7.8 || got > 8.2 {
+		t.Errorf("served segment starts at %.3fs, want ~8s (its absolute position)", got)
+	}
+}
+
+// A different start position is a different packaging job, not a cache hit.
+func TestSessionKeyIncludesStart(t *testing.T) {
+	if SessionKey(1, "remux", 0, 0, 1080, 0) == SessionKey(1, "remux", 0, 0, 1080, 2) {
+		t.Fatal("sessions with different start positions must not share an identity")
 	}
 }

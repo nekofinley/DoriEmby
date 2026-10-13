@@ -3,6 +3,7 @@ package media
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -54,17 +55,21 @@ type sessionKey struct {
 	audio  int
 	vindex int
 	height int
+	// start is the session's first segment number, and part of its identity: a
+	// different start is a different packaging job, so seeking backwards starts a
+	// fresh session instead of reusing one that is already past that point.
+	start int
 }
 
 // SessionKey identifies one packaging session. The type is deliberately
 // unexported: callers obtain a value here and hand it straight back to
 // EnsureSession.
-func SessionKey(fileID int64, mode string, audio, vindex, height int) sessionKey {
-	return sessionKey{fileID: fileID, mode: mode, audio: audio, vindex: vindex, height: height}
+func SessionKey(fileID int64, mode string, audio, vindex, height, start int) sessionKey {
+	return sessionKey{fileID: fileID, mode: mode, audio: audio, vindex: vindex, height: height, start: start}
 }
 
 func (k sessionKey) dirName() string {
-	return fmt.Sprintf("%d-%s-a%d-v%d-h%d", k.fileID, k.mode, k.audio, k.vindex, k.height)
+	return fmt.Sprintf("%d-%s-a%d-v%d-h%d-s%d", k.fileID, k.mode, k.audio, k.vindex, k.height, k.start)
 }
 
 // Session is one packaging session and its output directory.
@@ -77,6 +82,52 @@ type Session struct {
 	mu       sync.Mutex
 	lastUsed time.Time
 	closed   bool
+	// startSeconds is where this session began (absolute file time), used to put
+	// packaged segments back onto the absolute timeline.
+	startSeconds float64
+	// tracks caches the init segment's track timescales for that shift.
+	tracks []mp4Track
+}
+
+// StartSeconds is the absolute file position this session began at.
+func (s *Session) StartSeconds() float64 { return s.startSeconds }
+
+// StartSegment is this session's first segment number.
+func (s *Session) StartSegment() int { return s.key.start }
+
+// ShiftSegment moves a packaged segment onto the absolute timeline. ffmpeg
+// rebases timestamps to zero whenever it starts a new process (even with -ss),
+// but players derive media time from tfdt for fMP4 — so a session that began
+// mid-file would otherwise look like it began at zero, and resume or seek would
+// land in the wrong place. Failures are non-fatal: the segment is served as-is.
+func (s *Session) ShiftSegment(data []byte) []byte {
+	if s.startSeconds <= 0 {
+		return data
+	}
+	s.mu.Lock()
+	tracks := s.tracks
+	s.mu.Unlock()
+	if tracks == nil {
+		initBytes, err := os.ReadFile(s.pack.InitPath())
+		if err != nil {
+			return data
+		}
+		parsed, err := ParseInitTracks(initBytes)
+		if err != nil {
+			log.Printf("hls session %d: cannot read track timescales (%v); serving segments unshifted", s.key.fileID, err)
+			return data
+		}
+		s.mu.Lock()
+		s.tracks = parsed
+		tracks = parsed
+		s.mu.Unlock()
+	}
+	out, _, err := ShiftTfdt(data, tracks, s.startSeconds)
+	if err != nil {
+		log.Printf("hls session %d: tfdt shift failed (%v); serving segment unshifted", s.key.fileID, err)
+		return data
+	}
+	return out
 }
 
 // Touch records that the session was just used.
@@ -196,7 +247,7 @@ func (e *Engine) EnsureSession(ctx context.Context, key sessionKey, opts Package
 		return nil, err
 	}
 
-	s := &Session{key: key, dir: dir, pack: p, cancel: cancel, lastUsed: time.Now()}
+	s := &Session{key: key, dir: dir, pack: p, cancel: cancel, lastUsed: time.Now(), startSeconds: opts.StartSeconds}
 
 	e.sessMu.Lock()
 	// Another request may have won the race; keep only one session per key.
