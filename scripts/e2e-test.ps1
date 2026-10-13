@@ -164,6 +164,61 @@ Show "local proxy range status" "$($resp.Status) len=$($resp.Bytes.Length) cr=$(
 $resp = RawReq $hc "HEAD" "$Base/api/stream/$($h264File)" @{}
 Show "local HEAD status" "$($resp.Status) accept-ranges=$($resp.RespHeaders.AcceptRanges)"
 
+Write-Host "==> 6b. byte-range HLS of a fragmented MP4 (P4)"
+# The playlist is built from the file's own box structure, so every segment is a
+# byte range of the original file: no transcode, no remux, nothing written to disk.
+# The bytes the server hands back are compared against the file itself.
+$frag = ($targets | Where-Object { $_.title -match '^Fragmented' } | Select-Object -First 1)
+if (-not $frag) { throw "the fragmented fixture was not scanned; step 4 should list it" }
+$brPlay = Invoke-RestMethod -Uri "$Base/api/play/$($frag.file)`?client=ios&force=byterange" -WebSession $sess
+Show "byterange decision" "$($brPlay.mode) | $($brPlay.reason)"
+if ($brPlay.mode -ne "byterange") { throw "force=byterange must be honoured, got '$($brPlay.mode)'" }
+if ($brPlay.url -notmatch 'byterange\.m3u8') { throw "unexpected byterange url '$($brPlay.url)'" }
+$br = RawReq $hc "GET" "$Base$($brPlay.url)" @{}
+$brTxt = [System.Text.Encoding]::UTF8.GetString($br.Bytes)
+if ($br.Status -ne 200) { throw "byterange playlist fetch failed: $($br.Status)" }
+if ($brTxt -notmatch '#EXT-X-VERSION:4') { throw "byte ranges need playlist version 4`n$brTxt" }
+if ($brTxt -notmatch '#EXT-X-MAP:URI="([^"]+)",BYTERANGE="(\d+)@(\d+)"') {
+  throw "a byte-range stream needs an EXT-X-MAP with its own range`n$brTxt"
+}
+$brUri = $Matches[1]; $initLen = [int64]$Matches[2]; $initOff = [int64]$Matches[3]
+$brSegs = @($brTxt -split "`n" | Where-Object { $_ -match '^#EXT-X-BYTERANGE:' })
+Show "byterange playlist" "segments=$($brSegs.Count) init=$initLen@$initOff endlist=$($brTxt.Contains('#EXT-X-ENDLIST'))"
+if ($brSegs.Count -lt 2) { throw "expected several fragments, got $($brSegs.Count)" }
+if (-not $brTxt.Contains('#EXT-X-ENDLIST')) { throw "a byte-range stream of a whole file is a VOD playlist" }
+
+# The init range must be the ftyp+moov of the file.
+$brInit = RawReq $hc "GET" "$Base$brUri" @{Range="bytes=$initOff-$($initOff + $initLen - 1)"}
+$brInitTxt = [System.Text.Encoding]::ASCII.GetString($brInit.Bytes)
+Show "byterange init" "status=$($brInit.Status) len=$($brInit.Bytes.Length) ftyp=$($brInitTxt.Substring(4,4) -eq 'ftyp')"
+if ($brInit.Status -ne 206 -or $brInit.Bytes.Length -ne $initLen) {
+  throw "the init range must come back as 206 with exactly $initLen bytes, got $($brInit.Status)/$($brInit.Bytes.Length)"
+}
+if ($brInitTxt.Substring(4, 4) -ne 'ftyp') { throw "the init range does not start with ftyp" }
+
+# And an advertised segment must match the file on disk, byte for byte. This is what
+# separates a real byte-range index from a well-formed but wrong one.
+if ($brSegs[0] -notmatch '^#EXT-X-BYTERANGE:(\d+)@(\d+)$') { throw "unparsable byte range '$($brSegs[0])'" }
+$segLen = [int64]$Matches[1]; $segOff = [int64]$Matches[2]
+$brSeg = RawReq $hc "GET" "$Base$brUri" @{Range="bytes=$segOff-$($segOff + $segLen - 1)"}
+$fixture = Join-Path $TestData "movies\Fragmented Clip (2024)\Fragmented Clip (2024) h264_aac.mp4"
+$all = [System.IO.File]::ReadAllBytes($fixture)
+$want = $all[$segOff..($segOff + $segLen - 1)]
+$same = $brSeg.Bytes.Length -eq $segLen
+if ($same) {
+  for ($i = 0; $i -lt $segLen; $i++) { if ($brSeg.Bytes[$i] -ne $want[$i]) { $same = $false; break } }
+}
+Show "byterange segment" "status=$($brSeg.Status) len=$($brSeg.Bytes.Length) matches_file=$same"
+if ($brSeg.Status -ne 206) { throw "a byte-range segment must be served as 206, got $($brSeg.Status)" }
+if (-not $same) { throw "the served bytes do not match $fixture at offset $segOff" }
+
+# A progressive MP4 cannot be served this way, and must say so rather than serve
+# something wrong.
+$progFile = ($targets | Where-Object { $_.title -match '^Wandering Earth' } | Select-Object -First 1).file
+$prog = RawReq $hc "GET" "$Base/api/hls/$progFile/byterange.m3u8?$($brPlay.url.Split('?')[1])" @{}
+Show "byterange on a progressive MP4" "status=$($prog.Status)"
+if ($prog.Status -eq 200) { throw "a progressive MP4 must not be served by byte range" }
+
 Write-Host "==> 7. HLS remux pipeline (hevc_hev1 file, iOS)"
 $hev1 = ($targets | Where-Object { $_.media.video.tag -eq "hev1" } | Select-Object -First 1).file
 $play = PlayDecision $hev1 "ios"

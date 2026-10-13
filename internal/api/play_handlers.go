@@ -201,6 +201,14 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		dec.URL = ""
 	}
 
+	if force == "byterange" {
+		// Serving the file's own bytes as HLS. Not chosen automatically: see §17 —
+		// remuxing and the proxy already give zero-transcode playback, and both are
+		// cheaper than indexing every fragment.
+		dec.Mode, dec.Kind = "byterange", "hls"
+		dec.Reason = "字节范围直取(零转码,不写磁盘)"
+	}
+
 	// A session begins at a segment boundary, and the player presents that stream
 	// as starting at zero. So the client is told where the stream begins in file
 	// time, or it would save progress measured from the resume point and line
@@ -227,6 +235,11 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		dec.MimeType = "video/mp4"
 	default: // remux / transcode → HLS
 		sq := signedQuery(s.Cfg.Secret, file.ID, sigTTL)
+		if force == "byterange" {
+			dec.URL = fmt.Sprintf("/api/hls/%d/byterange.m3u8%s", file.ID, sq)
+			dec.MimeType = "application/vnd.apple.mpegurl"
+			break
+		}
 		burnQ := ""
 		if burnSub > 0 {
 			burnQ = "&burn=" + strconv.FormatInt(burnSub, 10)
@@ -584,6 +597,13 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Byte-range serving of an already-fragmented MP4: the playlist is built from
+	// the file's own box structure, so nothing is packaged or written to disk.
+	if rest == "byterange.m3u8" {
+		s.serveByteRangeHLS(w, r, ctx, file, drv)
+		return
+	}
+
 	// The subtitle side of HLS: a master playlist offering each servable subtitle
 	// as a rendition, and the one-segment playlist for each one. Handled before
 	// the packaging split, because it is the same either way.
@@ -719,6 +739,62 @@ type sessionRequest struct {
 	burn      *media.BurnRequest
 	burnID    int64 // the subtitle being burned, for the signed URL
 	prepare   func(dir string) error
+}
+
+// serveByteRangeHLS serves an already-fragmented MP4 as HLS by pointing the player
+// at byte ranges of the original file: no transcoding, no remuxing, and nothing
+// written to disk. The player issues Range requests against the ordinary stream
+// endpoint, which is what the range handling in proxy_range.go exists for.
+//
+// Indexing needs random access, so this is offered only when the source hands back
+// a seekable file. A cloud source would need a header read per fragment — thousands
+// of round trips for a whole film — so it keeps using the proxy or remux paths
+// instead. That trade-off is deliberate; see docs §17.
+func (s *Server) serveByteRangeHLS(w http.ResponseWriter, r *http.Request, ctx context.Context,
+	file *models.MediaFile, drv source.Driver) {
+
+	rc, err := drv.Open(ctx, file.Path)
+	if err != nil {
+		fail(w, 502, "读取源失败: "+err.Error())
+		return
+	}
+	defer rc.Close()
+	ra, seekable := rc.(io.ReaderAt)
+	seeker, canSeek := rc.(io.Seeker)
+	if !seekable || !canSeek {
+		fail(w, 409, "字节范围直取需要可随机读取的源(当前源只能顺序读取)")
+		return
+	}
+	size, err := seeker.Seek(0, io.SeekEnd)
+	if err != nil {
+		fail(w, 500, "读取源大小失败: "+err.Error())
+		return
+	}
+	if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+		fail(w, 500, "读取源失败: "+err.Error())
+		return
+	}
+	idx, err := media.ParseFragmentedMP4(ra, size)
+	if err != nil {
+		fail(w, 409, "该文件不能按字节范围直取: "+err.Error())
+		return
+	}
+
+	// The segment URI is the file itself, so the player's own Range requests fetch
+	// exactly the bytes the playlist declares.
+	sq := signedQuery(s.Cfg.Secret, file.ID, sigTTL)
+	uri := fmt.Sprintf("/api/stream/%d%s", file.ID, sq)
+	if _, isLocal := drv.(*source.LocalDriver); !isLocal {
+		uri = fmt.Sprintf("/api/stream/%d?proxy=1", file.ID) + strings.Replace(sq, "?", "&", 1)
+	}
+	pl, err := idx.ByteRangePlaylist(uri)
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(pl)
 }
 
 // serveBurnHLS packages a stream with a subtitle overlaid onto the video.
