@@ -32,12 +32,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 		dropIfOnly bool
 	}{
 		{
-			// The regression that matters most: a plain line must come out exactly
-			// as it always did, with no placement invented for it.
-			name:    "plain dialogue keeps the player's default",
+			// A line that shares its moment with nothing else is lifted clear of
+			// the bottom edge, where the theatre's control bar sits.
+			name:    "a lone line is lifted off the bottom edge",
 			text:    `Dialogue: 0,0:00:01.00,0:00:03.00,Dialogue,,0,0,0,,你好,世界`,
-			wantCue: "",
-			wantIn:  []string{"00:00:01.000 --> 00:00:03.000\n你好,世界"},
+			wantCue: "line:82%,end",
+			wantIn:  []string{"00:00:01.000 --> 00:00:03.000 line:82%,end\n你好,世界"},
 		},
 		{
 			// The style's own MarginV (20px of 1080) is where ASS would put it.
@@ -58,16 +58,19 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 			wantCue: "align:start",
 		},
 		{
-			name:   "italics, bold and colour survive",
-			text:   `Dialogue: 0,0:00:01.00,0:00:03.00,Dialogue,,0,0,0,,{\i1}italics{\i0} and {\b1}bold{\b0} and {\c&H0000FF&}red`,
-			wantIn: []string{"<i>italics</i>", "<b>bold</b>", "<c.dm-cff0000>red</c>", "::cue(.dm-cff0000) { color: #ff0000 }"},
+			name: "italics, bold and colour survive",
+			text: `Dialogue: 0,0:00:01.00,0:00:03.00,Dialogue,,0,0,0,,{\i1}italics{\i0} and {\b1}bold{\b0} and {\c&H0000FF&}red`,
+			// A lone line, so it is lifted; the point here is the markup.
+			wantCue: "line:82%,end",
+			wantIn:  []string{"<i>italics</i>", "<b>bold</b>", "<c.dm-cff0000>red</c>", "::cue(.dm-cff0000) { color: #ff0000 }"},
 		},
 		{
 			// \p1 starts a vector drawing: its "text" is coordinate pairs, and
 			// rendering them is worse than rendering nothing.
-			name:   "a vector drawing is dropped, not shown",
-			text:   `Dialogue: 0,0:00:01.00,0:00:03.00,Dialogue,,0,0,0,,{\p1}m 0 0 l 100 0 100 100 0 100{\p0}visible`,
-			wantIn: []string{"visible"},
+			name:    "a vector drawing is dropped, not shown",
+			text:    `Dialogue: 0,0:00:01.00,0:00:03.00,Dialogue,,0,0,0,,{\p1}m 0 0 l 100 0 100 100 0 100{\p0}visible`,
+			wantCue: "line:82%,end",
+			wantIn:  []string{"visible"},
 			wantNotIn: []string{
 				"m 0 0", "l 100 0", "{\\p1}",
 			},
@@ -78,14 +81,16 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 			wantNotIn: []string{"-->", "m 0 0"},
 		},
 		{
-			name:   "text that looks like markup is escaped",
-			text:   `Dialogue: 0,0:00:01.00,0:00:03.00,Dialogue,,0,0,0,,Fish & chips <3`,
-			wantIn: []string{"Fish &amp; chips &lt;3"},
+			name:    "text that looks like markup is escaped",
+			text:    `Dialogue: 0,0:00:01.00,0:00:03.00,Dialogue,,0,0,0,,Fish & chips <3`,
+			wantCue: "line:82%,end",
+			wantIn:  []string{"Fish &amp; chips &lt;3"},
 		},
 		{
-			name:   "hard breaks become real lines, karaoke keeps its syllables",
-			text:   `Dialogue: 0,0:00:01.00,0:00:03.00,Dialogue,,0,0,0,,{\k20}き{\k20}ら{\k20}き\Nsecond line`,
-			wantIn: []string{"きらき\nsecond line"},
+			name:    "hard breaks become real lines, karaoke keeps its syllables",
+			text:    `Dialogue: 0,0:00:01.00,0:00:03.00,Dialogue,,0,0,0,,{\k20}き{\k20}ら{\k20}き\Nsecond line`,
+			wantCue: "line:82%,end",
+			wantIn:  []string{"きらき\nsecond line"},
 		},
 	}
 
@@ -95,11 +100,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 			if tc.wantCue != "" && !strings.Contains(got, tc.wantCue) {
 				t.Errorf("cue settings %q missing.\n got: %s", tc.wantCue, got)
 			}
-			if tc.wantCue == "" && strings.Contains(got, "-->") {
-				// Only the placement-free cases assert this, and they are the
-				// ones where the timing line must carry no settings at all.
+			if tc.wantCue == "" {
+				// These cases are about text only: the timing line must carry no
+				// placement at all.
 				for _, line := range strings.Split(got, "\n") {
-					if strings.Contains(line, "-->") && strings.TrimSpace(strings.SplitN(line, "-->", 2)[1]) != strings.TrimSpace(strings.Fields(strings.SplitN(line, "-->", 2)[1])[0]) {
+					if strings.Contains(line, "-->") && (strings.Contains(line, "line:") || strings.Contains(line, "align:")) {
 						t.Errorf("expected no cue settings, got %q", line)
 					}
 				}
@@ -115,6 +120,52 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 				}
 			}
 		})
+	}
+}
+
+// Simultaneous lines must keep the browser's collision handling. A cue with an
+// explicit line is placed there and nothing moves it out of the way, so pinning
+// every cue would stack two speakers on top of each other.
+func TestASSToVTTLeavesCrowdedLinesToThePlayer(t *testing.T) {
+	src := `[Script Info]
+PlayResX: 1920
+PlayResY: 1080
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Dialogue,Arial,48,&H00FFFFFF,0,0,0,0,100,100,0,0,1,2,1,2,60,60,30,1
+Style: Sign,Arial,72,&H0000FFFF,0,0,0,0,100,100,0,0,1,2,1,8,10,10,20,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:05.00,Dialogue,,0,0,0,,第一句
+Dialogue: 0,0:00:02.00,0:00:06.00,Dialogue,,0,0,0,,第二句
+Dialogue: 0,0:00:01.00,0:00:05.00,Sign,,0,0,0,,{\an8}牌子
+Dialogue: 0,0:00:20.00,0:00:22.00,Dialogue,,0,0,0,,很久以后的一句
+`
+	got := string(ASSToVTT([]byte(src)))
+	lines := strings.Split(got, "\n")
+	var settings []string
+	for _, line := range lines {
+		if strings.Contains(line, "-->") {
+			settings = append(settings, strings.TrimSpace(strings.SplitN(line, "-->", 2)[1]))
+		}
+	}
+	// The two speakers overlap, so neither may be pinned; the sign is placed by
+	// its own anchor, and the line twenty seconds later is alone and is lifted.
+	if len(settings) != 4 {
+		t.Fatalf("expected four cues, got %d.\n got: %s", len(settings), got)
+	}
+	for i, s := range settings[:2] {
+		if strings.Contains(s, "line:") {
+			t.Errorf("cue %d overlaps another and must not be pinned, got %q", i, s)
+		}
+	}
+	if !strings.Contains(settings[2], "line:") {
+		t.Errorf("the sign's own anchor must be kept, got %q", settings[2])
+	}
+	if !strings.Contains(settings[3], "line:82%,end") {
+		t.Errorf("a lone line later in the file must still be lifted, got %q", settings[3])
 	}
 }
 

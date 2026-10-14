@@ -298,8 +298,11 @@ let hideTimer = null
 let probeTimer = null
 let streamTimer = null
 let stallTimer = null
-let waitTimer = null     // grace period before a buffering event counts as loading
 let stallSince = 0
+// Where the playhead was when we last looked, and when it last advanced: these
+// are what decide whether the picture is moving (see markPlaying).
+let tickAt = 0
+let tickMovedAt = 0
 let disposed = false
 
 /* ------------------------------------------------------------------ playback */
@@ -484,11 +487,15 @@ function stopStreamPoll() {
 /* Stall clock: while the player waits on data, show how long we have waited —
    that is the difference between "still loading" and "dead".
 
-   The picture has the last word on whether the player is loading. A `waiting`
-   event is not proof that it stopped — the element raises it while it buffers
-   ahead too — so the state is only claimed once the playhead has really stalled,
-   and any frame that moves clears it again (markPlaying). A spinner over a
-   picture that is already playing is worse than no spinner at all. */
+   The playhead has the last word on whether the player is loading, because no
+   event is evidence about the picture. `waiting` says data ran short, not that
+   the picture stopped; and on a slow connection readyState sits at
+   HAVE_CURRENT_DATA (2) for a whole film while frames keep arriving one at a
+   time, so a `readyState >= 3` test never passes there. That is how a spinner
+   ends up turning over a picture that is plainly playing, and how the stall clock
+   reaches the "switch mode?" hint with nothing actually wrong. So the state is
+   claimed only once the playhead has really stopped, and any advance clears it
+   (markPlaying). */
 function onWaiting() {
   if (stallSince) return
   stallSince = Date.now()
@@ -496,16 +503,11 @@ function onWaiting() {
   clearInterval(stallTimer)
   stallTimer = setInterval(() => {
     stallSeconds.value = (Date.now() - stallSince) / 1000
-  }, 500)
-  if (waitTimer) clearTimeout(waitTimer)
-  waitTimer = setTimeout(() => {
-    waitTimer = null
     const v = videoEl.value
-    // HAVE_FUTURE_DATA (3) is the least that can keep playing; below it the
-    // element really has run out of data, and saying so is honest whether or not
-    // the viewer had pressed play.
-    if (v && v.readyState < 3) isLoading.value = true
-  }, 400)
+    // Paused and short of data is genuinely preparing; playing is only preparing
+    // once the playhead has stopped moving.
+    if (v && (v.paused || !playheadMoving())) isLoading.value = true
+  }, 500)
 }
 
 function onPlaying() {
@@ -513,10 +515,31 @@ function onPlaying() {
   clearStall()
 }
 
+// Enough data has arrived to keep playing on its own. This settles the loading
+// state whatever the earlier events said, and it is the one signal that also
+// works while the element is paused (a viewer who pauses mid-stall should not be
+// left looking at "正在缓冲" after the data has turned up).
+function onCanPlay() {
+  const v = videoEl.value
+  if (!v || v.readyState < 3) return
+  isLoading.value = false
+  clearStall()
+}
+
+/** Has the playhead advanced in the last moment? The events lie; the clock does not. */
+function playheadMoving() {
+  return tickMovedAt > 0 && Date.now() - tickMovedAt < 1000
+}
+
 /** Frames are moving: nothing is loading, whatever the element's events said. */
 function markPlaying() {
   const v = videoEl.value
-  if (!v || v.paused || v.readyState < 3 || !(v.currentTime > 0)) return
+  if (!v) return
+  const t = v.currentTime
+  const advanced = Math.abs(t - tickAt) > 0.002
+  tickAt = t
+  if (v.paused || !advanced || !(t > 0)) return
+  tickMovedAt = Date.now()
   isLoading.value = false
   clearStall()
 }
@@ -525,7 +548,6 @@ function clearStall() {
   stallSince = 0
   stallSeconds.value = 0
   if (stallTimer) { clearInterval(stallTimer); stallTimer = null }
-  if (waitTimer) { clearTimeout(waitTimer); waitTimer = null }
 }
 
 const cands = ref([])
@@ -1180,6 +1202,7 @@ onBeforeUnmount(() => {
               @play="isPlaying = true; showControls()"
               @waiting="onWaiting"
               @playing="onPlaying"
+              @canplay="onCanPlay"
               @click="onTap"
               @dblclick="onDoubleTap"
               @ratechange="rate = videoEl?.playbackRate || 1"

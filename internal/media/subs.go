@@ -800,9 +800,92 @@ func hasText(rendered string) bool {
 	return false
 }
 
+// vttCue is one rendered cue waiting to be written: its timing line, its
+// payload, and where it sits. The times are kept as numbers because the bottom
+// placement depends on which cues share a moment.
+type vttCue struct {
+	head string
+	t0   float64
+	t1   float64
+	body string
+	pos  cuePos
+}
+
+// vttBottomPct is where a lone cue sits: a little above the bottom edge rather
+// than against it. The browser's own bottom placement puts text on the last row
+// of the picture, which in the theatre is underneath the control bar.
+//
+// Note that Chrome ignores the line-alignment component of a cue setting, so
+// "line:82%,end" is placed as "the top of the box at 82%" there. The value is
+// chosen for that reading: the text has to end above the control bar, which
+// covers roughly the last tenth of the picture — and the bar is a fixed height,
+// so on a short stage it covers a larger share, which is what the value allows for.
+const vttBottomPct = 82.0
+
+// liftLoneCues raises the cues that share their moment with nothing else.
+//
+// A cue with a line of its own is placed there and nothing moves it out of the
+// way, so pinning every cue would stack simultaneous dialogue on top of itself
+// (three lines at line:90%,end render as one). Leaving every cue alone keeps the
+// browser's collision handling, but leaves ordinary subtitles on the bottom edge.
+// So: lift the cues that are alone, and leave the crowded ones to the browser.
+// Subtitle files are timed sequentially almost everywhere, so that is nearly all
+// of them; a sign with an explicit position is not a competitor, since it is not
+// sitting where the dialogue goes.
+func liftLoneCues(cues []vttCue) {
+	for i := range cues {
+		if cues[i].pos.lineSet {
+			continue
+		}
+		crowded := false
+		for j := range cues {
+			if j == i || !sharesTheBottom(cues[j].pos) {
+				continue
+			}
+			if cues[j].t0 < cues[i].t1 && cues[i].t0 < cues[j].t1 {
+				crowded = true
+				break
+			}
+		}
+		if crowded {
+			continue
+		}
+		cues[i].pos.lineSet, cues[i].pos.lineAlign, cues[i].pos.linePct = true, "end", vttBottomPct
+	}
+}
+
+// sharesTheBottom reports whether a cue competes for the bottom of the frame:
+// either it has no placement of its own, or it was placed in the lower part where
+// a lifted dialogue line would land on it.
+func sharesTheBottom(p cuePos) bool {
+	if !p.lineSet {
+		return true
+	}
+	return p.lineAlign == "end" && p.linePct > 70
+}
+
+// cueSeconds reads a SubRip or WebVTT timestamp, either separator.
+func cueSeconds(s string) (float64, bool) {
+	m := assClock.FindStringSubmatch(strings.TrimSpace(s))
+	if m == nil {
+		return 0, false
+	}
+	h, _ := strconv.Atoi(m[1])
+	mi, _ := strconv.Atoi(m[2])
+	sec, _ := strconv.Atoi(m[3])
+	ms := m[4]
+	for len(ms) < 3 {
+		ms += "0"
+	}
+	milli, _ := strconv.Atoi(ms[:3])
+	return float64(h*3600+mi*60+sec) + float64(milli)/1000, true
+}
+
+var assClock = regexp.MustCompile(`^(\d+):(\d{1,2}):(\d{1,2})[.,](\d{1,3})$`)
+
 // assembleVTT puts the document together with its STYLE block, which WebVTT only
 // allows before the first cue.
-func assembleVTT(styles *vttStyles, cues string) []byte {
+func assembleVTT(styles *vttStyles, cues []vttCue) []byte {
 	var b strings.Builder
 	b.WriteString("WEBVTT\n\n")
 	if len(styles.decls) > 0 {
@@ -817,7 +900,13 @@ func assembleVTT(styles *vttStyles, cues string) []byte {
 		}
 		b.WriteString("\n")
 	}
-	b.WriteString(cues)
+	for _, c := range cues {
+		head := c.head
+		if s := c.pos.settings(); s != "" {
+			head += " " + s
+		}
+		fmt.Fprintf(&b, "%s\n%s\n\n", head, c.body)
+	}
 	return []byte(b.String())
 }
 
@@ -870,7 +959,7 @@ func SRTToVTT(data []byte) []byte {
 	doc := newASSDoc()
 	styles := &vttStyles{}
 	base := assStyle{align: 2}
-	var cues strings.Builder
+	var cues []vttCue
 	for _, block := range splitBlocks(src) {
 		lines := strings.Split(block, "\n")
 		at := -1
@@ -889,12 +978,15 @@ func SRTToVTT(data []byte) []byte {
 		if !hasText(text) {
 			continue
 		}
-		if s := pos.settings(); s != "" {
-			head += " " + s
+		c := vttCue{head: head, body: text, pos: pos}
+		if parts := strings.SplitN(head, "-->", 2); len(parts) == 2 {
+			c.t0, _ = cueSeconds(parts[0])
+			c.t1, _ = cueSeconds(parts[1])
 		}
-		fmt.Fprintf(&cues, "%s\n%s\n\n", head, text)
+		cues = append(cues, c)
 	}
-	return assembleVTT(styles, cues.String())
+	liftLoneCues(cues)
+	return assembleVTT(styles, cues)
 }
 
 // ASSToVTT converts SSA/ASS bytes to WebVTT, carrying across what WebVTT can
@@ -905,7 +997,7 @@ func SRTToVTT(data []byte) []byte {
 func ASSToVTT(data []byte) []byte {
 	doc, events := parseASS(data)
 	styles := &vttStyles{}
-	var cues strings.Builder
+	cues := make([]vttCue, 0, len(events))
 	for _, ev := range events {
 		base := doc.style(ev.style)
 		if ev.marginL > 0 {
@@ -922,13 +1014,14 @@ func ASSToVTT(data []byte) []byte {
 		if !hasText(text) {
 			continue
 		}
-		head := assTimestamp(ev.start) + " --> " + assTimestamp(ev.end)
-		if s := pos.settings(); s != "" {
-			head += " " + s
-		}
-		fmt.Fprintf(&cues, "%s\n%s\n\n", head, text)
+		begin, end := assTimestamp(ev.start), assTimestamp(ev.end)
+		c := vttCue{head: begin + " --> " + end, body: text, pos: pos}
+		c.t0, _ = cueSeconds(begin)
+		c.t1, _ = cueSeconds(end)
+		cues = append(cues, c)
 	}
-	return assembleVTT(styles, cues.String())
+	liftLoneCues(cues)
+	return assembleVTT(styles, cues)
 }
 
 // ToVTT converts known subtitle bytes to WebVTT by format name.
