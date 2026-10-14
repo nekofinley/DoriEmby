@@ -44,6 +44,8 @@ const volume = ref(Number(localStorage.getItem('dm:volume') ?? 1))
 const rate = ref(Number(localStorage.getItem('dm:rate') ?? 1))
 const controlsVisible = ref(true)
 const panelOpen = ref(false)
+/** Which face the drawer shows: the subtitles, or everything else. */
+const panelMode = ref('settings')
 const menuOpen = ref(false)
 // locked: in fullscreen, every control but the lock button stops answering taps,
 // so a hand moving across the screen cannot pause, seek or leave by accident.
@@ -279,11 +281,21 @@ const overview = computed(() => {
   return (it?.type === 'episode' ? it.overview : '') || sh?.overview || it?.overview || ''
 })
 
-/** The gear and the panel button: a drawer in the theater, a tab in a page. */
-function togglePanel() {
+/** The drawer has two faces and one body, the subtitle button opening the tracks
+ * and the gear opening the rest. Both used to open the same list, so asking for
+ * the subtitles in fullscreen produced the whole settings sheet — which is the
+ * thing this separates. On a watch page the two are still one tab, in order. */
+function openPanel(mode) {
   if (isStacked.value && !fsActive.value) { tab.value = 'settings'; menuOpen.value = false; return }
-  panelOpen.value = !panelOpen.value
+  if (panelOpen.value && panelMode.value === mode) { panelOpen.value = false; return }
+  panelMode.value = mode
+  menuOpen.value = false
+  panelOpen.value = true
 }
+/** 'all' where the panel is a watch-page tab, otherwise the face that was asked for. */
+const drawerMode = computed(() => (isStacked.value && !fsActive.value ? 'all' : panelMode.value))
+/** The gear: the settings face. */
+function togglePanel() { openPanel('settings') }
 function toggleMenu() {
   if (isStacked.value && !fsActive.value) { tab.value = 'settings'; return }
   menuOpen.value = !menuOpen.value
@@ -1437,7 +1449,7 @@ onBeforeUnmount(() => {
               <button
                 v-if="!nativeSubs && (play?.subtitles || []).length" class="icon-btn"
                 :class="{ on: activeSub }" aria-label="字幕" title="字幕"
-                @click="togglePanel"
+                @click="openPanel('subs')"
               >
                 <AppIcon name="subtitles" :size="19" />
               </button>
@@ -1594,13 +1606,16 @@ onBeforeUnmount(() => {
           <Transition :name="isStacked ? 'none' : 'slide'">
             <aside v-if="panelShown" class="panel glass">
               <div class="pn-head">
-                <div class="card-title mb-0"><AppIcon name="layers" :size="16" /> 播放设置</div>
+                <div class="card-title mb-0">
+                  <AppIcon :name="drawerMode === 'subs' ? 'subtitles' : 'layers'" :size="16" />
+                  {{ drawerMode === 'subs' ? '字幕' : '播放设置' }}
+                </div>
                 <button v-if="!isStacked" class="icon-btn" aria-label="关闭" @click="panelOpen = false">
                   <AppIcon name="close" :size="17" />
                 </button>
               </div>
 
-              <div v-if="(play?.versions || []).length" class="pn-group">
+              <div v-if="drawerMode !== 'subs' && (play?.versions || []).length" class="pn-group">
                 <div class="label">版本</div>
                 <div class="pn-chips">
                   <button
@@ -1610,7 +1625,7 @@ onBeforeUnmount(() => {
                 </div>
               </div>
 
-              <div v-if="(play?.audio_tracks || []).length > 1" class="pn-group">
+              <div v-if="drawerMode !== 'subs' && (play?.audio_tracks || []).length > 1" class="pn-group">
                 <div class="label">音轨</div>
                 <div class="pn-chips">
                   <button
@@ -1623,7 +1638,7 @@ onBeforeUnmount(() => {
                 </div>
               </div>
 
-              <div v-if="!nativeSubs && (play?.subtitles || []).length" class="pn-group">
+              <div v-if="drawerMode !== 'settings' && !nativeSubs && (play?.subtitles || []).length" class="pn-group">
                 <div class="label">字幕</div>
                 <div class="pn-chips">
                   <button class="chip" :class="{ on: activeSub === null }" @click="selectSub(null)">关闭</button>
@@ -1640,7 +1655,7 @@ onBeforeUnmount(() => {
                    a burn — the faithful rendering, and the only one iOS shows.
                    This group appears on iOS too, where the text tracks themselves
                    are left to the native player. -->
-              <div v-if="burnables.length" class="pn-group">
+              <div v-if="drawerMode !== 'settings' && burnables.length" class="pn-group">
                 <div class="label">忠实排版(烧录)</div>
                 <div class="pn-chips">
                   <button
@@ -1651,14 +1666,14 @@ onBeforeUnmount(() => {
                 </div>
               </div>
 
-              <div class="pn-group">
+              <div v-if="drawerMode !== 'subs'" class="pn-group">
                 <div class="label">播放速度</div>
                 <div class="pn-rates">
                   <button v-for="r in rates" :key="r" class="chip sm" :class="{ on: rate === r }" @click="setRate(r)">{{ r }}×</button>
                 </div>
               </div>
 
-              <div class="pn-group">
+              <div v-if="drawerMode !== 'subs'" class="pn-group">
                 <div class="label">播放模式</div>
                 <div class="pn-chips">
                   <button
@@ -1669,7 +1684,7 @@ onBeforeUnmount(() => {
                 </div>
               </div>
 
-              <div class="pn-group">
+              <div v-if="drawerMode !== 'subs'" class="pn-group">
                 <div class="label">画面</div>
                 <div class="pn-chips">
                   <button class="chip" :class="{ on: pipActive }" @click="togglePip()">
