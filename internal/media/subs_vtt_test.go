@@ -36,8 +36,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 			// the bottom edge, where the theatre's control bar sits.
 			name:    "a lone line is lifted off the bottom edge",
 			text:    `Dialogue: 0,0:00:01.00,0:00:03.00,Dialogue,,0,0,0,,你好,世界`,
-			wantCue: "line:82%,end",
-			wantIn:  []string{"00:00:01.000 --> 00:00:03.000 line:82%,end\n你好,世界"},
+			wantCue: "line:88%,end",
+			wantIn:  []string{"00:00:01.000 --> 00:00:03.000 line:88%,end\n你好,世界"},
 		},
 		{
 			// The style's own MarginV (20px of 1080) is where ASS would put it.
@@ -61,7 +61,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 			name: "italics, bold and colour survive",
 			text: `Dialogue: 0,0:00:01.00,0:00:03.00,Dialogue,,0,0,0,,{\i1}italics{\i0} and {\b1}bold{\b0} and {\c&H0000FF&}red`,
 			// A lone line, so it is lifted; the point here is the markup.
-			wantCue: "line:82%,end",
+			wantCue: "line:88%,end",
 			wantIn:  []string{"<i>italics</i>", "<b>bold</b>", "<c.dm-cff0000>red</c>", "::cue(.dm-cff0000) { color: #ff0000 }"},
 		},
 		{
@@ -69,7 +69,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 			// rendering them is worse than rendering nothing.
 			name:    "a vector drawing is dropped, not shown",
 			text:    `Dialogue: 0,0:00:01.00,0:00:03.00,Dialogue,,0,0,0,,{\p1}m 0 0 l 100 0 100 100 0 100{\p0}visible`,
-			wantCue: "line:82%,end",
+			wantCue: "line:88%,end",
 			wantIn:  []string{"visible"},
 			wantNotIn: []string{
 				"m 0 0", "l 100 0", "{\\p1}",
@@ -83,13 +83,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 		{
 			name:    "text that looks like markup is escaped",
 			text:    `Dialogue: 0,0:00:01.00,0:00:03.00,Dialogue,,0,0,0,,Fish & chips <3`,
-			wantCue: "line:82%,end",
+			wantCue: "line:88%,end",
 			wantIn:  []string{"Fish &amp; chips &lt;3"},
 		},
 		{
 			name:    "hard breaks become real lines, karaoke keeps its syllables",
 			text:    `Dialogue: 0,0:00:01.00,0:00:03.00,Dialogue,,0,0,0,,{\k20}き{\k20}ら{\k20}き\Nsecond line`,
-			wantCue: "line:82%,end",
+			wantCue: "line:88%,end",
 			wantIn:  []string{"きらき\nsecond line"},
 		},
 	}
@@ -123,10 +123,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 	}
 }
 
-// Simultaneous lines must keep the browser's collision handling. A cue with an
-// explicit line is placed there and nothing moves it out of the way, so pinning
-// every cue would stack two speakers on top of each other.
-func TestASSToVTTLeavesCrowdedLinesToThePlayer(t *testing.T) {
+// Simultaneous lines are stacked here, one slot per display line, the way the
+// browser would have: the alternative — leaving them to the browser — puts the
+// bottom-most line on the last row of the picture, under the theatre's controls.
+func TestASSToVTTStacksOverlappingLines(t *testing.T) {
 	src := `[Script Info]
 PlayResX: 1920
 PlayResY: 1080
@@ -151,21 +151,71 @@ Dialogue: 0,0:00:20.00,0:00:22.00,Dialogue,,0,0,0,,很久以后的一句
 			settings = append(settings, strings.TrimSpace(strings.SplitN(line, "-->", 2)[1]))
 		}
 	}
-	// The two speakers overlap, so neither may be pinned; the sign is placed by
-	// its own anchor, and the line twenty seconds later is alone and is lifted.
 	if len(settings) != 4 {
 		t.Fatalf("expected four cues, got %d.\n got: %s", len(settings), got)
 	}
-	for i, s := range settings[:2] {
-		if strings.Contains(s, "line:") {
-			t.Errorf("cue %d overlaps another and must not be pinned, got %q", i, s)
+	// The first speaker takes the bottom slot, the second goes one line above it,
+	// the sign keeps the anchor the file gave it, and the line twenty seconds
+	// later — alone in its moment — takes the bottom slot again.
+	// A slot is 7.25% and the value is rendered to one decimal, so the second
+	// slot reads 80.8 rather than 80.75 — half a pixel at 1080p.
+	want := []string{"line:88%,end", "line:80.8%,end", "line:1.9%,start", "line:88%,end"}
+	for i, w := range want {
+		if !strings.Contains(settings[i], w) {
+			t.Errorf("cue %d should carry %q, got %q", i, w, settings[i])
 		}
 	}
-	if !strings.Contains(settings[2], "line:") {
-		t.Errorf("the sign's own anchor must be kept, got %q", settings[2])
+}
+
+// A cue that wraps to two lines occupies two slots, so the cue overlapping it has
+// to start two lines higher — the same accounting the browser does.
+// A cue's box grows downwards from the line it is given, so what a wrapped cue
+// costs depends on which side of it the other cue is on: above it, the other cue
+// only has to clear its top edge, while below it, the wrapped cue has to fit its
+// whole height. Both directions are pinned here.
+func TestASSToVTTRoomsAWrappedLineBothWays(t *testing.T) {
+	head := `[Script Info]
+PlayResX: 1920
+PlayResY: 1080
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Dialogue,Arial,48,&H00FFFFFF,0,0,0,0,100,100,0,0,1,2,1,2,60,60,30,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+`
+	settings := func(src string) []string {
+		got := string(ASSToVTT([]byte(head + src)))
+		var out []string
+		for _, line := range strings.Split(got, "\n") {
+			if strings.Contains(line, "-->") {
+				out = append(out, strings.TrimSpace(strings.SplitN(line, "-->", 2)[1]))
+			}
+		}
+		return out
 	}
-	if !strings.Contains(settings[3], "line:82%,end") {
-		t.Errorf("a lone line later in the file must still be lifted, got %q", settings[3])
+
+	// The wrapped cue is underneath: the cue added later goes one line above its
+	// top edge and no further, because the wrapped cue's second line is below it.
+	under := settings("Dialogue: 0,0:00:01.00,0:00:05.00,Dialogue,,0,0,0,,上面一行\\N下面一行\n" +
+		"Dialogue: 0,0:00:02.00,0:00:06.00,Dialogue,,0,0,0,,另一句\n")
+	if len(under) != 2 {
+		t.Fatalf("expected two cues, got %d", len(under))
+	}
+	if !strings.Contains(under[0], "line:88%,end") || !strings.Contains(under[1], "line:80.8%,end") {
+		t.Errorf("a cue above a wrapped one needs one line of room, got %q then %q", under[0], under[1])
+	}
+
+	// The wrapped cue is on top: it has to fit both of its lines above the other
+	// cue, which costs two.
+	over := settings("Dialogue: 0,0:00:01.00,0:00:05.00,Dialogue,,0,0,0,,另一句\n" +
+		"Dialogue: 0,0:00:02.00,0:00:06.00,Dialogue,,0,0,0,,上面一行\\N下面一行\n")
+	if len(over) != 2 {
+		t.Fatalf("expected two cues, got %d", len(over))
+	}
+	if !strings.Contains(over[0], "line:88%,end") || !strings.Contains(over[1], "line:73.5%,end") {
+		t.Errorf("a wrapped cue needs both of its lines above the one below, got %q then %q", over[0], over[1])
 	}
 }
 

@@ -15,6 +15,7 @@ const error = ref('')
 const fatal = ref('')
 const videoEl = ref(null)
 const stageEl = ref(null)
+const playerEl = ref(null)
 const watchEl = ref(null)
 const hls = ref(null)
 const currentAudio = ref(0)
@@ -1087,7 +1088,12 @@ function setRate(r) {
 }
 
 async function toggleFullscreen() {
-  const el = stageEl.value
+  // The whole player goes fullscreen, not just the picture. Fullscreen is a top
+  // layer that only renders the element's own subtree, so anything outside it —
+  // the settings drawer — is not on screen and cannot be touched: a drag on it
+  // landed on the controls underneath instead, which is how a swipe down the
+  // settings list ended up on the volume slider.
+  const el = playerEl.value ?? stageEl.value
   const v = videoEl.value
   if (!document.fullscreenElement) {
     if (el?.requestFullscreen) await el.requestFullscreen().catch(() => {})
@@ -1143,6 +1149,21 @@ function onKey(e) {
   showControls()
 }
 
+/* A drag over the picture in fullscreen is either ours or the browser's.
+   Ours is tap/double-tap and the seek bar's own pointer handling; the browser's is
+   its video-gesture layer, which some Android browsers run over fullscreen video:
+   a horizontal drag seeks, a vertical one on the right-hand side changes the
+   volume, and on the left it changes the *brightness* — which is the giveaway,
+   since no page can touch screen brightness. Consuming the drag keeps that layer
+   from acting on a locked player, and keeps its zones from claiming touches that
+   belong to a popup. A popup is left alone so it can still scroll itself. */
+function consumeFullscreenDrag(e) {
+  if (!fsActive.value) return
+  const t = e.target
+  if (t instanceof Element && t.closest('.panel, .ctl-menu')) return
+  if (e.cancelable) e.preventDefault()
+}
+
 function goBack() {
   saveProgress()
   router.back()
@@ -1157,6 +1178,8 @@ onMounted(() => {
   window.addEventListener('orientationchange', onViewport)
   document.addEventListener('fullscreenchange', onFsChange)
   document.addEventListener('pointermove', showControls)
+  // Not passive: the whole point is being able to cancel the gesture.
+  document.addEventListener('touchmove', consumeFullscreenDrag, { passive: false })
   videoEl.value?.addEventListener('enterpictureinpicture', onPipChange)
   videoEl.value?.addEventListener('leavepictureinpicture', onPipChange)
 })
@@ -1176,13 +1199,14 @@ onBeforeUnmount(() => {
   window.removeEventListener('orientationchange', onViewport)
   document.removeEventListener('fullscreenchange', onFsChange)
   document.removeEventListener('pointermove', showControls)
+  document.removeEventListener('touchmove', consumeFullscreenDrag)
   window.removeEventListener('pointermove', moveScrub)
   window.removeEventListener('pointerup', endScrub)
 })
 </script>
 
 <template>
-  <div class="player" :class="[layoutClass, { fs: fsActive, locked, 'hide-ui': chromeHidden }]">
+  <div ref="playerEl" class="player" :class="[layoutClass, { fs: fsActive, locked, 'hide-ui': chromeHidden }]">
     <div ref="watchEl" class="watch" :class="{ 'no-side': layout === 'tablet' && !episodes.length }">
       <div class="wmain">
         <!-- ================= the picture ================= -->
@@ -1261,7 +1285,7 @@ onBeforeUnmount(() => {
                  page shows its progress under the picture instead (see .wi-loading
                  below), where it cannot cover the picture or the play button. -->
             <Transition name="fade">
-              <div v-if="!isStacked && isLoading && !error && !fatal" class="center-state">
+              <div v-if="theaterChrome && isLoading && !error && !fatal" class="center-state">
                 <span class="ring" />
                 <div class="cs-text">{{ loadingText }}</div>
                 <div v-if="streamPct > 0" class="cs-bar" role="progressbar" :aria-valuenow="Math.round(streamPct)" aria-valuemin="0" aria-valuemax="100">
@@ -1419,7 +1443,7 @@ onBeforeUnmount(() => {
           <template v-if="isStacked">
             <!-- Preparing, as a long thin bar under the picture: centred on a 16:9
                  box it would sit exactly where the play button goes. -->
-            <div v-if="isLoading && !error && !fatal" class="wi-loading">
+            <div v-if="!theaterChrome && isLoading && !error && !fatal" class="wi-loading">
               <div
                 class="wl-bar" :class="{ live: streamPct > 0 }" role="progressbar"
                 :aria-valuenow="Math.round(streamPct)" aria-valuemin="0" aria-valuemax="100"
@@ -1794,9 +1818,14 @@ video { width: 100%; height: 100%; object-fit: contain; background: #000; displa
 .hide-ui { cursor: none; }
 
 /* Locked: the picture plays on, the chrome is gone, and only the lock button
-   still takes a tap. */
+   still takes a tap. The hidden chrome is not hit-testable, and neither the
+   picture nor the page it sits in answers a pan or a zoom — a lock that leaves
+   the browser's own gesture machinery running is not a lock. */
 .locked .controls { opacity: 0; transform: translateY(12px); pointer-events: none; }
 .locked .top-bar { opacity: 0; transform: translateY(-12px); pointer-events: none; }
+.locked .panel, .locked .ctl-menu { display: none; }
+.locked { touch-action: none; }
+.locked video { touch-action: none; }
 .locked .hints { opacity: 0; }
 .locked { cursor: none; }
 
@@ -1928,6 +1957,10 @@ video { width: 100%; height: 100%; object-fit: contain; background: #000; displa
   flex-direction: column;
   gap: 18px;
   overflow-y: auto;
+  /* A drag over the panel scrolls the panel and nothing else: no scroll chaining
+     onto the page behind it, and no gesture machinery engaging on the picture. */
+  overscroll-behavior: contain;
+  touch-action: pan-y;
   z-index: 7;
 }
 .pn-head { display: flex; align-items: center; justify-content: space-between; }
@@ -1990,8 +2023,13 @@ video { width: 100%; height: 100%; object-fit: contain; background: #000; displa
 .lay-tablet .winfo { display: block; padding: 18px 20px calc(34px + env(safe-area-inset-bottom)); }
 .lay-tablet :deep(.toast-host) { bottom: calc(22px + env(safe-area-inset-bottom)); }
 
-/* The page's 设置 tab: the drawer's groups, flowed into the page instead. */
-.lay-phone .panel, .lay-tablet .panel {
+/* The page's 设置 tab: the drawer's groups, flowed into the page instead.
+   Not in fullscreen, where there is no page to flow them into: there the panel is
+   the right-hand drawer again. That is not only cosmetic — as a static block its
+   rect sat underneath the absolutely positioned control bar, so the picture's own
+   controls won the hit test where they overlapped: a drag down the settings list
+   landed on the volume slider, and a drag across it on the seek bar. */
+.lay-phone:not(.fs) .panel, .lay-tablet:not(.fs) .panel {
   position: static;
   inset: auto;
   width: auto;
@@ -2115,7 +2153,26 @@ video { width: 100%; height: 100%; object-fit: contain; background: #000; displa
 
 /* ============================ fullscreen ================================= */
 /* The stage is the screen again, whatever page layout it came from. */
-.player.fs .stage { display: block; max-width: none; margin: 0; }
+/* The stage fills the screen in fullscreen, whatever page layout it came from: the
+   chain becomes a column that fills and stops scrolling, and the page's own
+   furniture steps aside. All of this used to happen by itself, because the stage was
+   the fullscreen element and everything else was outside the top layer — which is
+   also exactly why the settings drawer could not be touched there. */
+.player.fs .watch, .player.fs .wmain {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+.player.fs .stage { display: block; flex: 1; min-height: 0; max-width: none; margin: 0; overflow: hidden; }
+/* The watch page's info block is a real box with padding on a small screen, and
+   hidden children still leave its padding behind — 44px of it, which is exactly
+   what stopped the stage from filling the screen. Contents means the settings
+   drawer inside it keeps working while the block itself takes no room. */
+.player.fs .winfo { display: contents; padding: 0; }
+.player.fs .wi-topline, .player.fs .wi-title, .player.fs .wi-meta,
+.player.fs .wi-actions, .player.fs .wi-tabs, .player.fs .wi-eps,
+.player.fs .wi-about, .player.fs .wi-facts, .player.fs .wside { display: none; }
 .player.fs .frame { position: absolute; inset: 0; width: auto; aspect-ratio: auto; }
 .player.fs .controls {
   position: absolute;

@@ -1060,6 +1060,13 @@ select option { background: var(--bg-2); color: var(--text-1); }
   .card { padding: var(--sp-4); border-radius: var(--r-m); }
 }
 
+/* A drag that nothing means to handle must not turn into the browser's own
+   gestures: on a phone a downward drag over the picture is pull-to-refresh, which
+   reloads the page and resumes playback from the last saved position — a "seek"
+   nobody asked for. The player handles its own gestures and consumes what it does
+   not use, so the page never needs to move. */
+html, body { overscroll-behavior: none; }
+
 /* ------------------------------------------------------------------ subtitles */
 /* WebVTT cues are drawn by the browser, and its default is white text in a black
    box — a block of a subtitle sitting on top of the picture. Draw the text with an

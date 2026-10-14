@@ -811,57 +811,127 @@ type vttCue struct {
 	pos  cuePos
 }
 
-// vttBottomPct is where a lone cue sits: a little above the bottom edge rather
-// than against it. The browser's own bottom placement puts text on the last row
-// of the picture, which in the theatre is underneath the control bar.
+// vttBottomPct is where the bottom-most cue sits: a little above the bottom edge
+// rather than against it. The browser's own bottom placement puts text on the last
+// row of the picture, which in the theatre is underneath the control bar.
 //
 // Note that Chrome ignores the line-alignment component of a cue setting, so
-// "line:82%,end" is placed as "the top of the box at 82%" there. The value is
-// chosen for that reading: the text has to end above the control bar, which
-// covers roughly the last tenth of the picture — and the bar is a fixed height,
-// so on a short stage it covers a larger share, which is what the value allows for.
-const vttBottomPct = 82.0
+// "line:88%,end" is placed as "the top of the box at 88%" there. The value is
+// chosen for that reading.
+const vttBottomPct = 88.0
 
-// liftLoneCues raises the cues that share their moment with nothing else.
+// vttLinePct is one line of cue text as a share of the picture's height. It is
+// measured, not guessed: three stacked cues in an 800px-tall picture sit 58px
+// apart (7.25%), and the same three in a 400px-tall picture sit 29px apart — so
+// the advance follows the picture, not the window, which is what makes a
+// percentage usable in every layout.
+const vttLinePct = 7.25
+
+// vttOverlapTol is how much two cue *boxes* may overlap without their text
+// touching. Also measured: the glyphs start about 1.6% below the box's top edge
+// and are 4.5% tall, so a box overlap under that figure cannot reach the ink — and
+// without the slack, a sign the file pinned at, say, 81% would shove the dialogue
+// two lines up the frame for the sake of eight pixels of empty box.
+const vttOverlapTol = 1.5
+
+// stackBottomCues gives every cue that has no placement of its own a line, and
+// stacks them the way the browser would have.
 //
-// A cue with a line of its own is placed there and nothing moves it out of the
-// way, so pinning every cue would stack simultaneous dialogue on top of itself
-// (three lines at line:90%,end render as one). Leaving every cue alone keeps the
-// browser's collision handling, but leaves ordinary subtitles on the bottom edge.
-// So: lift the cues that are alone, and leave the crowded ones to the browser.
-// Subtitle files are timed sequentially almost everywhere, so that is nearly all
-// of them; a sign with an explicit position is not a competitor, since it is not
-// sitting where the dialogue goes.
-func liftLoneCues(cues []vttCue) {
+// Neither obvious answer works. Leaving the placement to the player puts the
+// bottom-most line on the last row of the picture, under the theatre's control
+// bar; pinning every cue to one line is worse, because a cue with a line of its
+// own is placed there and nothing moves it out of the way, so simultaneous lines
+// render on top of each other (three cues at one line: one visible). What the
+// browser does for free is avoid collisions, and that is what this does — in time
+// order, each cue goes one slot above everything it overlaps.
+func stackBottomCues(cues []vttCue) {
+	lines := make([]int, len(cues))
+	for i := range cues {
+		lines[i] = cueLines(cues[i].body)
+	}
+	order := make([]int, 0, len(cues))
+	for i := range cues {
+		order = append(order, i)
+	}
+	sort.SliceStable(order, func(a, b int) bool { return cues[order[a]].t0 < cues[order[b]].t0 })
+
+	rank := make([]int, len(cues))
+	for at, i := range order {
+		rank[i] = at
+	}
+	// top is the top edge of a cue sitting in slot k, which is where Chrome puts a
+	// cue given an explicit line (it ignores the alignment component).
+	top := func(k int) float64 { return vttBottomPct - float64(k)*vttLinePct }
+
+	slot := make([]int, len(cues))
+	for _, i := range order {
+		if cues[i].pos.lineSet {
+			continue // placed by the file: not ours to move
+		}
+		// The lowest slot whose span is clear of everything already there. Walking
+		// up rather than adding up the blockers' heights, because a cue the file
+		// pinned low in the frame sits between slots and has to push the stack clear
+		// of itself, not by a whole number of lines.
+		k := 0
+		for ; k < 12; k++ {
+			lo := top(k)
+			hi := lo + float64(lines[i])*vttLinePct
+			if hi <= 0 {
+				break // the stack has run off the top of the picture
+			}
+			clash := false
+			for _, j := range order {
+				if j == i || !cueOverlaps(cues[i], cues[j]) {
+					continue
+				}
+				var oLo float64
+				if cues[j].pos.lineSet {
+					oLo = cues[j].pos.linePct
+				} else {
+					if rank[j] > rank[i] {
+						continue // later in time: it stacks above this one, not below
+					}
+					oLo = top(slot[j])
+				}
+				oHi := oLo + float64(lines[j])*vttLinePct
+				if oLo < hi-vttOverlapTol && lo < oHi-vttOverlapTol {
+					clash = true
+					break
+				}
+			}
+			if !clash {
+				break
+			}
+		}
+		slot[i] = k
+	}
 	for i := range cues {
 		if cues[i].pos.lineSet {
 			continue
 		}
-		crowded := false
-		for j := range cues {
-			if j == i || !sharesTheBottom(cues[j].pos) {
-				continue
-			}
-			if cues[j].t0 < cues[i].t1 && cues[i].t0 < cues[j].t1 {
-				crowded = true
-				break
-			}
+		pct := vttBottomPct - float64(slot[i])*vttLinePct
+		if pct < 0 {
+			pct = 0
 		}
-		if crowded {
-			continue
-		}
-		cues[i].pos.lineSet, cues[i].pos.lineAlign, cues[i].pos.linePct = true, "end", vttBottomPct
+		cues[i].pos.lineSet, cues[i].pos.lineAlign, cues[i].pos.linePct = true, "end", pct
 	}
 }
 
-// sharesTheBottom reports whether a cue competes for the bottom of the frame:
-// either it has no placement of its own, or it was placed in the lower part where
-// a lifted dialogue line would land on it.
-func sharesTheBottom(p cuePos) bool {
-	if !p.lineSet {
-		return true
+// cueLines counts the display lines a cue occupies: a wrapped cue takes two slots
+// in the stack, which is what a line assigned here has to allow for.
+func cueLines(body string) int {
+	n := 1
+	for _, r := range body {
+		if r == '\n' {
+			n++
+		}
 	}
-	return p.lineAlign == "end" && p.linePct > 70
+	return n
+}
+
+// cueOverlaps reports whether two cues are on the picture at the same moment.
+func cueOverlaps(a, b vttCue) bool {
+	return b.t0 < a.t1 && a.t0 < b.t1
 }
 
 // cueSeconds reads a SubRip or WebVTT timestamp, either separator.
@@ -985,7 +1055,7 @@ func SRTToVTT(data []byte) []byte {
 		}
 		cues = append(cues, c)
 	}
-	liftLoneCues(cues)
+	stackBottomCues(cues)
 	return assembleVTT(styles, cues)
 }
 
@@ -1020,7 +1090,7 @@ func ASSToVTT(data []byte) []byte {
 		c.t1, _ = cueSeconds(end)
 		cues = append(cues, c)
 	}
-	liftLoneCues(cues)
+	stackBottomCues(cues)
 	return assembleVTT(styles, cues)
 }
 

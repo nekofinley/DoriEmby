@@ -147,6 +147,20 @@ func TestSessionLifecycle(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 
+	// ENDLIST lands when the last segment is written, which is not the same moment
+	// as the packager exiting — and CloseSessions only keeps output whose packager
+	// finished cleanly. Waiting for that (which is also what marks the session
+	// complete) is what makes this a test of the cache rather than a race with the
+	// process: the original flake failed whenever the poll won by a few
+	// milliseconds, and killed the output it was about to assert on.
+	deadline = time.Now().Add(30 * time.Second)
+	for !sess.finished() {
+		if time.Now().After(deadline) {
+			t.Fatal("the packager never finished")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
 	dir := sess.Dir()
 	e.CloseSessions()
 	// Completed output is cache: replaying the file must not package it again.
