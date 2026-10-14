@@ -271,7 +271,12 @@ const tabs = computed(() => {
   return out
 })
 const activeTab = computed(() => (tabs.value.includes(tab.value) ? tab.value : tabs.value[0]))
-const panelShown = computed(() => (isStacked.value && !fsActive.value ? activeTab.value === 'settings' : panelOpen.value))
+/** The panel as a block *in* the page — the 设置 tab — rather than a drawer over
+ * the picture. Only a watch page has somewhere to put it: fullscreen turns any
+ * layout back into a theater, where the panel is the right-hand drawer again, and
+ * there it needs the drawer's own manners (a close button, a slide in). */
+const panelInline = computed(() => isStacked.value && !fsActive.value)
+const panelShown = computed(() => (panelInline.value ? activeTab.value === 'settings' : panelOpen.value))
 
 const infoShow = computed(() => queue.value?.show || null)
 const infoGenres = computed(() => parseGenres(infoShow.value || meta.value))
@@ -286,18 +291,26 @@ const overview = computed(() => {
  * the subtitles in fullscreen produced the whole settings sheet — which is the
  * thing this separates. On a watch page the two are still one tab, in order. */
 function openPanel(mode) {
-  if (isStacked.value && !fsActive.value) { tab.value = 'settings'; menuOpen.value = false; return }
+  if (panelInline.value) { tab.value = 'settings'; menuOpen.value = false; return }
   if (panelOpen.value && panelMode.value === mode) { panelOpen.value = false; return }
   panelMode.value = mode
   menuOpen.value = false
   panelOpen.value = true
 }
 /** 'all' where the panel is a watch-page tab, otherwise the face that was asked for. */
-const drawerMode = computed(() => (isStacked.value && !fsActive.value ? 'all' : panelMode.value))
+const drawerMode = computed(() => (panelInline.value ? 'all' : panelMode.value))
 /** The gear: the settings face. */
 function togglePanel() { openPanel('settings') }
+/** Which surface the control bar's gear opens. A watch page has no room for a
+ * drawer over the picture, so it jumps to the 设置 tab; a touch screen gets the
+ * same right-hand drawer the subtitle button opens, because the small popup was
+ * only ever a shorter copy of that drawer — and on a phone it is the bad copy:
+ * no hover to read the mode hints with, a quarter of the screen to scroll, and a
+ * tap target competing with the picture behind it. A mouse keeps the popup, where
+ * it is the quick way to the speed and mode. */
 function toggleMenu() {
-  if (isStacked.value && !fsActive.value) { tab.value = 'settings'; return }
+  if (panelInline.value) { tab.value = 'settings'; return }
+  if (touchOnly) { openPanel('settings'); return }
   menuOpen.value = !menuOpen.value
 }
 function setMode(m) {
@@ -1455,7 +1468,10 @@ onBeforeUnmount(() => {
               </button>
 
               <div class="menu-wrap">
-                <button class="icon-btn" :class="{ on: menuOpen }" aria-label="播放速度与模式" title="设置" @click="toggleMenu">
+                <button
+                  class="icon-btn" :class="{ on: menuOpen || (panelOpen && panelMode === 'settings') }"
+                  :aria-label="touchOnly ? '设置' : '播放速度与模式'" title="设置" @click="toggleMenu"
+                >
                   <AppIcon name="settings" :size="19" />
                 </button>
                 <Transition name="fade">
@@ -1603,14 +1619,14 @@ onBeforeUnmount(() => {
           <!-- ============ side panel: tracks, mode, picture ============
                A right-hand drawer over the picture in the theater, the 设置 tab
                of the page in a watch page. -->
-          <Transition :name="isStacked ? 'none' : 'slide'">
+          <Transition :name="panelInline ? 'none' : 'slide'">
             <aside v-if="panelShown" class="panel glass">
               <div class="pn-head">
                 <div class="card-title mb-0">
                   <AppIcon :name="drawerMode === 'subs' ? 'subtitles' : 'layers'" :size="16" />
                   {{ drawerMode === 'subs' ? '字幕' : '播放设置' }}
                 </div>
-                <button v-if="!isStacked" class="icon-btn" aria-label="关闭" @click="panelOpen = false">
+                <button v-if="!panelInline" class="icon-btn" aria-label="关闭" @click="panelOpen = false">
                   <AppIcon name="close" :size="17" />
                 </button>
               </div>
