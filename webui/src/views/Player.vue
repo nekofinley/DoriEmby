@@ -27,6 +27,11 @@ const streamStart = ref(0)
 // manages them (its own menu and its own default) and the page must not attach
 // <track> elements as well, or both would render at once.
 const nativeSubs = computed(() => !!play.value?.native_subtitles)
+// Text tracks whose formatting WebVTT can only approximate (ASS typesetting:
+// signs placed to the pixel, karaoke, animation) can be burned into the picture
+// instead. On iOS that is the only way to see the original layout at all, since
+// the native player renders the approximation and nothing better.
+const burnables = computed(() => (play.value?.subtitles || []).filter((s) => s.burn_available))
 const duration = ref(0)
 const position = ref(0)
 const buffered = ref(0)
@@ -858,6 +863,23 @@ function showSub(sub) {
   return true
 }
 
+// Burning a text subtitle overlays it on the picture, which is the faithful
+// rendering for typesetting — and what an iOS player can actually show. It
+// re-encodes, so it is a deliberate choice; pressing it again turns it off.
+function burnSubtitle(sub) {
+  if (!sub) return
+  if (burnSub.value === sub.id) {
+    burnSub.value = 0
+    loadDecision(forceMode.value || undefined)
+    return
+  }
+  burnSub.value = sub.id
+  activeSub.value = null
+  panelOpen.value = false
+  toast.info(`烧录字幕:${sub.label || '字幕'}（需要重新编码,稍等）`)
+  loadDecision(forceMode.value || undefined)
+}
+
 function selectSub(sub) {
   // A track the server marked as burn-only is images (PGS/VobSub) or was chosen
   // for faithful typesetting: it can only be shown by re-encoding the video with
@@ -1519,6 +1541,22 @@ onBeforeUnmount(() => {
                     class="chip" :class="{ on: activeSub && activeSub.id === sub.id || (sub.burn && burnSub === sub.id) }"
                     @click="selectSub(sub)"
                   >{{ sub.label || sub.lang || '字幕' }}<span v-if="sub.burn" class="tiny"> · 烧录</span></button>
+                </div>
+              </div>
+
+              <!-- Typesetting (ASS) tracks: WebVTT can only approximate where a
+                   sign sits and what it looks like, so the original is offered as
+                   a burn — the faithful rendering, and the only one iOS shows.
+                   This group appears on iOS too, where the text tracks themselves
+                   are left to the native player. -->
+              <div v-if="burnables.length" class="pn-group">
+                <div class="label">忠实排版(烧录)</div>
+                <div class="pn-chips">
+                  <button
+                    v-for="sub in burnables" :key="'burn' + sub.id"
+                    class="chip" :class="{ on: burnSub === sub.id }"
+                    @click="burnSubtitle(sub)"
+                  >{{ sub.label || sub.lang || '字幕' }}<span class="tiny"> · 重新编码</span></button>
                 </div>
               </div>
 

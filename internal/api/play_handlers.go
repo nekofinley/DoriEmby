@@ -164,8 +164,13 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 		Default  bool   `json:"default"`
 		// Burn marks a track that cannot be served as text and has to be overlaid
 		// onto the video instead — the client offers it, knowing it re-encodes.
-		Burn bool   `json:"burn,omitempty"`
-		URL  string `json:"url,omitempty"`
+		Burn bool `json:"burn,omitempty"`
+		// BurnAvailable marks a text track whose formatting WebVTT can only
+		// approximate (ASS typesetting: signs placed to the pixel, karaoke,
+		// animation). Overlaying it is the faithful rendering, so the client may
+		// offer that as a choice — it is not a requirement, unlike Burn.
+		BurnAvailable bool   `json:"burn_available,omitempty"`
+		URL           string `json:"url,omitempty"`
 	}
 	subDTOs := make([]subDTO, 0, len(subs))
 	for _, sub := range subs {
@@ -186,7 +191,10 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 			Lang:     sub.Lang,
 			Embedded: sub.Embedded,
 			Default:  sub.ID == defSubID,
-			URL:      fmt.Sprintf("/api/subs/%d/%d.vtt%s", file.ID, sub.ID, signedQuery(s.Cfg.Secret, file.ID, sigTTL)),
+			// ASS/SSA is where typesetting lives, so those tracks can also be
+			// burned in when a viewer wants the original layout.
+			BurnAvailable: sub.Format == "ass" || sub.Format == "ssa",
+			URL:           fmt.Sprintf("/api/subs/%d/%d.vtt%s", file.ID, sub.ID, signedQuery(s.Cfg.Secret, file.ID, sigTTL)),
 		})
 	}
 

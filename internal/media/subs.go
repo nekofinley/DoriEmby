@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"doriyamedia/internal/models"
 )
@@ -66,24 +68,777 @@ func SubLabel(name string) string {
 	return strings.TrimSpace(base)
 }
 
-// SRTToVTT converts SubRip bytes to WebVTT.
-func SRTToVTT(data []byte) []byte {
-	s := strings.ReplaceAll(string(data), "\r\n", "\n")
-	s = strings.TrimPrefix(s, "\ufeff")
-	if !strings.HasPrefix(s, "WEBVTT") {
-		var b strings.Builder
-		b.WriteString("WEBVTT\n\n")
-		b.WriteString(s)
-		s = b.String()
+// ---------- WebVTT conversion ----------
+//
+// Everything this server serves as text subtitles passes through here. SubRip is
+// plain text with the odd <i>; SSA/ASS carries typesetting — positioning,
+// alignment, several styles, per-line colours, vector drawings. WebVTT can
+// express much more of that than this converter used to admit: a cue can say
+// which part of the picture it belongs to, and inline tags carry bold, italic,
+// underline and class-based colour. Discarding all of it is what pinned every
+// sign — a title card, a phone screen, a shop front — to the bottom centre,
+// stacked on top of the dialogue that belongs there.
+//
+// What deliberately does not survive: pixel-exact horizontal placement, because a
+// WebVTT cue box is placed by width and faking a pixel offset walks a sign off the
+// edge instead of onto it; font sizes, which would fight the player's own
+// scaling; and everything drawn or animated — \t, \clip, karaoke sweeps, \p
+// shapes and their coordinates — which has no WebVTT equivalent at all. Burning
+// the subtitle in remains the faithful path for those, and the player offers it
+// for ASS tracks.
+const (
+	assDefaultPlayX = 1920.0
+	assDefaultPlayY = 1080.0
+)
+
+// assStyle is the part of an ASS style WebVTT can carry, plus the alignment and
+// margins that decide where a line sits when the line itself does not say.
+type assStyle struct {
+	primary   string // "#rrggbb", empty when the style has no usable colour
+	bold      bool
+	italic    bool
+	underline bool
+	strikeout bool
+	boxed     bool // BorderStyle 3: the author asked for an opaque box
+	align     int  // ASS numpad alignment, 1-9
+	marginL   int
+	marginR   int
+	marginV   int
+}
+
+// assDoc is the header of an ASS file: the coordinate space its positions are in,
+// and the styles its dialogue lines name.
+type assDoc struct {
+	playX  float64
+	playY  float64
+	styles map[string]assStyle
+}
+
+type assEvent struct {
+	start, end string
+	style      string
+	text       string
+	marginL    int
+	marginR    int
+	marginV    int
+}
+
+func newASSDoc() *assDoc {
+	return &assDoc{playX: assDefaultPlayX, playY: assDefaultPlayY, styles: map[string]assStyle{}}
+}
+
+// style returns a style by name. An undefined name gets the ASS default — bottom
+// centre — rather than a zero value that would put the text nowhere.
+func (d *assDoc) style(name string) assStyle {
+	if st, ok := d.styles[strings.ToLower(strings.TrimSpace(name))]; ok {
+		return st
 	}
-	// cue timing: 00:00:01,000 --> 00:00:04,000  → comma to dot
-	lines := strings.Split(s, "\n")
-	for i, line := range lines {
-		if strings.Contains(line, "-->") {
-			lines[i] = strings.ReplaceAll(line, ",", ".")
+	return assStyle{align: 2}
+}
+
+func assFields(v string, n int) []string {
+	parts := strings.SplitN(v, ",", n)
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return parts
+}
+
+func assAtoi(v string) int {
+	n, err := strconv.Atoi(strings.Trim(strings.TrimSpace(v), "()"))
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// assBool reads an ASS boolean, where -1 means true and 0 means false.
+func assBool(v string) bool {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return false
+	}
+	if n, err := strconv.Atoi(v); err == nil {
+		return n != 0
+	}
+	return false
+}
+
+// assTagOn reads the argument of a toggle tag: \b. \b1 \b-1 \b700 are on, \b0 is
+// off. An argument we cannot read counts as on, which is what a bare tag means.
+func assTagOn(arg string) bool {
+	arg = strings.Trim(strings.TrimSpace(arg), "()")
+	if arg == "" {
+		return true
+	}
+	n, err := strconv.Atoi(arg)
+	if err != nil {
+		return true
+	}
+	return n != 0
+}
+
+// assColor turns an ASS colour into "#rrggbb". ASS stores it as &HAABBGGRR
+// (alpha first, then the bytes reversed), and some old files use decimal. An
+// unreadable value becomes empty, which leaves the text its inherited colour
+// rather than painting it black by accident.
+func assColor(v string) string {
+	s := strings.ToLower(strings.TrimSpace(v))
+	if s == "" {
+		return ""
+	}
+	s = strings.TrimPrefix(s, "&h")
+	s = strings.Trim(s, "&")
+	n, err := strconv.ParseUint(s, 16, 32)
+	if err != nil {
+		if n, err = strconv.ParseUint(strings.TrimSpace(v), 10, 32); err != nil {
+			return ""
 		}
 	}
-	return []byte(strings.Join(lines, "\n"))
+	return fmt.Sprintf("#%02x%02x%02x", n&0xff, (n>>8)&0xff, (n>>16)&0xff)
+}
+
+// parseASS reads what a conversion needs: the coordinate space, the styles, and
+// every dialogue line with its override tags still in the text.
+func parseASS(data []byte) (*assDoc, []assEvent) {
+	doc := newASSDoc()
+	var events []assEvent
+	section := ""
+	var styleFields, eventFields []string
+	src := strings.TrimPrefix(string(data), "\ufeff")
+	for _, line := range strings.Split(strings.ReplaceAll(src, "\r\n", "\n"), "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, ";") {
+			continue
+		}
+		if strings.HasPrefix(t, "[") && strings.HasSuffix(t, "]") {
+			section = strings.ToLower(strings.TrimSpace(t[1 : len(t)-1]))
+			continue
+		}
+		key, val := t, ""
+		if i := strings.Index(t, ":"); i >= 0 {
+			key, val = strings.TrimSpace(t[:i]), strings.TrimSpace(t[i+1:])
+		}
+		low := strings.ToLower(key)
+		switch section {
+		case "script info":
+			switch low {
+			case "playresx":
+				if n, err := strconv.ParseFloat(strings.TrimSpace(val), 64); err == nil && n > 0 {
+					doc.playX = n
+				}
+			case "playresy":
+				if n, err := strconv.ParseFloat(strings.TrimSpace(val), 64); err == nil && n > 0 {
+					doc.playY = n
+				}
+			}
+		case "v4+ styles", "v4++ styles", "v4 styles":
+			switch low {
+			case "format":
+				styleFields = assFields(val, -1)
+			case "style":
+				if len(styleFields) == 0 {
+					continue
+				}
+				parts := strings.SplitN(val, ",", len(styleFields))
+				if len(parts) < len(styleFields) {
+					continue
+				}
+				m := map[string]string{}
+				for i, f := range styleFields {
+					m[strings.ToLower(f)] = strings.TrimSpace(parts[i])
+				}
+				name := strings.ToLower(m["name"])
+				if name == "" {
+					continue
+				}
+				doc.styles[name] = assStyle{
+					primary:   assColor(m["primarycolour"]),
+					bold:      assBool(m["bold"]),
+					italic:    assBool(m["italic"]),
+					underline: assBool(m["underline"]),
+					strikeout: assBool(m["strikeout"]),
+					boxed:     assAtoi(m["borderstyle"]) == 3,
+					align:     assAtoi(m["alignment"]),
+					marginL:   assAtoi(m["marginl"]),
+					marginR:   assAtoi(m["marginr"]),
+					marginV:   assAtoi(m["marginv"]),
+				}
+			}
+		case "events":
+			switch low {
+			case "format":
+				eventFields = assFields(val, -1)
+			case "dialogue":
+				if len(eventFields) == 0 {
+					// No Format line: the documented order, whose last field is
+					// the only one that may contain commas.
+					eventFields = []string{"Layer", "Start", "End", "Style", "Name",
+						"MarginL", "MarginR", "MarginV", "Effect", "Text"}
+				}
+				parts := strings.SplitN(val, ",", len(eventFields))
+				if len(parts) < len(eventFields) {
+					continue
+				}
+				m := map[string]string{}
+				for i, f := range eventFields {
+					m[strings.ToLower(strings.TrimSpace(f))] = strings.TrimSpace(parts[i])
+				}
+				ev := assEvent{
+					start: m["start"], end: m["end"], style: m["style"], text: m["text"],
+					marginL: assAtoi(m["marginl"]), marginR: assAtoi(m["marginr"]),
+					marginV: assAtoi(m["marginv"]),
+				}
+				if ev.start == "" || ev.end == "" || strings.TrimSpace(ev.text) == "" {
+					continue
+				}
+				events = append(events, ev)
+			}
+		}
+	}
+	return doc, events
+}
+
+// vttStyles collects the STYLE block a document needs. WebVTT keeps colours and
+// decorations in classes rather than inline, so the renderer registers a class
+// the first time it uses one.
+type vttStyles struct {
+	decls map[string]string
+}
+
+func (s *vttStyles) add(name, decl string) string {
+	if s.decls == nil {
+		s.decls = map[string]string{}
+	}
+	s.decls[name] = decl
+	return name
+}
+
+// color registers a colour class. White is left alone: it is what WebVTT already
+// draws, and a class on every ordinary line of dialogue is pure noise.
+func (s *vttStyles) color(c string) string {
+	if c == "" || c == "#ffffff" {
+		return ""
+	}
+	return s.add("dm-c"+strings.TrimPrefix(c, "#"), "color: "+c)
+}
+
+func (s *vttStyles) strike() string {
+	return s.add("dm-so", "text-decoration: line-through")
+}
+
+// box is for a style that asked for an opaque box (BorderStyle 3). It is the one
+// place a background is wanted: the author drew one, so the text is unreadable
+// without it.
+func (s *vttStyles) box() string {
+	return s.add("dm-box", "background-color: rgba(0,0,0,.55)")
+}
+
+// cueState is the inline state of the text being rendered. WebVTT nests its tags,
+// so the renderer closes and reopens them whenever the state changes.
+type cueState struct {
+	bold, italic, underline, strikeout bool
+	color                              string
+	boxed                              bool
+}
+
+func (s cueState) tags(st *vttStyles) []string {
+	var tags []string
+	if s.bold {
+		tags = append(tags, "b")
+	}
+	if s.italic {
+		tags = append(tags, "i")
+	}
+	if s.underline {
+		tags = append(tags, "u")
+	}
+	if s.strikeout {
+		tags = append(tags, "c."+st.strike())
+	}
+	if s.boxed {
+		tags = append(tags, "c."+st.box())
+	}
+	if c := st.color(s.color); c != "" {
+		tags = append(tags, "c."+c)
+	}
+	return tags
+}
+
+func tagName(tag string) string {
+	if i := strings.IndexByte(tag, '.'); i >= 0 {
+		return tag[:i]
+	}
+	return tag
+}
+
+// retag closes the tags that are no longer wanted and opens the wanted ones. It
+// reopens everything on any change rather than diffing: legal nesting matters
+// more here than a handful of saved bytes.
+func retag(out *strings.Builder, open, want []string) []string {
+	if len(open) == len(want) {
+		same := true
+		for i := range open {
+			if open[i] != want[i] {
+				same = false
+				break
+			}
+		}
+		if same {
+			return open
+		}
+	}
+	for i := len(open) - 1; i >= 0; i-- {
+		out.WriteString("</" + tagName(open[i]) + ">")
+	}
+	for _, t := range want {
+		out.WriteString("<" + t + ">")
+	}
+	return want
+}
+
+// escapeCue escapes the characters WebVTT gives meaning to. Subtitle text is full
+// of "&" and "<3", and a raw one either breaks the cue or invents markup.
+func escapeCue(s string) string {
+	if !strings.ContainsAny(s, "&<>") {
+		return s
+	}
+	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(s)
+}
+
+// markupTags maps the tags subtitle files put in their own text onto the WebVTT
+// ones, so an SRT's <i> stays italic instead of being escaped into view.
+var markupTags = map[string]string{"i": "i", "b": "b", "u": "u", "em": "i", "strong": "b"}
+
+// renderMarkup rewrites the few tags that appear inside subtitle text and escapes
+// everything else. Unrecognised markup is shown rather than dropped: silently
+// swallowing it is how half a line goes missing.
+func renderMarkup(run string, styles *vttStyles) string {
+	var b strings.Builder
+	for i := 0; i < len(run); {
+		lt := strings.IndexByte(run[i:], '<')
+		if lt < 0 {
+			b.WriteString(escapeCue(run[i:]))
+			break
+		}
+		b.WriteString(escapeCue(run[i : i+lt]))
+		rest := run[i+lt:]
+		gt := strings.IndexByte(rest, '>')
+		if gt < 0 {
+			b.WriteString(escapeCue(rest))
+			break
+		}
+		if rep, ok := convertMarkupTag(rest[:gt+1], styles); ok {
+			b.WriteString(rep)
+		} else {
+			b.WriteString(escapeCue(rest[:gt+1]))
+		}
+		i += lt + gt + 1
+	}
+	return b.String()
+}
+
+func convertMarkupTag(tag string, styles *vttStyles) (string, bool) {
+	inner := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(tag, "<"), ">"))
+	if inner == "" {
+		return "", false
+	}
+	name := inner
+	if sp := strings.IndexAny(name, " \t"); sp >= 0 {
+		name = name[:sp]
+	}
+	closing := strings.HasPrefix(name, "/")
+	name = strings.ToLower(strings.TrimPrefix(name, "/"))
+	if closing {
+		if v, ok := markupTags[name]; ok {
+			return "</" + v + ">", true
+		}
+		if name == "font" {
+			return "</c>", true
+		}
+		return "", false
+	}
+	if v, ok := markupTags[name]; ok {
+		return "<" + v + ">", true
+	}
+	if name == "font" {
+		if c := colorFromFontTag(inner); c != "" {
+			if cls := styles.color(c); cls != "" {
+				return "<c." + cls + ">", true
+			}
+		}
+		return "", true // a font tag we cannot use: drop the tag, keep the text
+	}
+	return "", false
+}
+
+func colorFromFontTag(inner string) string {
+	low := strings.ToLower(inner)
+	i := strings.Index(low, "color")
+	if i < 0 {
+		return ""
+	}
+	eq := strings.Index(low[i:], "=")
+	if eq < 0 {
+		return ""
+	}
+	return normalizeColor(strings.Trim(strings.TrimSpace(inner[i+eq+1:]), "\"'"))
+}
+
+// normalizeColor accepts #rgb, #rrggbb and the colour names subtitle files use
+// most; anything else is left alone rather than guessed at.
+func normalizeColor(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	if strings.HasPrefix(v, "#") {
+		h := strings.TrimPrefix(v, "#")
+		switch len(h) {
+		case 3:
+			return "#" + string([]byte{h[0], h[0], h[1], h[1], h[2], h[2]})
+		case 6:
+			if _, err := strconv.ParseUint(h, 16, 32); err == nil {
+				return "#" + h
+			}
+		}
+		return ""
+	}
+	switch v {
+	case "white":
+		return "#ffffff"
+	case "yellow":
+		return "#ffff00"
+	case "red":
+		return "#ff0000"
+	case "cyan", "aqua":
+		return "#00ffff"
+	case "lime":
+		return "#00ff00"
+	case "blue":
+		return "#0000ff"
+	case "black":
+		return "#000000"
+	case "gray", "grey":
+		return "#808080"
+	}
+	return ""
+}
+
+// cuePos is what a cue says about where it belongs on the picture. Empty fields
+// mean "leave it to the player", which is what a plain bottom-centred line wants
+// — exactly the output the old conversion produced for every line.
+type cuePos struct {
+	linePct   float64
+	lineSet   bool
+	lineAlign string // start | center | end
+	textAlign string // start | center | end
+}
+
+func (p cuePos) settings() string {
+	var parts []string
+	if p.lineSet {
+		s := "line:" + pct(p.linePct)
+		if p.lineAlign != "" {
+			s += "," + p.lineAlign
+		}
+		parts = append(parts, s)
+	}
+	if p.textAlign != "" && p.textAlign != "center" {
+		parts = append(parts, "align:"+p.textAlign)
+	}
+	return strings.Join(parts, ",")
+}
+
+// pct renders a percentage with one decimal and no pointless ".0".
+func pct(v float64) string {
+	if v < 0 {
+		v = 0
+	}
+	if v > 100 {
+		v = 100
+	}
+	s := strconv.FormatFloat(math.Round(v*10)/10, 'f', 1, 64)
+	return strings.TrimSuffix(s, ".0") + "%"
+}
+
+// assAnchor splits an ASS numpad alignment into its horizontal and vertical
+// thirds: 1-3 bottom, 4-6 middle, 7-9 top, each row left/centre/right.
+func assAnchor(an int) (string, string) {
+	if an < 1 || an > 9 {
+		an = 2
+	}
+	h := [3]string{"start", "center", "end"}[(an-1)%3]
+	v := "bottom"
+	switch {
+	case an >= 7:
+		v = "top"
+	case an >= 4:
+		v = "middle"
+	}
+	return h, v
+}
+
+// lineAlignOf picks the line alignment that keeps the cue box's nearest edge on
+// the position: a sign near the top grows downwards, one near the bottom grows
+// upwards.
+func lineAlignOf(p float64) string {
+	switch {
+	case p < 33:
+		return "start"
+	case p > 66:
+		return "end"
+	default:
+		return "center"
+	}
+}
+
+// thirdOf reduces a horizontal position to the third of the frame it falls in.
+func thirdOf(p float64) string {
+	switch {
+	case p < 33:
+		return "start"
+	case p > 66:
+		return "end"
+	default:
+		return "center"
+	}
+}
+
+// cuePlacement decides where a cue sits. Vertical placement comes from \pos or
+// \move when the line has one, and otherwise from the style's own alignment and
+// top margin — that is what puts a title card at the top of the frame instead of
+// on the dialogue. Horizontal placement only distinguishes left, centre and
+// right, for the reason given at the top of this file.
+func cuePlacement(doc *assDoc, base assStyle, an int, hasPos bool, px, py float64, mv int) cuePos {
+	h, v := assAnchor(an)
+	if hasPos {
+		y := py / doc.playY * 100
+		return cuePos{lineSet: true, lineAlign: lineAlignOf(y), linePct: y, textAlign: thirdOf(px / doc.playX * 100)}
+	}
+	p := cuePos{textAlign: h}
+	switch v {
+	case "top":
+		if mv <= 0 {
+			mv = base.marginV
+		}
+		p.lineSet, p.lineAlign = true, "start"
+		p.linePct = float64(mv) / doc.playY * 100
+		if p.linePct < 1 {
+			// No usable margin: sit just inside the top edge, where ASS puts a
+			// top-aligned line.
+			p.linePct = 4
+		}
+	case "middle":
+		p.lineSet, p.lineAlign = true, "center"
+		p.linePct = 50
+	}
+	return p
+}
+
+// assRun is the state a single dialogue line passes through as its override tags
+// are read.
+type assRun struct {
+	st      cueState
+	an      int
+	hasPos  bool
+	px, py  float64
+	mv      int
+	drawing bool
+}
+
+func (r *assRun) apply(block string, base assStyle, doc *assDoc) {
+	for _, tag := range strings.Split(block, "\\") {
+		name, arg := assTagName(tag)
+		switch name {
+		case "":
+		case "r":
+			st, an := base, base.align
+			if arg = strings.Trim(strings.TrimSpace(arg), "()"); arg != "" {
+				if named := doc.style(arg); named.align != 0 || named.primary != "" || named.bold {
+					st, an = named, named.align
+				}
+			}
+			r.st = cueState{bold: st.bold, italic: st.italic, underline: st.underline,
+				strikeout: st.strikeout, color: st.primary, boxed: st.boxed}
+			r.an = an
+		case "b":
+			r.st.bold = assTagOn(arg)
+		case "i":
+			r.st.italic = assTagOn(arg)
+		case "u":
+			r.st.underline = assTagOn(arg)
+		case "s":
+			r.st.strikeout = assTagOn(arg)
+		case "c", "1c":
+			if c := assColor(arg); c != "" {
+				r.st.color = c
+			}
+		case "an":
+			if n := assAtoi(arg); n >= 1 && n <= 9 {
+				r.an = n
+			}
+		case "pos", "move":
+			if x, y, ok := assXY(arg); ok {
+				r.px, r.py, r.hasPos = x, y, true
+			}
+		case "p":
+			r.drawing = assAtoi(arg) > 0
+		}
+		// Everything else — \fs \fscx \fn \k \t \clip \fad \bord \shad \blur
+		// \alpha \2c \3c \4c \fe \org \q and friends — has no WebVTT equivalent.
+		// The text stays; the decoration does not.
+	}
+}
+
+// assTagName splits an override tag into its name and argument. \rStyle and
+// \fnArial take a free-form string, so they are handled before the general scan,
+// which would otherwise swallow the name into the tag.
+func assTagName(tag string) (string, string) {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return "", ""
+	}
+	switch tag[0] {
+	case 'r', 'R':
+		return "r", tag[1:]
+	case 'f', 'F':
+		if len(tag) >= 2 && (tag[1] == 'n' || tag[1] == 'N') {
+			return "fn", tag[2:]
+		}
+	}
+	i := 0
+	if tag[0] >= '0' && tag[0] <= '9' {
+		// \1c, \2c, \3c, \4c, \1a and their relatives start with the channel.
+		for i < len(tag) && (isAssLetter(tag[i]) || (tag[i] >= '0' && tag[i] <= '9')) {
+			i++
+		}
+	} else {
+		for i < len(tag) && isAssLetter(tag[i]) {
+			i++
+		}
+	}
+	return strings.ToLower(tag[:i]), tag[i:]
+}
+
+func isAssLetter(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+var assNumber = regexp.MustCompile(`-?\d+(?:\.\d+)?`)
+
+// assXY reads the first pair of numbers in a tag argument, which is the position
+// for \pos and the starting point of a \move.
+func assXY(arg string) (float64, float64, bool) {
+	m := assNumber.FindAllString(arg, 2)
+	if len(m) < 2 {
+		return 0, 0, false
+	}
+	x, err1 := strconv.ParseFloat(m[0], 64)
+	y, err2 := strconv.ParseFloat(m[1], 64)
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return x, y, true
+}
+
+// renderASSText turns one dialogue line into a cue payload and the placement its
+// override tags imply.
+func renderASSText(text string, base assStyle, doc *assDoc, styles *vttStyles) (string, cuePos) {
+	var (
+		out  strings.Builder
+		open []string
+		run  = assRun{an: base.align,
+			st: cueState{bold: base.bold, italic: base.italic, underline: base.underline,
+				strikeout: base.strikeout, color: base.primary, boxed: base.boxed}}
+	)
+	for i := 0; i < len(text); {
+		if text[i] == '{' {
+			if j := strings.IndexByte(text[i:], '}'); j >= 0 {
+				run.apply(text[i+1:i+j], base, doc)
+				i += j + 1
+				continue
+			}
+		}
+		next := strings.IndexByte(text[i:], '{')
+		if next < 0 {
+			next = len(text) - i
+		}
+		chunk := text[i : i+next]
+		i += next
+		if run.drawing {
+			// A \p1 block is a vector shape: its "text" is coordinate pairs, and
+			// showing them is worse than showing nothing.
+			continue
+		}
+		if chunk == "" {
+			// Nothing to show between two override blocks: emitting the tags here
+			// would leave stray <b></b> pairs and register classes nobody uses.
+			continue
+		}
+		chunk = strings.ReplaceAll(chunk, `\N`, "\n")
+		chunk = strings.ReplaceAll(chunk, `\n`, "\n")
+		chunk = strings.ReplaceAll(chunk, `\h`, "\u00a0")
+		open = retag(&out, open, run.st.tags(styles))
+		out.WriteString(renderMarkup(chunk, styles))
+	}
+	retag(&out, open, nil)
+	return out.String(), cuePlacement(doc, base, run.an, run.hasPos, run.px, run.py, run.mv)
+}
+
+// hasText reports whether a rendered cue would show anything at all: a line that
+// was only a drawing, or only tag changes, is not worth a cue.
+func hasText(rendered string) bool {
+	tag := false
+	for _, r := range rendered {
+		switch {
+		case r == '<':
+			tag = true
+		case r == '>':
+			tag = false
+		case !tag && !unicode.IsSpace(r):
+			return true
+		}
+	}
+	return false
+}
+
+// assembleVTT puts the document together with its STYLE block, which WebVTT only
+// allows before the first cue.
+func assembleVTT(styles *vttStyles, cues string) []byte {
+	var b strings.Builder
+	b.WriteString("WEBVTT\n\n")
+	if len(styles.decls) > 0 {
+		names := make([]string, 0, len(styles.decls))
+		for n := range styles.decls {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		b.WriteString("STYLE\n")
+		for _, n := range names {
+			fmt.Fprintf(&b, "::cue(.%s) { %s }\n", n, styles.decls[n])
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString(cues)
+	return []byte(b.String())
+}
+
+// splitBlocks cuts a subtitle document into blank-line separated blocks.
+func splitBlocks(src string) []string {
+	var out []string
+	var cur []string
+	for _, l := range strings.Split(src, "\n") {
+		if strings.TrimSpace(l) == "" {
+			if len(cur) > 0 {
+				out = append(out, strings.Join(cur, "\n"))
+				cur = nil
+			}
+			continue
+		}
+		cur = append(cur, strings.TrimRight(l, "\r"))
+	}
+	if len(cur) > 0 {
+		out = append(out, strings.Join(cur, "\n"))
+	}
+	return out
 }
 
 var assTime = regexp.MustCompile(`(\d+):(\d{1,2}):(\d{1,2})\.(\d{1,3})`)
@@ -106,60 +861,74 @@ func assTimestamp(t string) string {
 	return fmt.Sprintf("%02s:%s:%s.%s", h, mi, se, ms)
 }
 
-var overrideTags = regexp.MustCompile(`\{[^}]*\}`)
-
-// ASSToVTT converts SSA/ASS subtitle bytes to WebVTT (basic).
-func ASSToVTT(data []byte) []byte {
-	var b strings.Builder
-	b.WriteString("WEBVTT\n\n")
-	inEvents := false
-	var fields []string
-	lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
-	for _, line := range lines {
-		t := strings.TrimSpace(line)
-		if strings.HasPrefix(t, "[") && strings.HasSuffix(t, "]") {
-			inEvents = strings.EqualFold(t, "[events]")
+// SRTToVTT converts SubRip bytes to WebVTT. Cue text goes through the same
+// renderer as an ASS line, because real SubRip files carry ASS-style overrides
+// ({\an8} for a sign) and HTML (<i>, <font color=…>) — those are how a subtitle
+// says "this line belongs at the top".
+func SRTToVTT(data []byte) []byte {
+	src := strings.ReplaceAll(strings.TrimPrefix(string(data), "\ufeff"), "\r\n", "\n")
+	doc := newASSDoc()
+	styles := &vttStyles{}
+	base := assStyle{align: 2}
+	var cues strings.Builder
+	for _, block := range splitBlocks(src) {
+		lines := strings.Split(block, "\n")
+		at := -1
+		for i, l := range lines {
+			if strings.Contains(l, "-->") {
+				at = i
+				break
+			}
+		}
+		if at < 0 {
+			continue // the header, or a NOTE
+		}
+		head := strings.ReplaceAll(lines[at], ",", ".")
+		text, pos := renderASSText(strings.Join(lines[at+1:], "\n"), base, doc, styles)
+		text = strings.TrimRight(text, "\n")
+		if !hasText(text) {
 			continue
 		}
-		if !inEvents {
-			continue
+		if s := pos.settings(); s != "" {
+			head += " " + s
 		}
-		low := strings.ToLower(t)
-		if strings.HasPrefix(low, "format:") {
-			f := strings.Split(strings.TrimPrefix(t[len("format:"):], " "), ",")
-			fields = f
-			for i := range f {
-				fields[i] = strings.TrimSpace(fields[i])
-			}
-			continue
-		}
-		if strings.HasPrefix(low, "dialogue:") {
-			body := t[len("dialogue:"):]
-			parts := strings.SplitN(body, ",", len(fields))
-			if len(parts) != len(fields) {
-				continue
-			}
-			var start, end, text string
-			for i, name := range fields {
-				switch strings.ToLower(name) {
-				case "start":
-					start = parts[i]
-				case "end":
-					end = parts[i]
-				case "text":
-					text = parts[i]
-				}
-			}
-			if start == "" || end == "" {
-				continue
-			}
-			text = overrideTags.ReplaceAllString(text, "")
-			text = strings.ReplaceAll(text, "\\N", "\n")
-			text = strings.ReplaceAll(text, "\\n", "\n")
-			fmt.Fprintf(&b, "%s --> %s\n%s\n\n", assTimestamp(start), assTimestamp(end), text)
-		}
+		fmt.Fprintf(&cues, "%s\n%s\n\n", head, text)
 	}
-	return []byte(b.String())
+	return assembleVTT(styles, cues.String())
+}
+
+// ASSToVTT converts SSA/ASS bytes to WebVTT, carrying across what WebVTT can
+// express: when a line appears and where on the picture it belongs (from \an,
+// \pos and the style's own alignment and margins), plus bold, italic, underline
+// and colour. A style the file never defines, and a line with no positioning at
+// all, come out exactly as a plain conversion would.
+func ASSToVTT(data []byte) []byte {
+	doc, events := parseASS(data)
+	styles := &vttStyles{}
+	var cues strings.Builder
+	for _, ev := range events {
+		base := doc.style(ev.style)
+		if ev.marginL > 0 {
+			base.marginL = ev.marginL
+		}
+		if ev.marginR > 0 {
+			base.marginR = ev.marginR
+		}
+		if ev.marginV > 0 {
+			base.marginV = ev.marginV
+		}
+		text, pos := renderASSText(ev.text, base, doc, styles)
+		text = strings.TrimRight(text, "\n")
+		if !hasText(text) {
+			continue
+		}
+		head := assTimestamp(ev.start) + " --> " + assTimestamp(ev.end)
+		if s := pos.settings(); s != "" {
+			head += " " + s
+		}
+		fmt.Fprintf(&cues, "%s\n%s\n\n", head, text)
+	}
+	return assembleVTT(styles, cues.String())
 }
 
 // ToVTT converts known subtitle bytes to WebVTT by format name.

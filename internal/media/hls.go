@@ -386,7 +386,9 @@ func (e *Engine) Playlist(basePath string, sigQuery string, duration, segLen flo
 
 // ExtractEmbeddedSubtitle pulls one embedded text subtitle as WebVTT.
 func (e *Engine) ExtractEmbeddedSubtitle(ctx context.Context, file *models.MediaFile, drv source.Driver, streamIndex int) ([]byte, error) {
-	key := fmt.Sprintf("%d|%d", file.ID, streamIndex)
+	// The key carries a converter version: the output changed with the converter,
+	// and a cached entry would keep serving the flattened document.
+	key := fmt.Sprintf("%d|%d|v2", file.ID, streamIndex)
 	e.subMu.Lock()
 	if b, ok := e.subCache[key]; ok {
 		e.subMu.Unlock()
@@ -414,14 +416,17 @@ func (e *Engine) ExtractEmbeddedSubtitle(ctx context.Context, file *models.Media
 		return nil, fmt.Errorf("subtitle stream not found")
 	}
 
+	// Ask ffmpeg for ASS rather than WebVTT: its ASS writer keeps the container's
+	// styles, alignment and positioning, and ASSToVTT carries those into the
+	// WebVTT the player wants. ffmpeg's own WebVTT muxer flattens both away.
 	var buf strings.Builder
 	args := []string{"-hide_banner", "-loglevel", "error"}
 	args = HeaderArgs(args, headers)
-	args = append(args, "-i", target, "-map", fmt.Sprintf("0:s:%d", ordinal), "-f", "webvtt", "pipe:1")
+	args = append(args, "-i", target, "-map", fmt.Sprintf("0:s:%d", ordinal), "-f", "ass", "pipe:1")
 	if err := e.ffmpeg.RunStream(ctx, args, writerFunc(buf.WriteString)); err != nil {
 		return nil, err
 	}
-	data := []byte(buf.String())
+	data := ASSToVTT([]byte(buf.String()))
 	e.subMu.Lock()
 	if len(e.subOrder) >= 64 {
 		delete(e.subCache, e.subOrder[0])
