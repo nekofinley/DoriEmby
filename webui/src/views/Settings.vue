@@ -1,6 +1,7 @@
 <script setup>
 import { ref, onMounted, onBeforeUnmount, computed, watch } from 'vue'
-import { api } from '../api.js'
+import { api, fmtDate, fmtRelative } from '../api.js'
+import { me } from '../auth.js'
 import AppIcon from '../components/AppIcon.vue'
 import EmptyState from '../components/EmptyState.vue'
 import { toast } from '../toast.js'
@@ -9,6 +10,7 @@ const tabs = [
   { id: 'sources', label: '存储源', icon: 'cloud', desc: 'OpenList / WebDAV / 本地目录' },
   { id: 'libraries', label: '媒体库', icon: 'film', desc: '路径、类型与扫描' },
   { id: 'playback', label: '刮削与播放', icon: 'sparkles', desc: 'TMDB、Bangumi 与播放决策' },
+  { id: 'users', label: '用户', icon: 'users', desc: '账号、角色与注册策略' },
   { id: 'system', label: '系统', icon: 'server', desc: '工具路径与运行状态' },
 ]
 
@@ -56,6 +58,7 @@ async function loadAll() {
     scanStates.value = (await api.get('/api/scan/status')) || []
     sys.value = await api.get('/api/system/info')
     cfg.value = await api.get('/api/config')
+    users.value = (await api.get('/api/admin/users')).users || []
     if (!libForm.value.source_id && sources.value.length) libForm.value.source_id = sources.value[0].id
   } catch (e) {
     error.value = e.message
@@ -237,10 +240,113 @@ async function saveConfig() {
       tmdb: cfg.value.tmdb,
       bgm: cfg.value.bgm,
       playback: cfg.value.playback,
+      users: cfg.value.users,
     })
     toast.ok('配置已保存,立即生效')
     await loadAll()
   } catch (e) { toast.err(e.message) }
+}
+
+// ============================ users ======================================
+
+const users = ref([])
+const newUser = ref({ name: '', password: '', role: 'user' })
+const addingUser = ref(false)
+const pwTarget = ref(null) // 正在重置密码的用户
+const pwValue = ref('')
+
+// Signup policy. "open" is the default the server ships with; the other two are
+// how an owner takes the welcome mat back in.
+const regModes = [
+  { id: 'open', label: '开放注册', hint: '任何人注册后立即可用' },
+  { id: 'approval', label: '需要审核', hint: '注册后待管理员通过' },
+  { id: 'closed', label: '关闭注册', hint: '只能由管理员创建账号' },
+]
+
+const pendingUsers = computed(() => users.value.filter((u) => u.status === 'pending'))
+const adminCount = computed(() => users.value.filter((u) => u.role === 'admin' && u.status === 'active').length)
+
+// The account you are signed in as cannot be disabled or deleted from here.
+function isSelf(u) { return me.value && u.id === me.value.id }
+// The server refuses to leave itself without an admin; mirror that so the
+// buttons explain themselves instead of failing.
+function lastAdmin(u) { return u.role === 'admin' && u.status === 'active' && adminCount.value <= 1 }
+
+async function loadUsers() {
+  try {
+    users.value = (await api.get('/api/admin/users')).users || []
+  } catch (e) {
+    error.value = e.message
+  }
+}
+
+async function createUser() {
+  try {
+    await api.post('/api/admin/users', {
+      name: newUser.value.name,
+      password: newUser.value.password,
+      role: newUser.value.role,
+    })
+    newUser.value = { name: '', password: '', role: 'user' }
+    addingUser.value = false
+    await loadUsers()
+    toast.ok('用户已创建')
+  } catch (e) { toast.err(e.message) }
+}
+
+async function patchUser(u, patch, okMsg = '已更新') {
+  try {
+    await api.put(`/api/admin/users/${u.id}`, patch)
+    await loadUsers()
+    toast.ok(okMsg)
+  } catch (e) { toast.err(e.message) }
+}
+
+async function deleteUser(u) {
+  if (!confirm(`删除用户「${u.name}」?该账号的播放记录会一并删除,且无法恢复。`)) return
+  try {
+    await api.del(`/api/admin/users/${u.id}`)
+    await loadUsers()
+    toast.ok('用户已删除')
+  } catch (e) { toast.err(e.message) }
+}
+
+async function savePassword() {
+  const u = pwTarget.value
+  if (!u) return
+  try {
+    await api.post(`/api/admin/users/${u.id}/password`, { password: pwValue.value })
+    pwTarget.value = null
+    pwValue.value = ''
+    await loadUsers()
+    toast.ok(`已重置「${u.name}」的密码,该账号其他设备已下线`)
+  } catch (e) { toast.err(e.message) }
+}
+
+async function revokeSessions(u) {
+  if (!confirm(`让「${u.name}」的所有设备退出登录?`)) return
+  try {
+    await api.post(`/api/admin/users/${u.id}/revoke`)
+    toast.ok('已下线该账号的所有设备')
+  } catch (e) { toast.err(e.message) }
+}
+
+async function saveRegistration() {
+  try {
+    await api.put('/api/config', { users: cfg.value.users })
+    const m = regModes.find((x) => x.id === cfg.value.users.registration)
+    toast.ok(`注册方式已改为「${m ? m.label : cfg.value.users.registration}」`)
+    await loadUsers()
+  } catch (e) {
+    toast.err(e.message)
+    await loadAll() // 拉回服务端的真实值,别让界面停在一个没保存成功的选项上
+  }
+}
+
+function statusLabel(u) {
+  if (u.status === 'pending') return '待审核'
+  if (u.status === 'disabled') return '已禁用'
+  return '正常'
 }
 
 const anyScanning = computed(() => (scanStates.value || []).some((s) => s.running))
@@ -676,6 +782,144 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
           </div>
         </section>
 
+        <!-- ---------- users ---------- -->
+        <section v-show="tab === 'users'" class="stack">
+          <!-- signup policy -->
+          <div class="card">
+            <div class="card-title"><AppIcon name="lock" :size="16" /> 注册与登录</div>
+            <div class="tiny">决定别人能不能自己注册账号。改完立刻生效,不需要重启。</div>
+
+            <div class="reg-modes">
+              <button
+                v-for="m in regModes" :key="m.id" class="type-card"
+                :class="{ on: cfg.users.registration === m.id }"
+                @click="cfg.users.registration = m.id; saveRegistration()"
+              >
+                <AppIcon :name="m.id === 'open' ? 'lockOpen' : m.id === 'approval' ? 'clock' : 'lock'" :size="18" />
+                <span class="tc-label">{{ m.label }}</span>
+                <span class="tiny">{{ m.hint }}</span>
+              </button>
+            </div>
+
+            <div class="form-grid mt-4">
+              <div class="field">
+                <label>密码最短长度</label>
+                <input v-model.number="cfg.users.min_password" type="number" min="4" max="128" step="1" />
+                <span class="hint">注册、管理员建号与改密都按这个长度校验,至少 4 位。</span>
+              </div>
+            </div>
+            <div class="save-bar flat">
+              <span class="tiny">改完记得保存</span>
+              <button class="btn primary" @click="saveConfig"><AppIcon name="check" :size="15" /> 保存配置</button>
+            </div>
+          </div>
+
+          <!-- pending approvals -->
+          <div v-if="pendingUsers.length" class="card pending-card">
+            <div class="card-title"><AppIcon name="clock" :size="16" /> 待审核注册({{ pendingUsers.length }})</div>
+            <div class="list">
+              <div v-for="u in pendingUsers" :key="u.id" class="row-card">
+                <span class="r-icon"><AppIcon name="user" :size="18" /></span>
+                <div class="r-main">
+                  <div class="r-title">{{ u.name }} <span class="badge warn">待审核</span></div>
+                  <div class="tiny">申请时间 {{ fmtDate(u.created_at) }}</div>
+                </div>
+                <button class="btn sm primary" @click="patchUser(u, { status: 'active' }, `已通过「${u.name}」`)">
+                  <AppIcon name="check" :size="14" /> 通过
+                </button>
+                <button class="btn sm danger" @click="deleteUser(u)"><AppIcon name="close" :size="14" /> 拒绝</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- create -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="card-title"><AppIcon name="plus" :size="16" /> 添加用户</div>
+                <div class="tiny">注册关闭时也能用这里直接建号;管理员可以进后台。</div>
+              </div>
+              <button class="btn sm" @click="addingUser = !addingUser">{{ addingUser ? '收起' : '展开表单' }}</button>
+            </div>
+
+            <Transition name="fade">
+              <div v-if="addingUser" class="add-panel">
+                <div class="form-grid">
+                  <div class="field"><label>用户名</label><input v-model="newUser.name" placeholder="2-32 个字符" /></div>
+                  <div class="field"><label>密码</label><input v-model="newUser.password" type="password" placeholder="至少 4 位" /></div>
+                  <div class="field">
+                    <label>角色</label>
+                    <select v-model="newUser.role">
+                      <option value="user">普通用户(只能浏览播放)</option>
+                      <option value="admin">管理员(可进后台)</option>
+                    </select>
+                  </div>
+                </div>
+                <button class="btn primary" :disabled="!newUser.name || !newUser.password" @click="createUser">
+                  <AppIcon name="check" :size="15" /> 创建用户
+                </button>
+              </div>
+            </Transition>
+          </div>
+
+          <!-- list -->
+          <div v-if="users.length" class="list">
+            <div v-for="u in users" :key="u.id" class="card user-card" :class="{ off: u.status !== 'active' }">
+              <div class="u-head">
+                <span class="av">{{ (u.name || '?').slice(0, 1).toUpperCase() }}</span>
+                <div class="u-main">
+                  <div class="r-title">
+                    {{ u.name }}
+                    <span class="badge" :class="u.role === 'admin' ? 'rating' : ''">
+                      {{ u.role === 'admin' ? '管理员' : '用户' }}
+                    </span>
+                    <span v-if="u.status !== 'active'" class="badge" :class="u.status === 'pending' ? 'warn' : 'err'">
+                      {{ statusLabel(u) }}
+                    </span>
+                    <span v-if="isSelf(u)" class="badge hd">当前账号</span>
+                  </div>
+                  <div class="tiny">
+                    创建于 {{ fmtDate(u.created_at) }} ·
+                    {{ u.last_login_at ? '上次登录 ' + fmtRelative(u.last_login_at) : '从未登录' }}
+                  </div>
+                </div>
+              </div>
+
+              <div class="u-actions">
+                <button
+                  v-if="u.status !== 'active'"
+                  class="btn sm" @click="patchUser(u, { status: 'active' }, `已启用「${u.name}」`)"
+                ><AppIcon name="check" :size="14" /> {{ u.status === 'pending' ? '通过并启用' : '启用' }}</button>
+
+                <button
+                  v-else class="btn sm"
+                  :disabled="isSelf(u) || lastAdmin(u)"
+                  :title="isSelf(u) ? '不能禁用自己的账号' : lastAdmin(u) ? '至少要保留一个可用的管理员' : ''"
+                  @click="patchUser(u, { status: 'disabled' }, `已禁用「${u.name}」`)"
+                ><AppIcon name="lock" :size="14" /> 禁用</button>
+
+                <button
+                  class="btn sm"
+                  :disabled="lastAdmin(u)"
+                  :title="lastAdmin(u) ? '至少要保留一个可用的管理员' : ''"
+                  @click="patchUser(u, { role: u.role === 'admin' ? 'user' : 'admin' }, u.role === 'admin' ? `「${u.name}」已降为普通用户` : `「${u.name}」已成为管理员`)"
+                ><AppIcon :name="u.role === 'admin' ? 'user' : 'settings'" :size="14" /> {{ u.role === 'admin' ? '降为用户' : '设为管理员' }}</button>
+
+                <button class="btn sm" @click="pwTarget = u; pwValue = ''"><AppIcon name="lock" :size="14" /> 重置密码</button>
+                <button class="btn sm" @click="revokeSessions(u)"><AppIcon name="power" :size="14" /> 踢下线</button>
+
+                <button
+                  class="btn sm danger" :disabled="isSelf(u) || lastAdmin(u)"
+                  :title="isSelf(u) ? '不能删除当前登录的账号' : lastAdmin(u) ? '至少要保留一个可用的管理员' : ''"
+                  @click="deleteUser(u)"
+                ><AppIcon name="trash" :size="14" /> 删除</button>
+              </div>
+            </div>
+          </div>
+
+          <EmptyState v-else icon="users" title="还没有其他用户" text="打开上面的注册开关,或直接添加一个账号。" />
+        </section>
+
         <!-- ---------- system ---------- -->
         <section v-show="tab === 'system'" class="stack">
           <div v-if="sys" class="tiles">
@@ -724,6 +968,31 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
         </section>
       </div>
     </div>
+
+    <!-- 重置密码：独立弹窗,避免在用户卡片里塞一个容易误触的输入框 -->
+    <Transition name="modal">
+      <div v-if="pwTarget" class="modal-mask" @click.self="pwTarget = null">
+        <div class="modal" role="dialog" aria-modal="true" aria-label="重置密码">
+          <div class="modal-head">
+            <div>
+              <div class="card-title"><AppIcon name="lock" :size="16" /> 重置「{{ pwTarget.name }}」的密码</div>
+              <div class="tiny">保存后该账号在其他设备上的登录会全部失效。</div>
+            </div>
+          </div>
+          <form @submit.prevent="savePassword">
+            <div class="field">
+              <label for="user-pw">新密码</label>
+              <input id="user-pw" v-model="pwValue" type="text" :placeholder="`至少 ${cfg.users.min_password || 4} 位`" autofocus />
+              <span class="hint">明文显示,方便你转告对方;对方登录后可在「账号设置」里自行修改。</span>
+            </div>
+            <div class="btn-row">
+              <button type="button" class="btn" @click="pwTarget = null">取消</button>
+              <button class="btn primary" :disabled="!pwValue"><AppIcon name="check" :size="15" /> 保存新密码</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </Transition>
   </div>
 
   <div v-else class="page">
@@ -867,6 +1136,27 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
   z-index: 400;
 }
 .save-bar.flat { position: static; margin-top: var(--sp-4); background: var(--bg-0); box-shadow: none; }
+
+/* ---------- users ---------- */
+.reg-modes { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: var(--sp-3); margin-top: var(--sp-4); }
+.pending-card { border-color: rgba(251, 191, 36, 0.28); }
+
+.user-card { display: flex; flex-direction: column; gap: var(--sp-3); }
+/* A blocked or not-yet-approved account reads as inactive at a glance. */
+.user-card.off { opacity: 0.72; }
+.u-head { display: flex; align-items: center; gap: 12px; }
+.av {
+  display: grid; place-items: center;
+  width: 38px; height: 38px; flex: none;
+  border-radius: 50%;
+  background: linear-gradient(150deg, #3d4450, #22262e);
+  border: 1px solid var(--line-2);
+  font-size: var(--fs-15);
+  font-weight: 700;
+  color: var(--text-1);
+}
+.u-main { flex: 1; min-width: 0; }
+.u-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 
 .set-skeleton { padding-top: calc(var(--header-h) + 40px); }
 

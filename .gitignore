@@ -5,9 +5,13 @@ config.json
 *.db-shm
 # build artifacts
 *.exe
+*.exe~
 
 # local UI verification sandbox (fixtures, screenshots, seeding)
 .uitest/
+
+# local network-probe sandbox (go build cache)
+.netprobe/
 
 node_modules/
 webui/node_modules/

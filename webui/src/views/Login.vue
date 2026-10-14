@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { api } from '../api.js'
 import AppIcon from '../components/AppIcon.vue'
@@ -8,16 +8,25 @@ const route = useRoute()
 const host = location.host
 const name = ref('')
 const password = ref('')
+const confirm = ref('')
 const showPw = ref(false)
 const error = ref('')
+const notice = ref('')
 const busy = ref(false)
-const setupNeeded = ref(false)
 const checking = ref(true)
+const mode = ref('login') // login | register
+const bootstrap = ref({ setup_needed: false, can_register: false, registration: 'open', min_password: 4 })
+
+const setupNeeded = computed(() => !!bootstrap.value.setup_needed)
+const canRegister = computed(() => !setupNeeded.value && !!bootstrap.value.can_register)
+const minPassword = computed(() => bootstrap.value.min_password || 4)
+// "审核" mode is the admin saying yes, but not yet: worth spelling out so a new
+// arrival is not left wondering why the sign-in they just created fails.
+const needsApproval = computed(() => bootstrap.value.registration === 'approval' && canRegister.value)
 
 onMounted(async () => {
   try {
-    const b = await api.get('/api/bootstrap')
-    setupNeeded.value = !!b.setup_needed
+    bootstrap.value = await api.get('/api/bootstrap')
     if (setupNeeded.value) name.value = 'admin'
   } catch (e) {
     error.value = e.message
@@ -26,12 +35,37 @@ onMounted(async () => {
   }
 })
 
+function switchMode(m) {
+  if (mode.value === m) return
+  mode.value = m
+  error.value = ''
+  notice.value = ''
+  password.value = ''
+  confirm.value = ''
+}
+
 async function submit() {
   error.value = ''
+  notice.value = ''
+  if (mode.value === 'register' && password.value !== confirm.value) {
+    error.value = '两次输入的密码不一致'
+    return
+  }
   busy.value = true
   try {
     if (setupNeeded.value) {
       await api.post('/api/setup', { name: name.value, password: password.value })
+    } else if (mode.value === 'register') {
+      const res = await api.post('/api/auth/register', { name: name.value, password: password.value })
+      // Approval mode creates the account but refuses to sign it in yet.
+      if (res?.pending) {
+        notice.value = res.message || '注册成功,等待管理员审核通过后即可登录'
+        mode.value = 'login'
+        password.value = ''
+        confirm.value = ''
+        busy.value = false
+        return
+      }
     } else {
       await api.post('/api/auth/login', { name: name.value, password: password.value })
     }
@@ -87,15 +121,32 @@ const features = [
     <section class="form-side">
       <form class="form" @submit.prevent="submit">
         <div class="form-head">
-          <h2>{{ setupNeeded ? '初始化管理员' : '登录' }}</h2>
+          <h2>{{ setupNeeded ? '初始化管理员' : mode === 'register' ? '注册' : '登录' }}</h2>
           <p class="small">
-            {{ setupNeeded ? '第一次使用,先创建一个管理员账号。' : '使用你的账号继续。' }}
+            <template v-if="setupNeeded">第一次使用,先创建一个管理员账号。</template>
+            <template v-else-if="mode === 'register'">创建一个账号,登录后即可浏览与播放全部媒体。</template>
+            <template v-else>使用你的账号继续。</template>
           </p>
+        </div>
+
+        <div v-if="canRegister" class="mode-switch" role="tablist">
+          <button
+            type="button" role="tab" :aria-selected="mode === 'login'"
+            :class="{ on: mode === 'login' }" @click="switchMode('login')"
+          >登录</button>
+          <button
+            type="button" role="tab" :aria-selected="mode === 'register'"
+            :class="{ on: mode === 'register' }" @click="switchMode('register')"
+          >注册</button>
         </div>
 
         <div class="field">
           <label for="login-name">用户名</label>
-          <input id="login-name" v-model="name" autocomplete="username" placeholder="admin" required :disabled="busy || checking" />
+          <input
+            id="login-name" v-model="name" autocomplete="username"
+            :placeholder="mode === 'register' ? '2-32 个字符' : 'admin'"
+            required :disabled="busy || checking"
+          />
         </div>
 
         <div class="field">
@@ -103,8 +154,9 @@ const features = [
           <div class="pw-wrap">
             <input
               id="login-pw" v-model="password" :type="showPw ? 'text' : 'password'"
-              :autocomplete="setupNeeded ? 'new-password' : 'current-password'"
-              :placeholder="setupNeeded ? '至少 4 位' : '输入密码'" required :disabled="busy || checking"
+              :autocomplete="setupNeeded || mode === 'register' ? 'new-password' : 'current-password'"
+              :placeholder="setupNeeded || mode === 'register' ? `至少 ${minPassword} 位` : '输入密码'"
+              required :disabled="busy || checking"
             />
             <button
               type="button" class="pw-toggle" :aria-label="showPw ? '隐藏密码' : '显示密码'"
@@ -116,18 +168,40 @@ const features = [
           <span v-if="setupNeeded" class="hint">这个账号拥有全部管理权限,请妥善保管。</span>
         </div>
 
+        <div v-if="mode === 'register'" class="field">
+          <label for="login-pw2">确认密码</label>
+          <input
+            id="login-pw2" v-model="confirm" :type="showPw ? 'text' : 'password'"
+            autocomplete="new-password" placeholder="再输入一次" required :disabled="busy || checking"
+          />
+        </div>
+
         <Transition name="fade">
           <div v-if="error" class="flash err"><AppIcon name="alert" :size="16" /> {{ error }}</div>
+        </Transition>
+
+        <Transition name="fade">
+          <div v-if="notice" class="flash ok"><AppIcon name="check" :size="16" /> {{ notice }}</div>
         </Transition>
 
         <button class="btn primary lg block" :disabled="busy || checking">
           <template v-if="busy">请稍候…</template>
           <template v-else-if="checking">检查服务…</template>
+          <template v-else-if="setupNeeded">
+            <AppIcon name="lock" :size="16" /> 创建并进入
+          </template>
+          <template v-else-if="mode === 'register'">
+            <AppIcon name="user" :size="16" /> 注册并进入
+          </template>
           <template v-else>
-            <AppIcon name="lock" :size="16" />
-            {{ setupNeeded ? '创建并进入' : '登录' }}
+            <AppIcon name="lock" :size="16" /> 登录
           </template>
         </button>
+
+        <p v-if="needsApproval" class="hint approval">
+          <AppIcon name="clock" :size="13" />
+          注册后需要管理员审核通过才能登录。
+        </p>
 
         <div class="foot tiny">
           <AppIcon name="wifi" :size="13" />
@@ -219,6 +293,30 @@ const features = [
 .pw-toggle:hover { color: var(--text-1); background: rgba(255, 255, 255, 0.07); }
 .foot { display: flex; align-items: center; gap: 7px; margin-top: var(--sp-5); line-height: 1.5; }
 .foot code { font-family: var(--font-mono); color: var(--text-3); }
+
+/* login / register switch — the same segmented look the rest of the app uses */
+.mode-switch {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 3px;
+  padding: 3px;
+  margin-bottom: var(--sp-5);
+  background: rgba(0, 0, 0, 0.32);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-m);
+}
+.mode-switch button {
+  height: 34px;
+  border-radius: var(--r-s);
+  color: var(--text-3);
+  font-size: var(--fs-13);
+  font-weight: 600;
+  transition: color var(--t-fast), background var(--t-fast);
+}
+.mode-switch button:hover { color: var(--text-1); }
+.mode-switch button.on { background: var(--bg-3); color: var(--text-1); box-shadow: var(--sh-1); }
+
+.approval { display: flex; align-items: center; gap: 6px; margin: var(--sp-4) 0 0; text-align: center; justify-content: center; }
 
 @media (max-width: 980px) {
   .login { grid-template-columns: 1fr; }

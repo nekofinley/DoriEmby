@@ -2,12 +2,12 @@
 import { ref, computed, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { api } from './api.js'
+import { me, loadMe } from './auth.js'
 import AppHeader from './components/AppHeader.vue'
 import AppFooter from './components/AppFooter.vue'
 import ToastHost from './components/ToastHost.vue'
 
 const route = useRoute()
-const me = ref(null)
 const version = ref('')
 
 const fullscreen = computed(() => !!route.meta.fullscreen)
@@ -15,8 +15,11 @@ const bare = computed(() => route.meta.chrome === false)
 const overlay = computed(() => !!route.meta.overlay)
 
 onMounted(async () => {
+  // The router guard has usually loaded this already; forcing a read keeps the
+  // first paint after a reload honest.
+  await loadMe(true)
+  if (!me.value) return
   try {
-    me.value = (await api.get('/api/auth/me')).user
     // The footer names the binary it is talking to. /api/system/info is
     // authenticated, so it is asked for only once there is a session; if it
     // fails the footer simply omits the version.

@@ -74,8 +74,10 @@ func (s *Store) migrate() error {
 			name TEXT UNIQUE NOT NULL,
 			pass_hash TEXT NOT NULL,
 			salt TEXT NOT NULL,
-			role TEXT NOT NULL DEFAULT 'admin',
-			created_at TIMESTAMP NOT NULL
+			role TEXT NOT NULL DEFAULT 'user',
+			status TEXT NOT NULL DEFAULT 'active',
+			created_at TIMESTAMP NOT NULL,
+			last_login_at TIMESTAMP
 		)`,
 		`CREATE TABLE IF NOT EXISTS sessions (
 			token TEXT PRIMARY KEY,
@@ -159,7 +161,33 @@ func (s *Store) migrate() error {
 			return fmt.Errorf("migrate: %w", err)
 		}
 	}
-	return s.migrateFilesUnique()
+	if err := s.migrateFilesUnique(); err != nil {
+		return err
+	}
+	return s.migrateUsers()
+}
+
+// migrateUsers adds the columns a database from before multi-user support is
+// missing. Existing rows keep working: the single account such a database had
+// was created as an admin by the setup flow, so it stays an active admin.
+func (s *Store) migrateUsers() error {
+	cols := []struct{ name, ddl string }{
+		{"status", `ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`},
+		{"last_login_at", `ALTER TABLE users ADD COLUMN last_login_at TIMESTAMP`},
+	}
+	for _, c := range cols {
+		has, err := s.hasColumn("users", c.name)
+		if err != nil {
+			return err
+		}
+		if has {
+			continue
+		}
+		if _, err := s.DB.Exec(c.ddl); err != nil {
+			return fmt.Errorf("users.%s: %w", c.name, err)
+		}
+	}
+	return nil
 }
 
 // migrateFilesUnique upgrades the files table to "one row per (source, path)".
@@ -207,15 +235,66 @@ func (s *Store) hasColumn(table, column string) (bool, error) {
 
 // ---------- users ----------
 
+// userCols is the column list every user query scans, in the order scanUser
+// reads them, so adding a column means touching those two places only.
+const userCols = `id, name, pass_hash, salt, role, status, created_at, last_login_at`
+
+func scanUser(row interface{ Scan(...any) error }) (*models.User, error) {
+	u := &models.User{}
+	var last sql.NullTime
+	if err := row.Scan(&u.ID, &u.Name, &u.PassHash, &u.Salt, &u.Role, &u.Status, &u.CreatedAt, &last); err != nil {
+		return nil, err
+	}
+	if last.Valid {
+		t := last.Time
+		u.LastLogin = &t
+	}
+	return u, nil
+}
+
 func (s *Store) UserCount() (int, error) {
 	var n int
 	err := s.DB.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&n)
 	return n, err
 }
 
+// ActiveAdminCount counts accounts that can still administer the server. A
+// disabled or pending admin does not count, which is what stops the last usable
+// admin from being demoted, disabled or deleted out from under the server.
+func (s *Store) ActiveAdminCount() (int, error) {
+	var n int
+	err := s.DB.QueryRow(`SELECT COUNT(*) FROM users WHERE role = ? AND status = ?`,
+		models.RoleAdmin, models.StatusActive).Scan(&n)
+	return n, err
+}
+
+// ListUsers returns every account, oldest first, for the admin user table.
+func (s *Store) ListUsers() ([]models.User, error) {
+	rows, err := s.DB.Query(`SELECT ` + userCols + ` FROM users ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []models.User
+	for rows.Next() {
+		u, err := scanUser(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *u)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) CreateUser(u *models.User) error {
-	res, err := s.DB.Exec(`INSERT INTO users (name, pass_hash, salt, role, created_at) VALUES (?,?,?,?,?)`,
-		u.Name, u.PassHash, u.Salt, u.Role, time.Now())
+	if u.Role == "" {
+		u.Role = models.RoleUser
+	}
+	if u.Status == "" {
+		u.Status = models.StatusActive
+	}
+	res, err := s.DB.Exec(`INSERT INTO users (name, pass_hash, salt, role, status, created_at) VALUES (?,?,?,?,?,?)`,
+		u.Name, u.PassHash, u.Salt, u.Role, u.Status, time.Now())
 	if err != nil {
 		return err
 	}
@@ -223,24 +302,89 @@ func (s *Store) CreateUser(u *models.User) error {
 	return nil
 }
 
+// UserByName looks a name up case-insensitively: SQLite's default = is
+// case-sensitive, which would let someone register "Admin" next to an existing
+// "admin" and sign in as a convincing impostor in the UI.
 func (s *Store) UserByName(name string) (*models.User, error) {
-	u := &models.User{}
-	err := s.DB.QueryRow(`SELECT id, name, pass_hash, salt, role, created_at FROM users WHERE name = ?`, name).
-		Scan(&u.ID, &u.Name, &u.PassHash, &u.Salt, &u.Role, &u.CreatedAt)
-	if err != nil {
-		return nil, err
-	}
-	return u, nil
+	return scanUser(s.DB.QueryRow(`SELECT `+userCols+` FROM users WHERE name = ? COLLATE NOCASE`, name))
 }
 
 func (s *Store) UserByID(id int64) (*models.User, error) {
-	u := &models.User{}
-	err := s.DB.QueryRow(`SELECT id, name, pass_hash, salt, role, created_at FROM users WHERE id = ?`, id).
-		Scan(&u.ID, &u.Name, &u.PassHash, &u.Salt, &u.Role, &u.CreatedAt)
+	return scanUser(s.DB.QueryRow(`SELECT `+userCols+` FROM users WHERE id = ?`, id))
+}
+
+// NameTaken reports whether another account already uses that name, so the API
+// can answer with a readable message instead of the UNIQUE constraint's text.
+// exceptID is the account being edited (0 when creating a new one). It is
+// case-insensitive for the same reason as UserByName.
+func (s *Store) NameTaken(name string, exceptID int64) (bool, error) {
+	var n int
+	err := s.DB.QueryRow(`SELECT COUNT(*) FROM users WHERE name = ? COLLATE NOCASE AND id <> ?`, name, exceptID).Scan(&n)
+	return n > 0, err
+}
+
+func (s *Store) RenameUser(id int64, name string) error {
+	_, err := s.DB.Exec(`UPDATE users SET name = ? WHERE id = ?`, name, id)
+	return err
+}
+
+func (s *Store) UpdateUserRole(id int64, role string) error {
+	_, err := s.DB.Exec(`UPDATE users SET role = ? WHERE id = ?`, role, id)
+	return err
+}
+
+func (s *Store) UpdateUserStatus(id int64, status string) error {
+	_, err := s.DB.Exec(`UPDATE users SET status = ? WHERE id = ?`, status, id)
+	return err
+}
+
+func (s *Store) UpdateUserPassword(id int64, hash, salt string) error {
+	_, err := s.DB.Exec(`UPDATE users SET pass_hash = ?, salt = ? WHERE id = ?`, hash, salt, id)
+	return err
+}
+
+func (s *Store) TouchLastLogin(id int64, t time.Time) error {
+	_, err := s.DB.Exec(`UPDATE users SET last_login_at = ? WHERE id = ?`, t, id)
+	return err
+}
+
+// DeleteUser removes the account, its sessions (via the foreign key cascade) and
+// its playback progress. Progress has no foreign key to users, so rows would
+// otherwise survive and attach themselves to whatever account reuses the id.
+func (s *Store) DeleteUser(id int64) error {
+	tx, err := s.DB.Begin()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return u, nil
+	defer tx.Rollback()
+	for _, q := range []string{
+		`DELETE FROM sessions WHERE user_id = ?`,
+		`DELETE FROM progress WHERE user_id = ?`,
+		`DELETE FROM users WHERE id = ?`,
+	} {
+		if _, err := tx.Exec(q, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// DeleteUserSessions signs every device of one account out, without touching
+// the account itself. excludeToken keeps the caller's own session alive.
+func (s *Store) DeleteUserSessions(userID int64, excludeToken string) error {
+	if excludeToken != "" {
+		_, err := s.DB.Exec(`DELETE FROM sessions WHERE user_id = ? AND token <> ?`, userID, excludeToken)
+		return err
+	}
+	_, err := s.DB.Exec(`DELETE FROM sessions WHERE user_id = ?`, userID)
+	return err
+}
+
+// PruneSessions drops sessions that have already expired, so the table does not
+// grow for the lifetime of the server.
+func (s *Store) PruneSessions() error {
+	_, err := s.DB.Exec(`DELETE FROM sessions WHERE expires_at < ?`, time.Now())
+	return err
 }
 
 // ---------- sessions ----------

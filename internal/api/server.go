@@ -31,10 +31,24 @@ type Server struct {
 	// UI can report the binary it is actually talking to rather than a constant
 	// someone has to remember to bump.
 	Version string
+
+	// loginLimiter and registerLimiter bound password guessing and signup
+	// floods per client address. Both live in memory; see attemptLimiter.
+	loginLimiter    *attemptLimiter
+	registerLimiter *attemptLimiter
 }
 
 func New(store *db.Store, cfg *config.Config, scanner *scan.Scanner, meta *metadata.Manager, engine *media.Engine, webFS fs.FS, version string) *Server {
-	return &Server{Store: store, Cfg: cfg, Scanner: scanner, Metadata: meta, Engine: engine, WebFS: webFS, DevWeb: cfg.DevWebDir, Version: version}
+	return &Server{
+		Store: store, Cfg: cfg, Scanner: scanner, Metadata: meta, Engine: engine,
+		WebFS: webFS, DevWeb: cfg.DevWebDir, Version: version,
+		// Ten wrong passwords per address per five minutes is far more than a
+		// person needs and far too slow to guess with; five signups per hour
+		// keeps a shared address (a family, a dorm) working while stopping a
+		// script from filling the user table.
+		loginLimiter:    newAttemptLimiter(10, 5*time.Minute),
+		registerLimiter: newAttemptLimiter(5, time.Hour),
+	}
 }
 
 // ---------- helpers ----------
@@ -58,14 +72,20 @@ func readBody(r *http.Request, v any) error {
 
 const cookieName = "doriyamedia_token"
 
-func (s *Server) currentUser(r *http.Request) *models.User {
-	token := ""
-	if c, err := r.Cookie(cookieName); err == nil {
-		token = c.Value
+// sessionToken reads the caller's session token from the cookie, or from a
+// bearer header for clients that cannot hold cookies.
+func sessionToken(r *http.Request) string {
+	if c, err := r.Cookie(cookieName); err == nil && c.Value != "" {
+		return c.Value
 	}
 	if ah := r.Header.Get("Authorization"); strings.HasPrefix(ah, "Bearer ") {
-		token = ah[len("Bearer "):]
+		return ah[len("Bearer "):]
 	}
+	return ""
+}
+
+func (s *Server) currentUser(r *http.Request) *models.User {
+	token := sessionToken(r)
 	if token == "" {
 		return nil
 	}
@@ -75,6 +95,11 @@ func (s *Server) currentUser(r *http.Request) *models.User {
 	}
 	u, err := s.Store.UserByID(sess.UserID)
 	if err != nil {
+		return nil
+	}
+	// A session that outlived a "禁用" would keep working, so the account state
+	// is re-checked on every request rather than only at sign-in.
+	if !u.CanLogin() {
 		return nil
 	}
 	return u
@@ -174,10 +199,21 @@ func (s *Server) Handler() http.Handler {
 
 	// auth / setup
 	mux.HandleFunc("POST /api/setup", s.handleSetup)
+	mux.HandleFunc("POST /api/auth/register", s.handleRegister)
 	mux.HandleFunc("POST /api/auth/login", s.handleLogin)
 	mux.HandleFunc("POST /api/auth/logout", s.requireAuth(s.handleLogout))
 	mux.HandleFunc("GET /api/auth/me", s.requireAuth(s.handleMe))
+	mux.HandleFunc("PUT /api/auth/profile", s.requireAuth(s.handleUpdateProfile))
+	mux.HandleFunc("POST /api/auth/password", s.requireAuth(s.handleChangePassword))
 	mux.HandleFunc("GET /api/bootstrap", s.handleBootstrap)
+
+	// user management (admin only)
+	mux.HandleFunc("GET /api/admin/users", s.requireAdmin(s.handleListUsers))
+	mux.HandleFunc("POST /api/admin/users", s.requireAdmin(s.handleCreateUser))
+	mux.HandleFunc("PUT /api/admin/users/{id}", s.requireAdmin(s.handleUpdateUser))
+	mux.HandleFunc("DELETE /api/admin/users/{id}", s.requireAdmin(s.handleDeleteUser))
+	mux.HandleFunc("POST /api/admin/users/{id}/password", s.requireAdmin(s.handleSetUserPassword))
+	mux.HandleFunc("POST /api/admin/users/{id}/revoke", s.requireAdmin(s.handleRevokeUserSessions))
 
 	// system
 	mux.HandleFunc("GET /api/system/info", s.requireAuth(s.handleSystemInfo))

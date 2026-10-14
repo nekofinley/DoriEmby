@@ -11,6 +11,32 @@ import (
 // DefaultTMDBProxy is the usual local SOCKS5 port (Clash/v2rayN default).
 const DefaultTMDBProxy = "socks5://127.0.0.1:7890"
 
+// Registration modes for self-service signup.
+const (
+	// RegistrationOpen lets a visitor register and sign in immediately.
+	RegistrationOpen = "open"
+	// RegistrationApproval creates the account as pending; an admin approves it
+	// from the settings page before it can sign in.
+	RegistrationApproval = "approval"
+	// RegistrationClosed hides signup entirely: only an admin creates accounts.
+	RegistrationClosed = "closed"
+)
+
+// DefaultMinPassword matches the floor the first-run setup form has always
+// enforced.
+const DefaultMinPassword = 4
+
+// Users controls who may get an account on this server, and how strong their
+// passwords have to be.
+type Users struct {
+	// Registration is one of RegistrationOpen / RegistrationApproval /
+	// RegistrationClosed.
+	Registration string `json:"registration"`
+	// MinPassword is the shortest password accepted at signup, when an admin
+	// creates an account, and when a password is changed.
+	MinPassword int `json:"min_password"`
+}
+
 type TMDB struct {
 	APIKey   string `json:"api_key"`
 	Language string `json:"language"`
@@ -91,8 +117,15 @@ type Config struct {
 	TMDB            TMDB     `json:"tmdb"`
 	BGM             BGMTV    `json:"bgm"`
 	Playback        Playback `json:"playback"`
+	Users           Users    `json:"users"`
 	ScanConcurrency int      `json:"scan_concurrency"`
 	DevWebDir       string   `json:"dev_web_dir"`
+}
+
+// RegistrationAllowed reports whether visitors may create their own account,
+// either immediately or pending an admin's approval.
+func (c *Config) RegistrationAllowed() bool {
+	return c.Users.Registration == RegistrationOpen || c.Users.Registration == RegistrationApproval
 }
 
 func Defaults() *Config {
@@ -123,6 +156,10 @@ func Defaults() *Config {
 			PreProbeMaxFiles:    100,
 			PreProbeConcurrency: 1,
 			HLSCacheMB:          2048,
+		},
+		Users: Users{
+			Registration: RegistrationOpen,
+			MinPassword:  DefaultMinPassword,
 		},
 		ScanConcurrency: 4,
 	}
@@ -213,6 +250,19 @@ func (c *Config) normalize() {
 	}
 	if c.ScanConcurrency <= 0 {
 		c.ScanConcurrency = 4
+	}
+	// An unknown registration mode would silently lock people out of a server
+	// whose owner meant to leave signup on, so it falls back to the default.
+	switch c.Users.Registration {
+	case RegistrationOpen, RegistrationApproval, RegistrationClosed:
+	default:
+		c.Users.Registration = RegistrationOpen
+	}
+	if c.Users.MinPassword < DefaultMinPassword {
+		c.Users.MinPassword = DefaultMinPassword
+	}
+	if c.Users.MinPassword > 128 {
+		c.Users.MinPassword = 128
 	}
 	if c.FFmpeg == "" {
 		c.FFmpeg = "ffmpeg"

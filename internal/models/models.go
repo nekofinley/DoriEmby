@@ -2,14 +2,39 @@ package models
 
 import "time"
 
+// Account roles. Only RoleAdmin reaches the settings backend; RoleUser is a
+// viewer that can browse, play and keep its own playback progress.
+const (
+	RoleAdmin = "admin"
+	RoleUser  = "user"
+)
+
+// Account states. StatusPending is a self-registration waiting for an admin to
+// approve it (only produced in the "approval" registration mode), and
+// StatusDisabled blocks sign-in without deleting the account — and with it the
+// playback progress attached to it.
+const (
+	StatusActive   = "active"
+	StatusPending  = "pending"
+	StatusDisabled = "disabled"
+)
+
 type User struct {
-	ID        int64     `json:"id"`
-	Name      string    `json:"name"`
-	PassHash  string    `json:"-"`
-	Salt      string    `json:"-"`
-	Role      string    `json:"role"`
-	CreatedAt time.Time `json:"created_at"`
+	ID        int64      `json:"id"`
+	Name      string     `json:"name"`
+	PassHash  string     `json:"-"`
+	Salt      string     `json:"-"`
+	Role      string     `json:"role"`
+	Status    string     `json:"status"`
+	CreatedAt time.Time  `json:"created_at"`
+	LastLogin *time.Time `json:"last_login_at,omitempty"`
 }
+
+// IsAdmin reports whether the account may reach the settings backend.
+func (u *User) IsAdmin() bool { return u != nil && u.Role == RoleAdmin }
+
+// CanLogin reports whether the account is currently allowed to sign in.
+func (u *User) CanLogin() bool { return u != nil && u.Status == StatusActive }
 
 type Session struct {
 	Token     string    `json:"token"`

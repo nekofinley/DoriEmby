@@ -3,7 +3,9 @@ import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import AppIcon from './AppIcon.vue'
 import SearchOverlay from './SearchOverlay.vue'
+import AccountDialog from './AccountDialog.vue'
 import { api } from '../api.js'
+import { logout as signOut } from '../auth.js'
 
 const props = defineProps({
   me: { type: Object, default: null },
@@ -17,6 +19,7 @@ const scrolled = ref(false)
 const menuOpen = ref(false)
 const browseOpen = ref(false)
 const searching = ref(false)
+const acctOpen = ref(false)
 
 const isAdmin = computed(() => props.me?.role === 'admin')
 const movieLib = computed(() => libraries.value.find((l) => l.type === 'movie'))
@@ -36,7 +39,9 @@ const tabs = computed(() => {
   if (movieLib.value) out.push({ label: '电影', to: `/library/${movieLib.value.id}?type=movie`, icon: 'film' })
   if (seriesLib.value) out.push({ label: '剧集', to: `/library/${seriesLib.value.id}?type=show`, icon: 'tv' })
   out.push({ label: '文件', to: '/browse', icon: 'folder' })
-  out.push({ label: '设置', to: '/settings', icon: 'settings' })
+  // The settings backend is the admin's; a viewer gets no tab that would only
+  // bounce them back to the home page.
+  if (isAdmin.value) out.push({ label: '设置', to: '/settings', icon: 'settings' })
   return out
 })
 
@@ -66,8 +71,7 @@ onBeforeUnmount(() => {
 watch(() => route.fullPath, () => { menuOpen.value = false; browseOpen.value = false })
 
 async function logout() {
-  try { await api.post('/api/auth/logout') } catch {}
-  location.href = '/login'
+  await signOut()
 }
 
 function pickLibrary(lib) {
@@ -134,6 +138,9 @@ defineExpose({ openSearch: () => { searching.value = true } })
                 <div class="tiny">{{ isAdmin ? '管理员' : '用户' }}</div>
               </div>
             </div>
+            <button class="dd-item" @click="menuOpen = false; acctOpen = true">
+              <AppIcon name="user" :size="16" /><span class="dd-name">账号设置</span>
+            </button>
             <router-link v-if="isAdmin" to="/settings" class="dd-item">
               <AppIcon name="settings" :size="16" /><span class="dd-name">设置</span>
             </router-link>
@@ -147,6 +154,7 @@ defineExpose({ openSearch: () => { searching.value = true } })
   </header>
 
   <SearchOverlay v-model:open="searching" :libraries="libraries" />
+  <AccountDialog v-model:open="acctOpen" />
 
   <nav class="tabbar">
     <router-link

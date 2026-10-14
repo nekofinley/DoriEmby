@@ -1,0 +1,499 @@
+package api
+
+import (
+	"fmt"
+	"net"
+	"net/http"
+	"regexp"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"doriyamedia/internal/auth"
+	"doriyamedia/internal/config"
+	"doriyamedia/internal/models"
+)
+
+const (
+	// sessionTTL is how long one sign-in lasts before the cookie expires.
+	sessionTTL = 30 * 24 * time.Hour
+
+	minNameLen = 2
+	maxNameLen = 32
+	// maxPasswordLen keeps a huge body from turning into a minutes-long PBKDF2
+	// derivation on the server.
+	maxPasswordLen = 200
+)
+
+// nameRe keeps account names to something readable in the UI and harmless in a
+// log line: letters in any script (so Chinese names work), digits, and _ - . @
+var nameRe = regexp.MustCompile(`^[\p{L}\p{N}_.@-]+$`)
+
+// validateName trims and checks a requested account name.
+func validateName(raw string) (string, error) {
+	name := strings.TrimSpace(raw)
+	switch n := utf8.RuneCountInString(name); {
+	case n < minNameLen || n > maxNameLen:
+		return "", fmt.Errorf("用户名需要 %d-%d 个字符", minNameLen, maxNameLen)
+	case !nameRe.MatchString(name):
+		return "", fmt.Errorf("用户名只能包含中英文、数字与 _ - . @")
+	}
+	return name, nil
+}
+
+// passwordMin is the effective minimum password length.
+func (s *Server) passwordMin() int {
+	min := s.Cfg.Users.MinPassword
+	if min < config.DefaultMinPassword {
+		min = config.DefaultMinPassword
+	}
+	return min
+}
+
+func (s *Server) validatePassword(pw string) error {
+	if utf8.RuneCountInString(pw) < s.passwordMin() {
+		return fmt.Errorf("密码至少 %d 位", s.passwordMin())
+	}
+	if len(pw) > maxPasswordLen {
+		return fmt.Errorf("密码过长(最多 %d 字节)", maxPasswordLen)
+	}
+	return nil
+}
+
+// clientIP is the address a request came from. X-Forwarded-For is deliberately
+// ignored: a client can set that header itself, and trusting it would turn the
+// sign-in throttle into a no-op.
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// normalizeRole maps any input onto the two roles that exist.
+func normalizeRole(role string) string {
+	if role == models.RoleAdmin {
+		return models.RoleAdmin
+	}
+	return models.RoleUser
+}
+
+// normalizeStatus maps any input onto a known account state.
+func normalizeStatus(status string) string {
+	switch status {
+	case models.StatusDisabled, models.StatusPending:
+		return status
+	default:
+		return models.StatusActive
+	}
+}
+
+// ---------- registration (public) ----------
+
+// handleRegister creates an account from the signup form. Whether that account
+// can sign in immediately, must wait for an admin, or may not be created at all
+// is the admin's registration policy.
+func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name     string `json:"name"`
+		Password string `json:"password"`
+	}
+	if err := readBody(r, &req); err != nil {
+		fail(w, 400, "参数错误")
+		return
+	}
+	// A server with no account yet is in first-run setup. Letting a stranger
+	// register here would either hand them the server or, by making the user
+	// count non-zero, lock the real owner out of the setup flow.
+	n, err := s.Store.UserCount()
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	if n == 0 {
+		fail(w, 400, "服务尚未初始化,请先创建管理员账号")
+		return
+	}
+	if !s.Cfg.RegistrationAllowed() {
+		fail(w, 403, "管理员已关闭注册")
+		return
+	}
+	key := clientIP(r)
+	if !s.registerLimiter.Allow(key) {
+		fail(w, 429, "注册过于频繁,请稍后再试")
+		return
+	}
+	name, err := validateName(req.Name)
+	if err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	if err := s.validatePassword(req.Password); err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	taken, err := s.Store.NameTaken(name, 0)
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	if taken {
+		fail(w, 409, "这个用户名已被使用")
+		return
+	}
+
+	u := &models.User{Name: name, Role: models.RoleUser, Status: models.StatusActive}
+	if s.Cfg.Users.Registration == config.RegistrationApproval {
+		u.Status = models.StatusPending
+	}
+	u.PassHash, u.Salt = auth.HashPassword(req.Password)
+	if err := s.Store.CreateUser(u); err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	s.registerLimiter.Hit(key)
+	if u.Status == models.StatusPending {
+		writeJSON(w, 202, map[string]any{
+			"pending": true,
+			"message": "注册成功,等待管理员审核通过后即可登录",
+		})
+		return
+	}
+	s.startSession(w, u)
+}
+
+// ---------- self service ----------
+
+// handleChangePassword changes the caller's own password after checking the old
+// one, and signs every other device out.
+func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request, user *models.User) {
+	var req struct {
+		Current string `json:"current_password"`
+		New     string `json:"new_password"`
+	}
+	if err := readBody(r, &req); err != nil {
+		fail(w, 400, "参数错误")
+		return
+	}
+	if !auth.Verify(req.Current, user.PassHash, user.Salt) {
+		fail(w, 403, "当前密码不正确")
+		return
+	}
+	if err := s.validatePassword(req.New); err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	if req.New == req.Current {
+		fail(w, 400, "新密码与当前密码相同")
+		return
+	}
+	hash, salt := auth.HashPassword(req.New)
+	if err := s.Store.UpdateUserPassword(user.ID, hash, salt); err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	// A changed password should end sessions opened with the old one; the caller
+	// keeps the session it is using right now.
+	if err := s.Store.DeleteUserSessions(user.ID, sessionToken(r)); err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+// handleUpdateProfile renames the caller's own account.
+func (s *Server) handleUpdateProfile(w http.ResponseWriter, r *http.Request, user *models.User) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := readBody(r, &req); err != nil {
+		fail(w, 400, "参数错误")
+		return
+	}
+	name, err := validateName(req.Name)
+	if err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	taken, err := s.Store.NameTaken(name, user.ID)
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	if taken {
+		fail(w, 409, "这个用户名已被使用")
+		return
+	}
+	if err := s.Store.RenameUser(user.ID, name); err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	user.Name = name
+	writeJSON(w, 200, map[string]any{"user": user})
+}
+
+// ---------- admin: user management ----------
+
+// handleListUsers returns every account for the settings page. Password hashes
+// and salts never leave the server (the model tags them json:"-").
+func (s *Server) handleListUsers(w http.ResponseWriter, r *http.Request, user *models.User) {
+	users, err := s.Store.ListUsers()
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	if users == nil {
+		users = []models.User{}
+	}
+	writeJSON(w, 200, map[string]any{"users": users})
+}
+
+// handleCreateUser is the admin-side "add account", for when registration is
+// closed or someone should be let in without a signup round trip.
+func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request, user *models.User) {
+	var req struct {
+		Name     string `json:"name"`
+		Password string `json:"password"`
+		Role     string `json:"role"`
+	}
+	if err := readBody(r, &req); err != nil {
+		fail(w, 400, "参数错误")
+		return
+	}
+	name, err := validateName(req.Name)
+	if err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	if err := s.validatePassword(req.Password); err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	taken, err := s.Store.NameTaken(name, 0)
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	if taken {
+		fail(w, 409, "这个用户名已被使用")
+		return
+	}
+	u := &models.User{Name: name, Role: normalizeRole(req.Role), Status: models.StatusActive}
+	u.PassHash, u.Salt = auth.HashPassword(req.Password)
+	if err := s.Store.CreateUser(u); err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"user": u})
+}
+
+// handleUpdateUser edits one account: its name, its role, its state, or any
+// combination. Approving a pending signup is a status change to active.
+func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request, actor *models.User) {
+	id, ok := pathID(r)
+	if !ok {
+		fail(w, 400, "无效的用户 ID")
+		return
+	}
+	target, err := s.Store.UserByID(id)
+	if err != nil {
+		fail(w, 404, "用户不存在")
+		return
+	}
+	var req struct {
+		Name   *string `json:"name"`
+		Role   *string `json:"role"`
+		Status *string `json:"status"`
+	}
+	if err := readBody(r, &req); err != nil {
+		fail(w, 400, "参数错误")
+		return
+	}
+
+	role, status := target.Role, target.Status
+	if req.Role != nil {
+		role = normalizeRole(*req.Role)
+	}
+	if req.Status != nil {
+		status = normalizeStatus(*req.Status)
+	}
+
+	// Disabling yourself would take the panel away mid-session and cannot be
+	// undone from where you are standing. Stepping down from admin is allowed
+	// though — as long as someone else can still administer the server, which
+	// demotesLastAdmin checks below.
+	if target.ID == actor.ID {
+		if req.Status != nil && status != target.Status {
+			fail(w, 400, "不能禁用自己的账号")
+			return
+		}
+	}
+	if blocked, err := s.demotesLastAdmin(target, role, status); err != nil {
+		fail(w, 500, err.Error())
+		return
+	} else if blocked {
+		fail(w, 400, "至少要保留一个可用的管理员账号")
+		return
+	}
+
+	if req.Name != nil {
+		name, err := validateName(*req.Name)
+		if err != nil {
+			fail(w, 400, err.Error())
+			return
+		}
+		if name != target.Name {
+			taken, err := s.Store.NameTaken(name, target.ID)
+			if err != nil {
+				fail(w, 500, err.Error())
+				return
+			}
+			if taken {
+				fail(w, 409, "这个用户名已被使用")
+				return
+			}
+			if err := s.Store.RenameUser(target.ID, name); err != nil {
+				fail(w, 500, err.Error())
+				return
+			}
+			target.Name = name
+		}
+	}
+	if role != target.Role {
+		if err := s.Store.UpdateUserRole(target.ID, role); err != nil {
+			fail(w, 500, err.Error())
+			return
+		}
+		target.Role = role
+	}
+	if status != target.Status {
+		if err := s.Store.UpdateUserStatus(target.ID, status); err != nil {
+			fail(w, 500, err.Error())
+			return
+		}
+		target.Status = status
+		// A blocked account should not keep watching on a session it already
+		// holds, otherwise "禁用" would only take effect at the next sign-in.
+		if status != models.StatusActive {
+			if err := s.Store.DeleteUserSessions(target.ID, ""); err != nil {
+				fail(w, 500, err.Error())
+				return
+			}
+		}
+	}
+	writeJSON(w, 200, map[string]any{"user": target})
+}
+
+// handleDeleteUser removes an account along with its sessions and playback
+// progress.
+func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request, actor *models.User) {
+	id, ok := pathID(r)
+	if !ok {
+		fail(w, 400, "无效的用户 ID")
+		return
+	}
+	target, err := s.Store.UserByID(id)
+	if err != nil {
+		fail(w, 404, "用户不存在")
+		return
+	}
+	if target.ID == actor.ID {
+		fail(w, 400, "不能删除当前登录的账号")
+		return
+	}
+	if blocked, err := s.demotesLastAdmin(target, models.RoleUser, models.StatusDisabled); err != nil {
+		fail(w, 500, err.Error())
+		return
+	} else if blocked {
+		fail(w, 400, "至少要保留一个可用的管理员账号")
+		return
+	}
+	if err := s.Store.DeleteUser(target.ID); err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+// handleSetUserPassword lets an admin set a new password for someone who forgot
+// theirs, and signs that account's other devices out.
+func (s *Server) handleSetUserPassword(w http.ResponseWriter, r *http.Request, actor *models.User) {
+	id, ok := pathID(r)
+	if !ok {
+		fail(w, 400, "无效的用户 ID")
+		return
+	}
+	target, err := s.Store.UserByID(id)
+	if err != nil {
+		fail(w, 404, "用户不存在")
+		return
+	}
+	var req struct {
+		Password string `json:"password"`
+	}
+	if err := readBody(r, &req); err != nil {
+		fail(w, 400, "参数错误")
+		return
+	}
+	if err := s.validatePassword(req.Password); err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	hash, salt := auth.HashPassword(req.Password)
+	if err := s.Store.UpdateUserPassword(target.ID, hash, salt); err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	// Resetting your own password keeps this session; resetting someone else's
+	// ends all of theirs.
+	exclude := ""
+	if target.ID == actor.ID {
+		exclude = sessionToken(r)
+	}
+	if err := s.Store.DeleteUserSessions(target.ID, exclude); err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+// handleRevokeUserSessions signs an account out everywhere: the "踢下线" button.
+func (s *Server) handleRevokeUserSessions(w http.ResponseWriter, r *http.Request, actor *models.User) {
+	id, ok := pathID(r)
+	if !ok {
+		fail(w, 400, "无效的用户 ID")
+		return
+	}
+	if _, err := s.Store.UserByID(id); err != nil {
+		fail(w, 404, "用户不存在")
+		return
+	}
+	exclude := ""
+	if id == actor.ID {
+		exclude = sessionToken(r)
+	}
+	if err := s.Store.DeleteUserSessions(id, exclude); err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+// demotesLastAdmin reports whether a change would leave the server with no
+// usable admin account. Only an account that currently *is* an active admin
+// matters, and only when the change stops it from being one — that is the one
+// mistake an admin cannot repair from inside the panel.
+func (s *Server) demotesLastAdmin(target *models.User, role, status string) (bool, error) {
+	if !(target.Role == models.RoleAdmin && target.Status == models.StatusActive) {
+		return false, nil
+	}
+	if role == models.RoleAdmin && status == models.StatusActive {
+		return false, nil
+	}
+	n, err := s.Store.ActiveAdminCount()
+	if err != nil {
+		return false, err
+	}
+	return n <= 1, nil
+}

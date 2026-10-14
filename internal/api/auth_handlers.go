@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"os/exec"
 	"runtime"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"doriyamedia/internal/auth"
+	"doriyamedia/internal/config"
 	"doriyamedia/internal/models"
 )
 
@@ -17,7 +19,14 @@ func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 		fail(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"setup_needed": n == 0})
+	writeJSON(w, 200, map[string]any{
+		"setup_needed": n == 0,
+		// The sign-in page renders its tabs from this: setup, sign-in, and
+		// whether to offer signup at all.
+		"registration": s.Cfg.Users.Registration,
+		"can_register": n > 0 && s.Cfg.RegistrationAllowed(),
+		"min_password": s.passwordMin(),
+	})
 }
 
 func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
@@ -34,12 +43,24 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		Name     string `json:"name"`
 		Password string `json:"password"`
 	}
-	if err := readBody(r, &req); err != nil || req.Name == "" || len(req.Password) < 4 {
-		fail(w, 400, "需要用户名和至少 4 位密码")
+	if err := readBody(r, &req); err != nil {
+		fail(w, 400, "参数错误")
+		return
+	}
+	name, err := validateName(req.Name)
+	if err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	if err := s.validatePassword(req.Password); err != nil {
+		fail(w, 400, err.Error())
 		return
 	}
 	hash, salt := auth.HashPassword(req.Password)
-	u := &models.User{Name: req.Name, PassHash: hash, Salt: salt, Role: "admin"}
+	u := &models.User{
+		Name: name, PassHash: hash, Salt: salt,
+		Role: models.RoleAdmin, Status: models.StatusActive,
+	}
 	if err := s.Store.CreateUser(u); err != nil {
 		fail(w, 500, err.Error())
 		return
@@ -56,21 +77,53 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "参数错误")
 		return
 	}
-	u, err := s.Store.UserByName(req.Name)
+	key := clientIP(r)
+	if !s.loginLimiter.Allow(key) {
+		fail(w, 429, "尝试过于频繁,请稍后再试")
+		return
+	}
+	// An unknown name and a wrong password are answered identically, and both
+	// count against the limiter, so the form cannot be used to discover which
+	// accounts exist.
+	u, err := s.Store.UserByName(strings.TrimSpace(req.Name))
 	if err != nil || !auth.Verify(req.Password, u.PassHash, u.Salt) {
+		if wait := s.loginLimiter.Hit(key); wait > 0 {
+			fail(w, 429, fmt.Sprintf("密码错误次数过多,请 %d 秒后再试", wait))
+			return
+		}
 		fail(w, 401, "用户名或密码错误")
 		return
 	}
+	// The password is right, so telling the owner why the account is blocked
+	// reveals nothing to anyone else.
+	switch u.Status {
+	case models.StatusPending:
+		fail(w, 403, "账号正在等待管理员审核通过")
+		return
+	case models.StatusDisabled:
+		fail(w, 403, "账号已被管理员禁用")
+		return
+	}
+	s.loginLimiter.Reset(key)
 	s.startSession(w, u)
 }
 
 func (s *Server) startSession(w http.ResponseWriter, u *models.User) {
 	token := auth.NewToken()
-	exp := time.Now().Add(30 * 24 * time.Hour)
+	exp := time.Now().Add(sessionTTL)
 	if err := s.Store.CreateSession(token, u.ID, exp); err != nil {
 		fail(w, 500, err.Error())
 		return
 	}
+	// Every session starts here — setup, signup and sign-in alike — so this is
+	// the one place that has to record the visit. Registering and being signed
+	// straight in is a login too, and the user table should not call it "never".
+	now := time.Now()
+	_ = s.Store.TouchLastLogin(u.ID, now)
+	u.LastLogin = &now
+	// Sessions the server never used again would otherwise accumulate for the
+	// lifetime of the database; signing in is a cheap place to sweep them.
+	_ = s.Store.PruneSessions()
 	http.SetCookie(w, &http.Cookie{
 		Name: cookieName, Value: token, Path: "/", HttpOnly: true,
 		SameSite: http.SameSiteLaxMode, Expires: exp,
@@ -79,20 +132,19 @@ func (s *Server) startSession(w http.ResponseWriter, u *models.User) {
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, user *models.User) {
-	token := ""
-	if c, err := r.Cookie(cookieName); err == nil {
-		token = c.Value
-	}
-	if ah := r.Header.Get("Authorization"); token == "" && len(ah) > 7 {
-		token = ah[7:]
-	}
-	_ = s.Store.DeleteSession(token)
+	_ = s.Store.DeleteSession(sessionToken(r))
 	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: "", Path: "/", MaxAge: -1})
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
+// handleMe tells the UI who it is talking to. The role decides whether the
+// settings backend is reachable at all, so the client can route on it.
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, user *models.User) {
-	writeJSON(w, 200, map[string]any{"user": user, "setup_needed": false})
+	writeJSON(w, 200, map[string]any{
+		"user":         user,
+		"is_admin":     user.IsAdmin(),
+		"setup_needed": false,
+	})
 }
 
 func (s *Server) handleSystemInfo(w http.ResponseWriter, r *http.Request, user *models.User) {
@@ -132,6 +184,7 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request, user *m
 		"tmdb":             s.Cfg.TMDB,
 		"bgm":              s.Cfg.BGM,
 		"playback":         s.Cfg.Playback,
+		"users":            s.Cfg.Users,
 	}
 	writeJSON(w, 200, cfg)
 }
@@ -146,6 +199,7 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request, user *m
 		TMDB            *configTMDB     `json:"tmdb"`
 		BGM             *configBGM      `json:"bgm"`
 		Playback        *configPlayback `json:"playback"`
+		Users           *configUsers    `json:"users"`
 	}
 	if err := readBody(r, &req); err != nil {
 		fail(w, 400, err.Error())
@@ -234,11 +288,29 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request, user *m
 			}
 		}
 	}
+	if req.Users != nil {
+		if req.Users.Registration != nil {
+			switch *req.Users.Registration {
+			case config.RegistrationOpen, config.RegistrationApproval, config.RegistrationClosed:
+				s.Cfg.Users.Registration = *req.Users.Registration
+			default:
+				// Silently keeping the old mode would leave the admin believing
+				// signup was closed when it is not.
+				fail(w, 400, "注册方式只能是 open / approval / closed")
+				return
+			}
+		}
+		if req.Users.MinPassword != nil && *req.Users.MinPassword > 0 {
+			s.Cfg.Users.MinPassword = *req.Users.MinPassword
+		}
+	}
 	if err := s.Cfg.Save(s.configFile()); err != nil {
 		fail(w, 500, err.Error())
 		return
 	}
-	s.Engine.SetBins(s.Cfg.FFmpeg, s.Cfg.FFProbe)
+	if s.Engine != nil {
+		s.Engine.SetBins(s.Cfg.FFmpeg, s.Cfg.FFProbe)
+	}
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
@@ -271,4 +343,9 @@ type configPlayback = struct {
 	AppleHEVCCopy       *bool `json:"apple_hevc_copy"`
 	HLSSessionPackager  *bool `json:"hls_session_packager"`
 	HLSCacheMB          *int  `json:"hls_cache_mb"`
+}
+
+type configUsers = struct {
+	Registration *string `json:"registration"`
+	MinPassword  *int    `json:"min_password"`
 }

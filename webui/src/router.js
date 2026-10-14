@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import { api } from './api.js'
+import { loadMe, resetAuth } from './auth.js'
+import { toast } from './toast.js'
 
 const routes = [
   { path: '/login', component: () => import('./views/Login.vue'), meta: { public: true, chrome: false } },
@@ -9,7 +10,10 @@ const routes = [
   { path: '/season/:id', component: () => import('./views/Season.vue'), meta: { title: '剧集', overlay: true } },
   { path: '/browse/:id?', component: () => import('./views/Browse.vue'), meta: { title: '文件' } },
   { path: '/play/:fileId', component: () => import('./views/Player.vue'), meta: { fullscreen: true, title: '播放' } },
-  { path: '/settings', component: () => import('./views/Settings.vue'), meta: { title: '设置' } },
+  // admin: the settings backend is the admin's alone. The API already answers
+  // 403 to everyone else; this keeps a viewer from landing on a page of failed
+  // requests in the first place.
+  { path: '/settings', component: () => import('./views/Settings.vue'), meta: { title: '设置', admin: true } },
   { path: '/:pathMatch(.*)*', redirect: '/' },
 ]
 
@@ -23,22 +27,15 @@ export const router = createRouter({
   },
 })
 
-let authChecked = false
-let authOk = false
-
 router.beforeEach(async (to) => {
   if (to.meta.public) return true
-  if (!authChecked) {
-    try {
-      await api.get('/api/auth/me')
-      authOk = true
-    } catch {
-      authOk = false
-    }
-    authChecked = true
-    window.__doriyamediaAuth = () => { authChecked = false }
+  const user = await loadMe()
+  window.__doriyamediaAuth = resetAuth
+  if (!user) return { path: '/login', query: { redirect: to.fullPath } }
+  if (to.meta.admin && user.role !== 'admin') {
+    toast.err('需要管理员权限')
+    return { path: '/' }
   }
-  if (!authOk) return { path: '/login', query: { redirect: to.fullPath } }
   return true
 })
 
