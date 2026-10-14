@@ -1060,6 +1060,15 @@ select option { background: var(--bg-2); color: var(--text-1); }
   .card { padding: var(--sp-4); border-radius: var(--r-m); }
 }
 
+/* A phone on its side leaves 390px of height, and the list was 28px taller than
+   that. The note at its foot goes first on a window this short — the same thing is
+   said by a toast — and the gaps come in a little. Every group stays reachable
+   without scrolling, which is also what keeps a finger off the volume slider. */
+@media (max-height: 520px) {
+  .player.fs .panel { gap: 6px; }
+  .player.fs .panel .pn-reason { display: none; }
+}
+
 /* A drag that nothing means to handle must not turn into the browser's own
    gestures: on a phone a downward drag over the picture is pull-to-refresh, which
    reloads the page and resumes playback from the last saved position — a "seek"

@@ -16,6 +16,7 @@ const fatal = ref('')
 const videoEl = ref(null)
 const stageEl = ref(null)
 const playerEl = ref(null)
+let cueObs = null
 const watchEl = ref(null)
 const hls = ref(null)
 const currentAudio = ref(0)
@@ -82,7 +83,11 @@ const nativeControls = computed(() => isIOS.value)
  * from a desktop window of the same width.
  */
 const vp = ref({ w: window.innerWidth, h: window.innerHeight })
-function onViewport() { vp.value = { w: window.innerWidth, h: window.innerHeight } }
+function onViewport() {
+  vp.value = { w: window.innerWidth, h: window.innerHeight }
+  // The picture's box moved with the window, and so did the place the cues belong.
+  fitCuesToPicture()
+}
 
 const touchOnly = (() => {
   try { return window.matchMedia('(hover: none) and (pointer: coarse)').matches } catch { return false }
@@ -865,6 +870,34 @@ function shiftCues(el) {
   el.dataset.cuesShifted = '1'
 }
 
+// Cue placement is a percentage of the *element*, but the picture inside it may be
+// letterboxed — a portrait window showing a 16:9 film is a band across the middle,
+// with black above and below it — and a cue near the bottom of the element then
+// lands in the black, nowhere near the picture. That is what "the subtitles are
+// stuck to the very bottom" was on a phone. ASS coordinates are in video space,
+// which is the picture, so the placement is remapped into the picture's own box.
+// It runs again whenever that box changes (rotation, fullscreen, a window resize);
+// the original value stays on the cue so repeated runs cannot compound.
+function fitCuesToPicture() {
+  const v = videoEl.value
+  if (!v || !v.videoWidth || !v.videoHeight) return
+  const box = v.getBoundingClientRect()
+  if (!box.height || !box.width) return
+  const scale = Math.min(box.width / v.videoWidth, box.height / v.videoHeight)
+  const picH = v.videoHeight * scale
+  const top = (box.height - picH) / 2
+  for (const t of v.textTracks) {
+    if (!t.cues) continue
+    for (const c of t.cues) {
+      if (typeof c.line !== 'number') continue
+      if (c.dmLine === undefined) c.dmLine = c.line
+      try {
+        c.line = ((top + (c.dmLine / 100) * picH) / box.height) * 100
+      } catch { /* frozen cue: leave it alone */ }
+    }
+  }
+}
+
 // showSub turns one subtitle track on and the rest off. It goes through the
 // element's own .track rather than indexing v.textTracks, because hls.js
 // registers text tracks of its own and the indices then stop lining up.
@@ -881,7 +914,8 @@ function showSub(sub) {
   el.track.mode = 'showing'
   // The cues may already be loaded, or may arrive with the track's load event.
   shiftCues(el)
-  el.addEventListener('load', () => shiftCues(el), { once: true })
+  fitCuesToPicture()
+  el.addEventListener('load', () => { shiftCues(el); fitCuesToPicture() }, { once: true })
   activeSub.value = sub
   return true
 }
@@ -1112,6 +1146,7 @@ async function togglePip() {
 }
 function onFsChange() {
   fsActive.value = !!document.fullscreenElement
+  fitCuesToPicture()
   // Fullscreen is the lock's only home: the watch page has no lock button, so a
   // lock that outlived fullscreen would be a player with no controls at all.
   if (!fsActive.value) locked.value = false
@@ -1175,6 +1210,13 @@ onMounted(() => {
   window.addEventListener('beforeunload', saveProgress)
   window.addEventListener('keydown', onKey)
   window.addEventListener('resize', onViewport)
+  // Fullscreenchange fires before the element has its new box, and a rotation does
+  // not always produce a resize the player sees in time, so the placement follows
+  // the element's own box rather than an event that may be early.
+  if (typeof ResizeObserver !== 'undefined' && videoEl.value) {
+    cueObs = new ResizeObserver(() => fitCuesToPicture())
+    cueObs.observe(videoEl.value)
+  }
   window.addEventListener('orientationchange', onViewport)
   document.addEventListener('fullscreenchange', onFsChange)
   document.addEventListener('pointermove', showControls)
@@ -1200,6 +1242,8 @@ onBeforeUnmount(() => {
   document.removeEventListener('fullscreenchange', onFsChange)
   document.removeEventListener('pointermove', showControls)
   document.removeEventListener('touchmove', consumeFullscreenDrag)
+  cueObs?.disconnect()
+  cueObs = null
   window.removeEventListener('pointermove', moveScrub)
   window.removeEventListener('pointerup', endScrub)
 })
@@ -1978,6 +2022,37 @@ video { width: 100%; height: 100%; object-fit: contain; background: #000; displa
 }
 .lay-phone .panel .pn-group .chip, .lay-tablet .panel .pn-group .chip { white-space: nowrap; }
 .pn-reason { display: flex; gap: 8px; line-height: 1.55; margin-top: auto; padding-top: 16px; border-top: 1px solid var(--line-1); }
+
+/* In fullscreen the settings are a bar down the side, not a full-width sheet: the
+   picture stays behind it and it reads as a panel. On a phone the medium query
+   above asks for 100% — a watch page has nothing to keep in view, but a fullscreen
+   player has. */
+.player.fs .panel { width: min(340px, 86vw); }
+
+/* And its text scales with the window, so a short one — a phone on its side is
+   390px tall — still shows every group without scrolling. Scrolling a settings list
+   is also how a drag ends up on the volume slider on the way past, so "it all
+   fits" is a gesture fix as much as a layout one. `overflow-y: auto` stays as the
+   fallback for a file with more tracks than any window has room for. */
+.player.fs .panel {
+  gap: clamp(7px, 1.9vh, 18px);
+  padding: clamp(10px, 2.4vh, 20px) clamp(12px, 3vw, 20px) clamp(12px, 2.6vh, 24px);
+  font-size: clamp(11px, 2.05vh, 13.5px);
+}
+.player.fs .panel .pn-group { gap: clamp(3px, 1vh, 8px); }
+.player.fs .panel .pn-group .label { font-size: clamp(8.5px, 1.7vh, 11px); }
+.player.fs .panel .pn-group .chip {
+  min-height: 0;
+  padding: clamp(3px, 1.05vh, 7px) clamp(8px, 1.8vw, 14px);
+  font-size: inherit;
+}
+.player.fs .panel .pn-chips {
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: clamp(4px, 1.1vh, 8px);
+}
+.player.fs .panel .pn-group .chip { white-space: nowrap; }
+.player.fs .panel .pn-reason { padding-top: clamp(6px, 1.6vh, 16px); line-height: 1.4; }
 
 .slide-enter-active, .slide-leave-active { transition: transform var(--t-mid), opacity var(--t-mid); }
 .slide-enter-from, .slide-leave-to { transform: translateX(24px); opacity: 0; }
