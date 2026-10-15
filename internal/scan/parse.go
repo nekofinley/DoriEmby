@@ -57,6 +57,106 @@ var (
 	reBracketGroups = regexp.MustCompile(`[\[【]([^\]】]*)[\]】]`)
 )
 
+// The leading part of a bracket that carries a label. Written as two patterns
+// rather than one so it is unambiguous which text is the number: either the
+// number with its version glued on ("12v2"), or the plain number, leaving " v2"
+// to be read as the version it is.
+var (
+	reBracketEpVersion = regexp.MustCompile(`(?i)^(\d{1,4}(?:\.\d)?)v\d+`)
+	reBracketEpPlain   = regexp.MustCompile(`^(\d{1,4}(?:\.\d)?)`)
+)
+
+// bracketEpisode reads an episode number out of a bracket whose contents are not
+// just the number, so that a release marking its finale or a version of an
+// episode ("[13 END]", "[01 (No Credit Ver.)]") is still identifiable as that
+// episode. Returns false when the bracket is something else entirely.
+//
+// What follows the number has to be a label a release actually writes. Anything
+// else is only *starting* with digits — a resolution ("[1080p]"), a 10-bit
+// profile ("[Hi10p]"), a checksum — and reading an episode out of those would
+// attach subtitles to the wrong file, which is worse than attaching none.
+func bracketEpisode(val string) (int, bool) {
+	v := strings.TrimSpace(val)
+	if v == "" || v[0] < '0' || v[0] > '9' {
+		return 0, false
+	}
+	m := reBracketEpVersion.FindStringSubmatch(v)
+	if m == nil {
+		m = reBracketEpPlain.FindStringSubmatch(v)
+	}
+	if m == nil {
+		return 0, false
+	}
+	label := strings.TrimSpace(v[len(m[0]):])
+	// A "v2" written apart from the number is a version, not a label.
+	if mm := reVersionOnly.FindStringSubmatch(label); mm != nil {
+		label = strings.TrimSpace(label[len(mm[0]):])
+	}
+	if label != "" && !episodeLabel(label) {
+		return 0, false
+	}
+	n, err := strconv.ParseFloat(m[1], 64)
+	if err != nil || n < 0 || n > 9999 {
+		return 0, false
+	}
+	return int(n), true
+}
+
+var reVersionOnly = regexp.MustCompile(`(?i)^v\d+`)
+
+// bracketEpLabels are the words a release puts beside an episode number to say
+// which episode it is — the finale, an alternative cut, a special — including
+// the words that appear inside a parenthesised note ("No Credit Ver.").
+var bracketEpLabels = map[string]bool{
+	// which episode
+	"end": true, "final": true, "finale": true, "fin": true, "last": true,
+	"complete": true, "v2": true, "v3": true,
+	// alternative cuts and versions
+	"nc": true, "nced": true, "ncop": true, "no": true, "credit": true,
+	"credits": true, "ver": true, "version": true, "clean": true, "alt": true,
+	"alternative": true, "uncensored": true, "uncut": true, "remastered": true,
+	"repack": true, "proper": true, "extended": true, "director": true, "cut": true,
+	// specials
+	"sp": true, "special": true, "ova": true, "oad": true, "ona": true,
+	"movie": true, "recap": true, "digest": true, "preview": true,
+	"opening": true, "ending": true, "title": true, "textless": true,
+}
+
+// episodeLabel reports whether the text after a bracket's episode number reads
+// as one of those labels. Two shapes are accepted: a known word on its own
+// ("END"), or such a word followed by a parenthesised note ("No Credit Ver.").
+func episodeLabel(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	// Split off a trailing "v2".
+	if m := reVersionOnly.FindStringSubmatch(strings.TrimSpace(s)); m != nil {
+		s = strings.TrimSpace(s[len(m[0]):])
+	}
+	if s == "" {
+		return true
+	}
+	low := strings.ToLower(s)
+	if bracketEpLabels[low] {
+		return true
+	}
+	// "(No Credit Ver.)" and friends: an opening bracket whose content is words.
+	if !strings.HasPrefix(low, "(") && !strings.HasPrefix(low, "（") {
+		return false
+	}
+	inner := strings.Trim(low, "()（） \t")
+	if inner == "" || strings.ContainsAny(inner, "0123456789") {
+		return false
+	}
+	for _, w := range strings.Fields(inner) {
+		if !bracketEpLabels[strings.Trim(w, ".,")] {
+			return false
+		}
+	}
+	return true
+}
+
 var qualityTokens = regexp.MustCompile(`(?i)\b(2160p|1080p|1080i|720p|576p|480p|4k|uhd|hdr10?|hdr10\+|dv|dovi|web[\.\-_ ]?(dl|rip)|brrip|blu[\.\-_ ]?ray|bdrip|remux|hdtv|dvdrip|hddvd|hevc|h[\.\-_ ]?26[45]|x26[45]|avc|10bit|8bit|60fps|30fps|23\.976|25fps|atmos|ddp?[\.\-_ ]?5\.1|eac3|ac3|dts[\.\-_ ]?(hd|ma|x)?|truehd|flac|aac|mp3|opus|chs|cht|chscj|big5|gb|mandarin|cantonese|chinese|english|japanese|dual|multi|sub|chs&eng|hsbs|sbs|3d|proper|repack|extended|uncut|remastered|unrated|internal|limited|imax|complete|hybrid|yify|rarbg|xvid|diy|mytvsuper|tvb|now|hbo|disney\+|netflix|nf|amzn|atvp|dsnp|hulu|max|pcm|truestem|web|dl|rip|bluray|uhdbluray)\b`)
 
 var cjkTokens = regexp.MustCompile(`(国语|普通话|粤语|中字|简体|繁体|简繁|内封|外挂|内嵌|双语|双音轨|无字幕|杜比视界|杜比全景声|全景声|高清|超清|蓝光|原盘|修复版|完整版|抢先版|枪版|官方中字|中英双字|去水印|高码|高码率|低码|片源|压制|收录|合集|无水印|4K|2160P|1080P|720P)`)
@@ -85,6 +185,15 @@ func ParseName(filename string) Parsed {
 					p.Kind = "episode"
 					epFound = true
 				}
+			} else if n, ok := bracketEpisode(val); ok {
+				// The episode number with a label after it — "[13 END]",
+				// "[01 (No Credit Ver.)]" — which is how a release marks its
+				// last episode, or a version of one. The number is what names
+				// the file either way.
+				p.Episode = n
+				p.IsEpisode = true
+				p.Kind = "episode"
+				epFound = true
 			}
 		}
 		if !epFound {

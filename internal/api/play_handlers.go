@@ -13,10 +13,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"doriyamedia/internal/media"
 	"doriyamedia/internal/models"
+	"doriyamedia/internal/scan"
 	"doriyamedia/internal/source"
 )
 
@@ -185,6 +187,9 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 			}
 			continue
 		}
+		// What the file actually holds, not what its name claimed: this is what
+		// decides whether the faithful-rendering option makes sense.
+		format, _ := s.subFormatFor(ctx, drv, &sub)
 		subDTOs = append(subDTOs, subDTO{
 			ID:       sub.ID,
 			Label:    sub.Title,
@@ -193,7 +198,7 @@ func (s *Server) playFile(w http.ResponseWriter, r *http.Request, file *models.M
 			Default:  sub.ID == defSubID,
 			// ASS/SSA is where typesetting lives, so those tracks can also be
 			// burned in when a viewer wants the original layout.
-			BurnAvailable: sub.Format == "ass" || sub.Format == "ssa",
+			BurnAvailable: format == "ass" || format == "ssa",
 			URL:           fmt.Sprintf("/api/subs/%d/%d.vtt%s", file.ID, sub.ID, signedQuery(s.Cfg.Secret, file.ID, sigTTL)),
 		})
 	}
@@ -482,23 +487,32 @@ func (s *Server) discoverSubtitles(ctx context.Context, drv source.Driver, file 
 	if !strings.HasPrefix(file.Path, "http://") && !strings.HasPrefix(file.Path, "https://") {
 		if dir, base := splitDirBase(file.Path); dir != "" && base != "" {
 			if entries, err := drv.List(ctx, dir); err == nil {
-				lowBase := strings.ToLower(stripExt(base))
-				for _, e := range entries {
+				// Where a subtitle sits is not who it belongs to: one directory
+				// holds a whole season, and a release may name its subtitles
+				// nothing like its video (see scan.SubtitleAttachment). Every
+				// candidate in the directory is offered, and the attachment rule
+				// decides — the format check only says whether it is a subtitle
+				// at all.
+				names := make([]string, len(entries))
+				for i, e := range entries {
 					if e.IsDir {
 						continue
 					}
-					format, conv := media.DetectSubFormat(e.Name)
-					if format == "" {
+					if _, ok := subFormatOf(e.Name); ok {
+						names[i] = e.Name
+					}
+				}
+				attached := scan.SubtitleAttachmentIn(base, names)
+				for i, e := range entries {
+					if !attached[i] {
 						continue
 					}
-					stem := strings.ToLower(stripExt(e.Name))
-					if strings.HasPrefix(stem, lowBase) {
-						_ = s.Store.UpsertSubtitle(&models.Subtitle{
-							FileID: file.ID, Path: e.Path,
-							Lang: media.GuessLang(e.Name), Title: media.SubLabel(e.Name),
-							Format: format, Convertible: conv,
-						})
-					}
+					format, conv := subFormatOf(e.Name)
+					_ = s.Store.UpsertSubtitle(&models.Subtitle{
+						FileID: file.ID, Path: e.Path,
+						Lang: media.GuessLang(e.Name), Title: media.SubLabel(e.Name),
+						Format: format, Convertible: conv,
+					})
 				}
 			}
 		}
@@ -522,11 +536,62 @@ func splitDirBase(p string) (string, string) {
 	return p[:i], p[i+1:]
 }
 
+// subFormatOf reports whether a listed file is a subtitle at all, and what it
+// most likely holds.
+//
+// The extension decides the format when there is one. Releases that name their
+// Chinese tracks "…aac].Chs" / "….Cht" leave the file with no extension at all,
+// the language tag standing where the extension would be; the tag does not say
+// what the file is written in, so the format it registers is corrected from the
+// file's own bytes when the subtitle is served (subFormatFor).
+func subFormatOf(name string) (format string, convertible bool) {
+	if format, conv := media.DetectSubFormat(name); format != "" {
+		return format, conv
+	}
+	return media.DetectTaggedSubFormat(name)
+}
+
 func stripExt(name string) string {
 	if i := strings.LastIndex(name, "."); i >= 0 {
 		return name[:i]
 	}
 	return name
+}
+
+// subFormatCache remembers what a subtitle file turned out to be, keyed by
+// subtitle id, so sniffing its bytes happens once per track rather than on every
+// cue request. Subtitle files are static, so the only way an entry goes stale is
+// a rescan replacing the file behind the same row, which is not worth a TTL.
+var subFormatCache sync.Map // int64 -> string
+
+// subFormatFor returns the format a subtitle should actually be converted as.
+//
+// The format recorded at discovery came from the file name, and a name is only a
+// claim: an ASS file shipped as "….Chs" has no extension to be read, and any
+// release can put the wrong one on. So for external text tracks the first bytes
+// get the final say, which is also what keeps the ASS converter (positioning,
+// colours, fonts) from being handed SubRip text or the other way round — the two
+// disagree about what a line means, and guessing wrong garbles the subtitles
+// rather than degrading them.
+func (s *Server) subFormatFor(ctx context.Context, drv source.Driver, sub *models.Subtitle) (string, bool) {
+	if sub.Embedded {
+		return sub.Format, sub.Convertible
+	}
+	if v, ok := subFormatCache.Load(sub.ID); ok {
+		return v.(string), true
+	}
+	rc, err := drv.Open(ctx, sub.Path)
+	if err != nil {
+		return sub.Format, sub.Convertible
+	}
+	defer rc.Close()
+	head, err := io.ReadAll(io.LimitReader(rc, 8<<10))
+	if err != nil && len(head) == 0 {
+		return sub.Format, sub.Convertible
+	}
+	format, _ := media.SniffTextSubFormat(head)
+	subFormatCache.Store(sub.ID, format)
+	return format, true
 }
 
 // ---------- /api/stream/{id} ----------
@@ -886,9 +951,10 @@ func (s *Server) burnSubtitleFile(ctx context.Context, file *models.MediaFile, d
 	if err != nil {
 		return nil, "", err
 	}
-	switch strings.ToLower(sub.Format) {
+	format, _ := s.subFormatFor(ctx, drv, sub)
+	switch strings.ToLower(format) {
 	case "subrip", "srt":
-		return raw, "srt", nil
+		return media.SRTToVTT(raw), "vtt", nil
 	case "ass", "ssa":
 		return raw, "ass", nil
 	case "webvtt", "vtt":
@@ -1260,7 +1326,8 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 			fail(w, 502, "字幕读取失败: "+err.Error())
 			return
 		}
-		data = media.ToVTT(sub.Format, raw)
+		format, _ := s.subFormatFor(ctx, drv, sub)
+		data = media.ToVTT(format, raw)
 	}
 	// A subtitle rendition inside an HLS stream is timed against that stream,
 	// which begins where the packaging session began; the caller says where that

@@ -1,6 +1,7 @@
 package media
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"regexp"
@@ -31,6 +32,62 @@ func DetectSubFormat(name string) (format string, convertible bool) {
 	}
 }
 
+// subLangTags are the language markers that appear as an extension-shaped tag on
+// the end of a subtitle file's name. Plain-language ones (Jap, Eng, Chi …) are
+// only trusted on a file with no usable extension; script ones (Chs / Cht / Sc /
+// Tc / Big5) are the tags a release puts *instead of* an extension.
+var subLangTags = map[string]bool{
+	// simplified / traditional Chinese
+	"chs": true, "cht": true, "sc": true, "tc": true, "big5": true,
+	"gb": true, "zh": true, "hans": true, "hant": true, "zhcn": true, "zhtw": true,
+	"简体": true, "繁体": true, "繁體": true, "简中": true, "繁中": true, "简": true, "繁": true,
+	// other languages, as release groups spell them
+	"jap": true, "jp": true, "jpn": true, "eng": true, "en": true, "chi": true,
+	"kor": true, "kr": true, "yue": true,
+}
+
+// subTagExts are the filename extensions that decide a *format*. A tag that is
+// one of these is an extension, not a language marker.
+var subTagExts = map[string]bool{
+	"srt": true, "ass": true, "ssa": true, "vtt": true, "sub": true,
+	"idx": true, "sup": true, "txt": true, "7z": true, "zip": true, "rar": true,
+}
+
+// subLangTag returns the language tag a file name ends with, if it ends with
+// one at all: "…[01][Ma10p_1080p][x265_flac_aac].Chs" → "chs".
+//
+// This shape is not an accident of one release group — VCB-Studio's batches ship
+// their Chinese subtitles as `…[x265_flac_aac].Chs` and `….Cht`, with the
+// language standing in for the extension, so the file has none. A name that ends
+// in a real extension has its format decided by that extension instead, and the
+// tag on it ("…简日.ass") is only ever used as a language hint.
+func subLangTag(name string) string {
+	dot := strings.LastIndex(name, ".")
+	if dot <= 0 || dot == len(name)-1 {
+		return ""
+	}
+	tag := strings.ToLower(name[dot+1:])
+	if subTagExts[tag] || !subLangTags[tag] {
+		return ""
+	}
+	return tag
+}
+
+// DetectTaggedSubFormat classifies a subtitle file whose name ends in a language
+// tag instead of an extension.
+//
+// The tag says "this is the Simplified Chinese track", never what the file is
+// written in — "…aac].Chs" in the wild is ASS, and ffmpeg sniffs its bytes for
+// the same reason (see SniffTextSubFormat). Registering it as ASS and correcting
+// the format from the file's own first bytes at serve time beats dropping the
+// track, which is what happens if only extensions are believed.
+func DetectTaggedSubFormat(name string) (format string, convertible bool) {
+	if subLangTag(name) == "" {
+		return "", false
+	}
+	return "ass", true
+}
+
 // langPatterns map a file or track name to a language. The ASCII alternatives
 // are word-anchored, but the CJK ones cannot be: Go's \b is an ASCII word
 // boundary, so `\b简\b` never matches text such as ".简日." — which is exactly
@@ -57,15 +114,212 @@ func GuessLang(name string) string {
 	return ""
 }
 
+// SubLabel turns a subtitle file name into the label a viewer picks from.
+//
+// What a viewer needs from this line is which track it is, so the label is the
+// part of the name that says so — the show and any human tag — with the release
+// furniture around it taken away: group tags, episode numbers, codecs,
+// resolutions, CRCs. Real sidecar names are mostly furniture:
+//
+//	[VCB-Studio][Yahari_Ore_…_Zoku][01][x265_aac][BDrip_1080P][DED1CA06].SumiSora.tc.ass
+//
+// has little left once that is gone, so any script tag the name carries is kept
+// and put first — "简体 · …" / "繁体 · …" / "日语 · …". A name that compacts away
+// to nothing at all is labelled by that tag alone, which is exactly what the
+// viewer was looking for and short enough to read on a phone. Two tracks of one
+// episode must never come out with the same label.
 func SubLabel(name string) string {
 	base := name
 	if i := strings.LastIndex(base, "/"); i >= 0 {
 		base = base[i+1:]
 	}
-	if i := strings.LastIndex(base, "."); i >= 0 {
-		base = base[:i]
+	tag := scriptLabel(nameLangTag(base))
+	body := compactSubLabel(base)
+	switch {
+	case tag != "" && body != "":
+		return tag + " · " + truncateLabel(body, maxSubLabel-len([]rune(tag))-len([]rune(" · ")))
+	case tag != "":
+		return tag
+	case body != "":
+		return truncateLabel(body, maxSubLabel)
+	}
+	// Nothing to describe the track with: keep the name as it is rather than
+	// invent a label that might name the wrong one.
+	if i := strings.LastIndex(base, "."); i > 0 {
+		if _, known := DetectSubFormat(base[i:]); known {
+			base = base[:i]
+		}
 	}
 	return strings.TrimSpace(base)
+}
+
+// nameLangTag finds the language tag wherever a release puts it in a dotted
+// name: where the extension would be ("….Chs"), just before one ("….Jap.ass"),
+// or further back when a group signs the file ("….Chs.Kamigami.ass").
+func nameLangTag(base string) string {
+	parts := strings.Split(base, ".")
+	// Walk back over the format extensions to the first real tag.
+	for i := len(parts) - 1; i > 0; i-- {
+		if _, isExt := DetectSubFormat("." + strings.ToLower(parts[i])); isExt {
+			continue
+		}
+		if t := subLangTag(strings.Join(parts[:i+1], ".")); t != "" {
+			return t
+		}
+		// A tag that is not a language ("….SumiSora.tc") is the group's name;
+		// keep walking back for the language in front of it ("….Chs.Kamigami").
+	}
+	return ""
+}
+
+// scriptLabel names a language tag the way a viewer reads it. Tags like ".tc"
+// and ".Chs" are the whole description a sidecar file carries, and "tc" alone is
+// not a name anyone picks a subtitle by.
+var scriptLabels = map[string]string{
+	"chs": "简体", "sc": "简体", "gb": "简体", "hans": "简体", "zhcn": "简体",
+	"简体": "简体", "简中": "简体", "简": "简体",
+	"cht": "繁体", "tc": "繁体", "big5": "繁体", "hant": "繁体", "zhtw": "繁体",
+	"繁体": "繁体", "繁體": "繁体", "繁中": "繁体", "繁": "繁体",
+	"jap": "日语", "jp": "日语", "jpn": "日语",
+	"eng": "英语", "en": "英语",
+	"kor": "韩语", "kr": "韩语",
+	"yue": "粤语", "chi": "中文", "zh": "中文",
+}
+
+func scriptLabel(tag string) string {
+	return scriptLabels[strings.ToLower(strings.TrimSpace(tag))]
+}
+
+// labelJunk are the name parts that say nothing about which track this is: the
+// same furniture the matcher ignores, plus the connector words release names are
+// full of.
+var labelJunk = map[string]bool{
+	"vcb": true, "studio": true, "sumisora": true, "kamigami": true,
+	"nekomoe": true, "kissaten": true, "beansub": true, "lolihouse": true,
+	"and": true, "the": true, "ver": true,
+	"x265": true, "x264": true, "h265": true, "h264": true, "hevc": true,
+	"avc": true, "10bit": true, "8bit": true, "hi10p": true, "ma10p": true,
+	"flac": true, "aac": true, "ac3": true, "eac3": true, "dts": true,
+	"opus": true, "mp3": true, "pcm": true, "truehd": true, "atmos": true,
+	"1080p": true, "1080i": true, "720p": true, "2160p": true, "480p": true,
+	"4k": true, "uhd": true, "hdr": true, "hdr10": true, "dovi": true, "dv": true,
+	"bdrip": true, "bd": true, "bluray": true, "bdmv": true, "webrip": true,
+	"web": true, "webdl": true, "dl": true, "hdtv": true, "dvdrip": true,
+	"remux": true, "repack": true, "proper": true, "complete": true,
+	"ova": true, "oad": true, "sp": true, "sps": true, "ncop": true, "nced": true,
+	"pv": true, "cd": true, "cds": true, "scan": true, "scans": true,
+	"font": true, "fonts": true, "menu": true, "menus": true, "bonus": true,
+}
+
+// compactSubLabel keeps the words of a name that identify the track, in order,
+// and returns "" when the name is all furniture.
+func compactSubLabel(base string) string {
+	// Two rounds: an extension ("….ass"), then the language tag in front of it
+	// ("….SumiSora.tc.ass"). Both are furniture, and leaving the tag on would
+	// make it look like a title word.
+	stem := base
+	for i := 0; i < 2; i++ {
+		j := strings.LastIndex(stem, ".")
+		if j <= 0 {
+			break
+		}
+		if _, known := DetectSubFormat(stem[j:]); !known && subLangTag(stem) == "" {
+			break
+		}
+		stem = stem[:j]
+	}
+
+	var kept []string
+	for _, w := range subWordRe.Split(stem, -1) {
+		t := strings.ToLower(strings.TrimSpace(w))
+		if t == "" || labelJunk[t] || isAllDigits(t) || isHexRun(t) {
+			continue
+		}
+		kept = append(kept, w)
+	}
+	if len(kept) == 0 {
+		return ""
+	}
+	return strings.Join(kept, " ")
+}
+
+// truncateLabel bounds a label to n runes so it stays readable in the player's
+// list, marking that something was cut.
+func truncateLabel(s string, n int) string {
+	r := []rune(s)
+	if n < 1 {
+		return ""
+	}
+	if len(r) <= n {
+		return s
+	}
+	return strings.TrimSpace(string(r[:n])) + "…"
+}
+
+var subWordRe = regexp.MustCompile(`[^\p{L}\p{N}]+`)
+
+func isAllDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return s != ""
+}
+
+// isHexRun reports an eight-character checksum such as the "DED1CA06" release
+// names carry, which is not a word anyone reads.
+func isHexRun(s string) bool {
+	if len(s) != 8 {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// maxSubLabel bounds a label so it stays readable in the player's list.
+const maxSubLabel = 40
+
+// assHeaderMarkers identify an SSA/ASS script from its own text: the two
+// section headings every such file carries, in either spelling.
+var assHeaderMarkers = [][]byte{
+	[]byte("[Script Info]"), []byte("[script info]"),
+	[]byte("[V4+ Styles]"), []byte("[v4+ styles]"),
+	[]byte("[V4 Styles]"), []byte("[v4 styles]"),
+	[]byte("[Events]"), []byte("[events]"),
+}
+
+// SniffTextSubFormat decides a text subtitle's real format from its content.
+//
+// It exists because the file name is only a claim. A release may ship ASS under
+// a language tag with no extension at all ("…aac].Chs"), so the format cannot be
+// read off the name; and a track registered by its name alone would be handed to
+// the SRT converter, which would turn every "Dialogue: 0,0:00:01.00,…" line into
+// a cue and lose the typesetting. Only ASS is claimed by signature — the
+// strongest, unambiguous one — and everything else falls to SubRip, whose
+// converter is the one that simply shows the text when it is handed something it
+// does not recognise.
+func SniffTextSubFormat(data []byte) (format string, convertible bool) {
+	head := data
+	if len(head) > 8192 {
+		head = head[:8192]
+	}
+	// A UTF-8 BOM must not hide the first section heading.
+	head = bytes.TrimPrefix(head, []byte{0xEF, 0xBB, 0xBF})
+	trimmed := bytes.TrimLeft(head, " \t\r\n")
+	if bytes.HasPrefix(trimmed, []byte("WEBVTT")) {
+		return "webvtt", true
+	}
+	for _, m := range assHeaderMarkers {
+		if bytes.Contains(head, m) {
+			return "ass", true
+		}
+	}
+	return "subrip", true
 }
 
 // ---------- WebVTT conversion ----------
