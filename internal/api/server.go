@@ -38,12 +38,17 @@ type Server struct {
 	loginLimiter    *attemptLimiter
 	registerLimiter *attemptLimiter
 	mailLimiter     *attemptLimiter
+
+	// SubtitleAudits holds the per-library "which BDRip episodes have no
+	// subtitles" audits and their last results. See subaudit.go.
+	SubtitleAudits *subtitleAuditRegistry
 }
 
 func New(store *db.Store, cfg *config.Config, scanner *scan.Scanner, meta *metadata.Manager, engine *media.Engine, webFS fs.FS, version string) *Server {
 	return &Server{
 		Store: store, Cfg: cfg, Scanner: scanner, Metadata: meta, Engine: engine,
 		WebFS: webFS, DevWeb: cfg.DevWebDir, Version: version,
+		SubtitleAudits: newSubtitleAuditRegistry(),
 		// Ten wrong passwords per address per five minutes is far more than a
 		// person needs and far too slow to guess with; five signups per hour
 		// keeps a shared address (a family, a dorm) working while stopping a
@@ -251,6 +256,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/libraries/{id}/scan", s.requireAdmin(s.handleScanLibrary))
 	mux.HandleFunc("POST /api/libraries/{id}/scan/stop", s.requireAdmin(s.handleStopScan))
 	mux.HandleFunc("GET /api/scan/status", s.requireAuth(s.handleScanStatus))
+
+	// subtitle audit (which BDRip episodes have no subtitles at all)
+	mux.HandleFunc("POST /api/libraries/{id}/subtitle-audit", s.requireAdmin(s.handleSubtitleAuditStart))
+	mux.HandleFunc("POST /api/libraries/{id}/subtitle-audit/stop", s.requireAdmin(s.handleSubtitleAuditStop))
+	mux.HandleFunc("GET /api/subtitle-audit", s.requireAuth(s.handleSubtitleAuditStatus))
 
 	// items
 	mux.HandleFunc("GET /api/home", s.requireAuth(s.handleHome))

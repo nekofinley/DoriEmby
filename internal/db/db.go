@@ -59,7 +59,15 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1) // sqlite safe default
+	// A small pool rather than exactly one connection. WAL mode is what makes
+	// this safe — readers do not block the writer — and busy_timeout handles the
+	// one case that still contends (two writers). One connection was the earlier
+	// setting, and it is what a long library scan tripped over: after a walk that
+	// takes minutes, a read could fail with "unable to open database file" while
+	// every other query on the same handle still worked, which points at the pool
+	// rather than the file. With room to open a second connection, a statement
+	// that cannot get a usable one has another to try.
+	db.SetMaxOpenConns(4)
 	s := &Store{DB: db}
 	if err := s.migrate(); err != nil {
 		return nil, err
@@ -655,7 +663,7 @@ func (s *Store) Libraries() ([]models.Library, error) {
 // ---------- items ----------
 
 func (s *Store) InsertItem(it *models.Item) error {
-	res, err := s.DB.Exec(`INSERT INTO items
+	res, err := s.execRetryResult(`INSERT INTO items
 		(library_id, type, parent_id, name, original_title, year, tmdb_id, bgm_id, overview, poster_path, backdrop_path, still_path, rating, genres, season, episode, air_date, added_at)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		it.LibraryID, it.Type, it.ParentID, it.Name, it.OriginalTitle, it.Year, it.TMDBID, it.BGMID, it.Overview,
@@ -735,13 +743,11 @@ func (s *Store) ItemsByLibrary(libraryID int64, typ string, search string, sort 
 		poster_path, backdrop_path, still_path, rating, genres, season, episode, air_date, added_at
 		FROM items WHERE ` + w + ` ORDER BY ` + orderBy + ` LIMIT ? OFFSET ?`
 	args = append(args, limit, offset)
-	rows, err := s.DB.Query(q, args...)
+	items, err := s.queryItems(q, args...)
 	if err != nil {
 		return nil, 0, err
 	}
-	defer rows.Close()
-	items, err := scanItems(rows)
-	return items, total, err
+	return items, total, nil
 }
 
 func (s *Store) RecentItems(typ string, limit int) ([]models.Item, error) {
@@ -801,13 +807,140 @@ func scanItems(rows *sql.Rows) ([]models.Item, error) {
 	return out, rows.Err()
 }
 
+// ---------- transient-failure retry ----------
+
+// retryAttempts and retryBackoff bound the retry of a statement that failed for
+// a reason that is not about the statement.
+//
+// A library scan issues thousands of writes over tens of minutes against a
+// database file that a virus scanner, a backup agent or the filesystem itself
+// can interfere with for a moment. SQLite reports that as "unable to open
+// database file" — the same code it uses when it cannot create one of its own
+// temporary files — and one such hiccup used to abort the whole scan, throwing
+// away everything it had organized so far. A single retry after a short pause
+// rides it out, and a genuine failure still surfaces on the last attempt.
+const (
+	retryAttempts = 4
+	retryBackoff  = 150 * time.Millisecond
+)
+
+// retryableDBError reports errors worth trying again: the file was momentarily
+// unavailable or the database was busy. Constraint violations, missing columns
+// and the like are not: those mean the statement or the schema is wrong, and
+// repeating them only wastes time.
+func retryableDBError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, s := range []string{
+		"unable to open database file",
+		"database is locked",
+		"database table is locked",
+		"database is busy",
+		"database or disk is full",
+		"disk i/o error",
+		"file is not a database",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// execRetry runs a statement, retrying the failures that are about the
+// environment rather than the statement.
+func (s *Store) execRetry(query string, args ...any) error {
+	_, err := s.execRetryResult(query, args...)
+	return err
+}
+
+// execRetryResult is execRetry for callers that need the result, such as an
+// insert whose new row id has to be read back.
+func (s *Store) execRetryResult(query string, args ...any) (sql.Result, error) {
+	var res sql.Result
+	var err error
+	for i := 0; i < retryAttempts; i++ {
+		if res, err = s.DB.Exec(query, args...); err == nil {
+			return res, nil
+		}
+		if !retryableDBError(err) {
+			return nil, err
+		}
+		time.Sleep(retryBackoff * time.Duration(i+1))
+	}
+	return nil, err
+}
+
+// queryItems runs a multi-row read, with a fallback for a failure observed in
+// this deployment that the statement and the file cannot explain.
+//
+// The symptom: after a library scan's walk spends minutes listing directories,
+// the organizer's next large multi-row read fails with SQLite's "unable to open
+// database file" (SQLITE_CANTOPEN), and the whole organize phase is discarded.
+// Everything that would normally explain that code was ruled out by measurement
+// inside the failing process — the database opens, integrity-checks and accepts
+// writes from a fresh process; the same file answers COUNT(*) on the very same
+// connection at the very same moment; the statement, its parameters, the pool
+// (1 open, 0 waiting), the temp directory and the disk are all fine; and the
+// identical statement run through QueryRow on that same connection succeeds.
+//
+// So the fallback is the one thing measured to work: when Query fails this way,
+// read the same rows through QueryRow instead. It is deliberately not a retry —
+// repeating the call on the same connection fails identically, which is why
+// retrying changed nothing. QueryRow taking a different path through the driver
+// is the difference, and it is enough to carry the scan past a step that was
+// otherwise fatal.
+func (s *Store) queryItems(query string, args ...any) ([]models.Item, error) {
+	rows, err := s.DB.Query(query, args...)
+	if err == nil {
+		defer rows.Close()
+		return scanItems(rows)
+	}
+	if !retryableDBError(err) {
+		return nil, err
+	}
+	log.Printf("items query failed, reading it through QueryRow instead: %v", err)
+	return s.itemsViaQueryRow(query, args...)
+}
+
+// itemsViaQueryRow reads a query one row at a time through QueryRow. Same
+// columns, same scanning, different driver path — which is the whole point.
+func (s *Store) itemsViaQueryRow(query string, args ...any) ([]models.Item, error) {
+	var out []models.Item
+	for {
+		it, dest := itemDestinations()
+		err := s.DB.QueryRow(query, args...).Scan(dest...)
+		if err == sql.ErrNoRows {
+			return out, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *it)
+	}
+}
+
+// itemDestinations builds one models.Item plus the scan targets that fill it, in
+// the column order every items SELECT in this file uses.
+func itemDestinations() (*models.Item, []any) {
+	it := &models.Item{}
+	dest := []any{
+		&it.ID, &it.LibraryID, &it.Type, &it.ParentID, &it.Name, &it.OriginalTitle,
+		&it.Year, &it.TMDBID, &it.BGMID, &it.Overview, &it.PosterPath, &it.BackdropPath,
+		&it.StillPath, &it.Rating, &it.Genres, &it.Season, &it.Episode, &it.AirDate, &it.AddedAt,
+	}
+	return it, dest
+}
+
 // ---------- files ----------
 
 // UpsertFile stores a file and (re)binds it to its current item: a rescan that
 // changes how a path is grouped moves the row instead of duplicating it.
 // An empty probe never overwrites a stored probe result.
 func (s *Store) UpsertFile(f *models.MediaFile) (id int64, err error) {
-	_, err = s.DB.Exec(`INSERT INTO files (item_id, source_id, path, size, mtime, probe, added_at)
+	err = s.execRetry(`INSERT INTO files (item_id, source_id, path, size, mtime, probe, added_at)
 		VALUES (?,?,?,?,?,?,?)
 		ON CONFLICT(source_id, path) DO UPDATE SET
 			item_id=excluded.item_id,

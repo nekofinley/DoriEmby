@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"regexp"
 	"strconv"
 	"strings"
@@ -32,7 +33,7 @@ type Scanner struct {
 	// OnScanned fires after a library scan finishes, so the caller can warm
 	// caches (e.g. pre-probe new files) without blocking the scan itself.
 	OnScanned func(lib *models.Library)
-	states    sync.Map // libraryID -> *models.ScanState
+	states    sync.Map // libraryID -> *models.ScanProgress
 	cancels   sync.Map // libraryID -> context.CancelFunc
 
 	queue chan *models.Library
@@ -48,24 +49,29 @@ func (sc *Scanner) Cancel(libID int64) bool {
 	return false
 }
 
-func (sc *Scanner) State(libID int64) *models.ScanState {
+// State reports a scan's progress. The result is a copy: the scan keeps running
+// while the caller marshals it.
+func (sc *Scanner) State(libID int64) models.ScanState {
 	if v, ok := sc.states.Load(libID); ok {
-		return v.(*models.ScanState)
+		st, _ := v.(*models.ScanProgress).Snapshot(0)
+		return st
 	}
-	return &models.ScanState{LibraryID: libID, Phase: "idle"}
+	return models.ScanState{LibraryID: libID, Phase: "idle"}
 }
 
-func (sc *Scanner) AllStates() []*models.ScanState {
-	var out []*models.ScanState
+// AllStates snapshots every tracked scan, for the settings page poll.
+func (sc *Scanner) AllStates() []models.ScanState {
+	var out []models.ScanState
 	sc.states.Range(func(_, v any) bool {
-		out = append(out, v.(*models.ScanState))
+		st, _ := v.(*models.ScanProgress).Snapshot(0)
+		out = append(out, st)
 		return true
 	})
 	return out
 }
 
-func (sc *Scanner) setState(libID int64, st *models.ScanState) {
-	sc.states.Store(libID, st)
+func (sc *Scanner) setState(libID int64, p *models.ScanProgress) {
+	sc.states.Store(libID, p)
 }
 
 // ScanLibrary enqueues a library scan (processed sequentially by one worker).
@@ -89,19 +95,30 @@ func (sc *Scanner) worker() {
 }
 
 func (sc *Scanner) runScan(lib *models.Library) error {
-	st := &models.ScanState{LibraryID: lib.ID, Running: true, Phase: "walk", StartedAt: float64(time.Now().UnixMilli()) / 1000}
-	sc.setState(lib.ID, st)
+	prog := models.NewScanProgress(lib.ID)
+	prog.Set(models.ScanState{
+		LibraryID: lib.ID, Running: true, Phase: "walk",
+		StartedAt: float64(time.Now().UnixMilli()) / 1000,
+	})
+	prog.AddEvent("info", "开始扫描 "+lib.Name)
+	sc.setState(lib.ID, prog)
+
+	fail := func(msg string) {
+		prog.Update(func(st *models.ScanState) {
+			st.Running, st.Error, st.Phase = false, msg, "error"
+			st.FinishedAt = float64(time.Now().UnixMilli()) / 1000
+		})
+		prog.AddEvent("warn", msg)
+	}
 
 	src, err := sc.Store.SourceByID(lib.SourceID)
 	if err != nil {
-		st.Running, st.Error, st.Phase = false, "源不存在: "+err.Error(), "error"
-		st.FinishedAt = float64(time.Now().UnixMilli()) / 1000
+		fail("源不存在: " + err.Error())
 		return err
 	}
 	drv, err := source.NewDriver(src)
 	if err != nil {
-		st.Running, st.Error, st.Phase = false, err.Error(), "error"
-		st.FinishedAt = float64(time.Now().UnixMilli()) / 1000
+		fail("源错误: " + err.Error())
 		return err
 	}
 
@@ -110,58 +127,81 @@ func (sc *Scanner) runScan(lib *models.Library) error {
 	sc.cancels.Store(lib.ID, context.CancelFunc(cancel))
 	defer sc.cancels.Delete(lib.ID)
 	finish := func() {
-		st.Running = false
-		st.FinishedAt = float64(time.Now().UnixMilli()) / 1000
-		sc.setState(lib.ID, st)
+		prog.Update(func(st *models.ScanState) {
+			st.Running = false
+			st.FinishedAt = float64(time.Now().UnixMilli()) / 1000
+		})
 	}
 
-	var stMu sync.Mutex
+	// The walk reports every directory. Emitting one line per directory would
+	// bury everything else on a large library, so the feed takes every eighth
+	// plus whatever is current — enough to see it moving.
+	var walkSeen int
 	files, listings, err := walkTree(ctx, drv, lib.Path, sc.Cfg.ScanConcurrency, func(dir string, dirs, found, errs int64, firstErr string) {
-		stMu.Lock()
-		st.Current = "扫描 " + dir
-		st.DirsDone, st.FilesFound, st.WalkErrs = int(dirs), int(found), int(errs)
-		if firstErr != "" && st.FirstErr == "" {
-			st.FirstErr = firstErr
+		walkSeen++
+		prog.Update(func(st *models.ScanState) {
+			st.Current = dir
+			st.DirsDone, st.FilesFound, st.WalkErrs = int(dirs), int(found), int(errs)
+			if firstErr != "" && st.FirstErr == "" {
+				st.FirstErr = firstErr
+			}
+		})
+		if walkSeen%8 == 0 {
+			prog.AddEvent("dir", dir)
 		}
-		stMu.Unlock()
 	})
 	if ctx.Err() != nil {
-		st.Phase, st.Error = "error", "扫描已取消"
+		prog.Update(func(st *models.ScanState) { st.Phase = "error" })
+		fail("扫描已取消")
 		finish()
 		return ctx.Err()
 	}
 	if err != nil && len(files) == 0 {
-		st.Phase, st.Error = "error", "遍历失败: "+err.Error()
+		fail("遍历失败: " + err.Error())
 		finish()
 		return err
 	}
 
-	st.Phase = "organize"
-	st.Total = len(files)
-	st.Current = fmt.Sprintf("发现 %d 个视频文件,正在整理…", len(files))
-	sc.setState(lib.ID, st)
-	if err := sc.organize(lib, files, st); err != nil {
-		st.Phase, st.Error = "error", "整理失败: "+err.Error()
+	prog.Update(func(st *models.ScanState) {
+		st.Phase = "organize"
+		st.Total = len(files)
+		st.Done = 0
+		st.Current = fmt.Sprintf("发现 %d 个视频文件,正在整理…", len(files))
+	})
+	prog.AddEvent("file", fmt.Sprintf("发现 %d 个视频文件", len(files)))
+	if err := sc.organize(lib, files, prog); err != nil {
+		fail("整理失败: " + err.Error())
 		finish()
 		return err
 	}
 
-	st.Phase = "identify"
-	st.Done, st.Total = 0, 0
-	sc.setState(lib.ID, st)
+	prog.Update(func(st *models.ScanState) {
+		st.Phase = "identify"
+		st.Done, st.Total = 0, 0
+		st.Current = "刮削与识别…"
+	})
+	prog.AddEvent("meta", "开始刮削与识别")
 	if sc.OnIdentify != nil {
 		sc.OnIdentify(lib, listings, func(done, total int, msg string) {
-			stMu.Lock()
-			st.Done, st.Total, st.Current = done, total, msg
-			stMu.Unlock()
+			prog.Update(func(st *models.ScanState) {
+				st.Done, st.Total, st.Current = done, total, msg
+			})
+			if msg != "" {
+				prog.AddEvent("meta", msg)
+			}
 		})
 	}
-	st.Phase = "done"
-	if st.WalkErrs > 0 || st.FirstErr != "" {
-		st.Error = fmt.Sprintf("完成,但有 %d 个目录读取失败(%s)", st.WalkErrs, st.FirstErr)
-	} else {
-		st.Current = fmt.Sprintf("完成,共 %d 个视频文件", st.Total)
-	}
+	// Settle the summary from the finished counters, then report it.
+	final, _ := prog.Snapshot(0)
+	prog.Update(func(st *models.ScanState) {
+		st.Phase = "done"
+		if final.WalkErrs > 0 || final.FirstErr != "" {
+			st.Error = fmt.Sprintf("完成,但有 %d 个目录读取失败(%s)", final.WalkErrs, final.FirstErr)
+		} else {
+			st.Current = fmt.Sprintf("完成,共 %d 个视频文件", st.Total)
+		}
+	})
+	prog.AddEvent("meta", fmt.Sprintf("扫描完成:%d 个视频文件", final.Total))
 	finish()
 	if sc.OnScanned != nil {
 		sc.OnScanned(lib)
@@ -300,18 +340,29 @@ type movieGroup struct {
 	Files []fileRec
 }
 
-func (sc *Scanner) organize(lib *models.Library, files []fileRec, st *models.ScanState) error {
+func (sc *Scanner) organize(lib *models.Library, files []fileRec, prog *models.ScanProgress) error {
+	// The walk runs for minutes without touching the database, and the first
+	// statement after it is the one that fails. Ping before any real work, so a
+	// connection whose handle went stale during that idle stretch is replaced on
+	// its own rather than under a query that matters.
+	if err := sc.Store.DB.Ping(); err != nil {
+		log.Printf("organize: ping before organize failed: %v", err)
+	}
+
 	switch lib.Type {
 	case "series":
-		return sc.organizeSeries(lib, files, st)
+		err := sc.organizeSeries(lib, files, prog)
+		return err
 	default:
-		return sc.organizeMovies(lib, files, st)
+		err := sc.organizeMovies(lib, files, prog)
+		return err
 	}
 }
 
-func (sc *Scanner) organizeMovies(lib *models.Library, files []fileRec, st *models.ScanState) error {
+func (sc *Scanner) organizeMovies(lib *models.Library, files []fileRec, prog *models.ScanProgress) error {
 	existing, _, err := sc.Store.ItemsByLibrary(lib.ID, "movie", "", "", 0, 1000000)
 	if err != nil {
+		log.Printf("organize: load movies failed: %v", err)
 		return err
 	}
 	byKey := map[string]int64{}
@@ -372,10 +423,21 @@ func (sc *Scanner) organizeMovies(lib *models.Library, files []fileRec, st *mode
 				return err
 			}
 		}
-		st.Done = i + 1
-		st.Current = g.Title
+		prog.Update(func(st *models.ScanState) {
+			st.Done = i + 1
+			st.Current = g.Title
+		})
+		prog.AddEvent("show", fmt.Sprintf("%s%s", g.Title, yearSuffix(g.Year)))
 	}
 	return sc.cleanup(lib, files)
+}
+
+// yearSuffix renders " (2019)" for the feed, empty when the year is unknown.
+func yearSuffix(year int) string {
+	if year <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (%d)", year)
 }
 
 type seriesIndex struct {
@@ -384,6 +446,7 @@ type seriesIndex struct {
 	seasonNames map[string]int64 // showID|normName -> season id (sub-series/arc seasons)
 	eps         map[string]int64 // seasonID|ep -> episode id
 	maxSeason   map[int64]int    // showID -> highest regular season number in use
+	loaded      map[int64]bool   // seasonID -> its episodes have been listed already
 }
 
 // nextSeason hands out the next free regular season number (1..90) for a show;
@@ -491,13 +554,14 @@ func planShow(childCount map[string]int, libPath, dir, filePath string, parsedSe
 	}
 }
 
-func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, st *models.ScanState) error {
+func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, prog *models.ScanProgress) error {
 	idx := &seriesIndex{
 		shows:       map[string]int64{},
 		seasons:     map[string]int64{},
 		seasonNames: map[string]int64{},
 		eps:         map[string]int64{},
 		maxSeason:   map[int64]int{},
+		loaded:      map[int64]bool{},
 	}
 
 	shows, _, err := sc.Store.ItemsByLibrary(lib.ID, "show", "", "", 0, 100000)
@@ -522,15 +586,37 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, st *mode
 			}
 		}
 	}
-	episodes, _, err := sc.Store.ItemsByLibrary(lib.ID, "episode", "", "", 0, 500000)
-	if err != nil {
-		return err
-	}
-	for _, it := range episodes {
-		if it.ParentID != nil {
-			idx.eps[fmt.Sprintf("%d|%d", *it.ParentID, it.Episode)] = it.ID
+	// Episodes are looked up per season rather than loaded wholesale. The one big
+	// read a rescan used to make here is also the read that fails outright
+	// ("unable to open database file") once the walk has run for a couple of
+	// minutes — on a connection where smaller reads, including the very same
+	// statement, keep working. Asking per season keeps every read small, and it
+	// is less work anyway: a season's episodes are only needed when a file for
+	// that season is being stored.
+	//
+	// The lookups are memoised in idx.eps, so a season is queried once and the
+	// episodes created during this scan are visible to the next file without a
+	// second query.
+	loadSeasonEps := func(seasonID int64) {
+		if idx.loaded[seasonID] {
+			return
+		}
+		idx.loaded[seasonID] = true
+		kids, err := sc.Store.ItemChildren(seasonID)
+		if err != nil {
+			// Not fatal: without the index the worst case is a duplicate episode
+			// row for a season whose episodes could not be listed, which the
+			// next scan's cleanup removes.
+			log.Printf("organize: list episodes of season %d failed: %v", seasonID, err)
+			return
+		}
+		for _, it := range kids {
+			if it.Type == "episode" {
+				idx.eps[fmt.Sprintf("%d|%d", seasonID, it.Episode)] = it.ID
+			}
 		}
 	}
+	_ = loadSeasonEps
 
 	childCount := dirChildCount(files)
 
@@ -583,6 +669,7 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, st *mode
 		if !ok {
 			it := &models.Item{LibraryID: lib.ID, Type: "show", Name: showTitle}
 			if err := sc.Store.InsertItem(it); err != nil {
+				log.Printf("organize: insert show %q failed: %v", showTitle, err)
 				return err
 			}
 			showID = it.ID
@@ -627,6 +714,10 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, st *mode
 		epKey := fmt.Sprintf("%d|%d", seasonID, ep)
 		epID, ok := idx.eps[epKey]
 		if !ok {
+			loadSeasonEps(seasonID)
+			epID, ok = idx.eps[epKey]
+		}
+		if !ok {
 			pid := seasonID
 			it := &models.Item{LibraryID: lib.ID, Type: "episode", ParentID: &pid,
 				Name: fmt.Sprintf("第 %d 集", ep), Season: season, Episode: ep}
@@ -640,12 +731,27 @@ func (sc *Scanner) organizeSeries(lib *models.Library, files []fileRec, st *mode
 		if _, err := sc.Store.UpsertFile(&models.MediaFile{
 			ItemID: epID, SourceID: lib.SourceID, Path: fr.Path, Size: fr.Size, MTime: fr.MTime,
 		}); err != nil {
+			log.Printf("organize: UpsertFile failed (done=%d) path=%q: %v", progDone(prog), fr.Path, err)
 			return err
 		}
-		st.Done++
-		st.Current = fmt.Sprintf("%s S%02dE%02d", showTitle, season, ep)
+		prog.Update(func(st *models.ScanState) {
+			st.Done++
+			st.Current = fmt.Sprintf("%s S%02dE%02d", showTitle, season, ep)
+		})
+		prog.AddEvent("episode", fmt.Sprintf("%s S%02dE%02d", showTitle, season, ep))
+
 	}
-	return sc.cleanup(lib, files)
+	if err := sc.cleanup(lib, files); err != nil {
+		log.Printf("organize: cleanup failed (done=%d): %v", progDone(prog), err)
+		return err
+	}
+	return nil
+}
+
+// progDone and progTotal read the organizer's counters, for diagnostics.
+func progDone(prog *models.ScanProgress) int {
+	st, _ := prog.Snapshot(0)
+	return st.Done
 }
 
 // cleanup deletes files no longer present and prunes childless items.

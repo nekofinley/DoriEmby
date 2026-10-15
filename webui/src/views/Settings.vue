@@ -4,6 +4,7 @@ import { api, fmtDate, fmtRelative } from '../api.js'
 import { me } from '../auth.js'
 import AppIcon from '../components/AppIcon.vue'
 import EmptyState from '../components/EmptyState.vue'
+import LiveProgress from '../components/LiveProgress.vue'
 import { toast } from '../toast.js'
 
 const tabs = [
@@ -99,16 +100,6 @@ async function stopScan(id) {
 }
 
 function stFor(id) { return (scanStates.value || []).find((s) => s.library_id === id) }
-function pct(st) {
-  if (!st || !st.total) return null
-  return Math.min(100, Math.round((st.done / st.total) * 100))
-}
-function phaseText(st) {
-  if (st.phase === 'walk') return `遍历中 · ${st.dirs_done || 0} 目录 / ${st.files_found || 0} 文件${st.walk_errors ? ' · ' + st.walk_errors + ' 失败' : ''}`
-  if (st.phase === 'organize') return `整理 ${st.done}/${st.total}`
-  if (st.phase === 'identify') return `识别刮削 ${st.done}/${st.total}`
-  return st.phase
-}
 function fmtClock(ts) {
   if (!ts) return ''
   return new Date(ts * 1000).toLocaleTimeString('zh-CN', { hour12: false })
@@ -125,8 +116,11 @@ function providersOf(lib) {
 
 onMounted(async () => {
   await loadAll()
+  await loadAudits()
   pollTimer = setInterval(async () => {
     try { scanStates.value = (await api.get('/api/scan/status')) || [] } catch {}
+    // 体检是长时间后台任务(要逐个探测网盘文件),轮询比扫描稍慢即可。
+    if (audits.value.some((a) => a.state.running)) await loadAudits()
   }, 2000)
 })
 onBeforeUnmount(() => clearInterval(pollTimer))
@@ -225,6 +219,64 @@ async function scanLibrary(id) {
     await api.post(`/api/libraries/${id}/scan`)
     toast.info('扫描已开始(含刮削,后台进行)')
   } catch (e) { toast.err(e.message) }
+}
+
+// ---------- 字幕体检 ----------
+// BDRip 才有意义:WebRip 的片子通常把字幕烧进画面了,没有文件也没有轨道可查,
+// 报成"缺字幕"多半是错的。所以这一页只看 bdrip。
+const audits = ref([])
+const auditOpen = ref({}) // libraryID -> 结果面板是否展开
+
+function auditFor(id) { return audits.value.find((a) => a.state.library_id === id) }
+
+async function loadAudits() {
+  try {
+    audits.value = (await api.get('/api/subtitle-audit')).audits || []
+  } catch {}
+}
+
+async function startAudit(id) {
+  try {
+    await api.post(`/api/libraries/${id}/subtitle-audit`)
+    auditOpen.value[id] = true
+    await loadAudits()
+    toast.info('开始体检:先列出缺少外挂字幕的剧集,再后台逐个确认内嵌字幕')
+  } catch (e) { toast.err(e.message) }
+}
+
+async function stopAudit(id) {
+  try {
+    await api.post(`/api/libraries/${id}/subtitle-audit/stop`)
+    await loadAudits()
+    toast.info('已停止,当前结果保留')
+  } catch (e) { toast.err(e.message) }
+}
+
+// 结果按剧集聚合:一眼看出是哪几部番需要补字幕。
+function auditGroups(items) {
+  const byShow = new Map()
+  for (const it of items) {
+    const key = it.show_id || it.season_id || it.item_id
+    if (!byShow.has(key)) {
+      byShow.set(key, { key, show: it.show || '未知剧集', showId: it.show_id, seasons: new Map() })
+    }
+    const g = byShow.get(key)
+    const sk = it.season_id || 0
+    if (!g.seasons.has(sk)) g.seasons.set(sk, { seasonId: it.season_id, season: it.season, episodes: [] })
+    g.seasons.get(sk).episodes.push(it)
+  }
+  const out = [...byShow.values()]
+  for (const g of out) {
+    g.seasons = [...g.seasons.values()].sort((a, b) => a.season - b.season)
+    for (const s of g.seasons) s.episodes.sort((a, b) => a.episode - b.episode || a.path.localeCompare(b.path))
+    g.count = g.seasons.reduce((n, s) => n + s.episodes.length, 0)
+    g.checking = g.seasons.reduce((n, s) => n + s.episodes.filter((e) => e.checking).length, 0)
+  }
+  return out.sort((a, b) => b.count - a.count || a.show.localeCompare(b.show))
+}
+function auditEpisodeLabel(e) {
+  if (!e.episode) return '特别篇'
+  return `第 ${e.episode} 集`
 }
 
 async function delLibrary(id) {
@@ -644,21 +696,31 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                     <button v-else class="btn sm primary" @click="scanLibrary(lib.id)">
                       <AppIcon name="scan" :size="14" /> 扫描
                     </button>
+                    <button
+                      v-if="auditFor(lib.id)?.state.running"
+                      class="btn sm" @click="stopAudit(lib.id)"
+                      title="停止字幕体检,已查到的结果保留"
+                    >
+                      <AppIcon name="close" :size="14" /> 停止体检
+                    </button>
+                    <button
+                      v-else
+                      class="btn sm" @click="startAudit(lib.id)"
+                      title="只查 bdrip:WebRip 的字幕通常烧在画面里,查不出来也说明不了什么"
+                    >
+                      <AppIcon name="subtitles" :size="14" /> 查缺字幕
+                    </button>
                     <button class="btn sm" @click="startEdit(lib)"><AppIcon name="settings" :size="14" /> 编辑</button>
                     <button class="btn sm danger" @click="delLibrary(lib.id)"><AppIcon name="trash" :size="14" /></button>
                   </div>
                 </div>
 
-                <div v-if="stFor(lib.id)?.running" class="scan-live">
-                  <div class="bar" :class="{ indet: pct(stFor(lib.id)) === null }">
-                    <i :style="pct(stFor(lib.id)) !== null ? { width: pct(stFor(lib.id)) + '%' } : {}"></i>
-                  </div>
-                  <div class="scan-line tiny">
-                    <span class="scan-phase"><AppIcon name="scan" :size="12" /> {{ phaseText(stFor(lib.id)) }}</span>
-                    <span v-if="stFor(lib.id).current" class="scan-cur truncate">{{ stFor(lib.id).current }}</span>
-                    <span v-if="pct(stFor(lib.id)) !== null" class="num">{{ pct(stFor(lib.id)) }}%</span>
-                  </div>
-                </div>
+                <!-- 媒体库扫描:两级进度条 + 滚动日志 -->
+                <LiveProgress
+                  v-if="stFor(lib.id)?.running"
+                  :state="stFor(lib.id)"
+                  @stop="stopScan(lib.id)"
+                />
                 <div v-else-if="stFor(lib.id)?.phase === 'done'" class="tiny scan-done">
                   <AppIcon name="check" :size="13" />
                   上次扫描完成:{{ stFor(lib.id).total }} 个文件 · {{ fmtClock(stFor(lib.id).finished_at) }}
@@ -668,6 +730,83 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                   <AppIcon name="alert" :size="14" />
                   扫描失败:{{ stFor(lib.id).error || stFor(lib.id).first_error || '未知错误' }}
                 </div>
+
+                <!-- 字幕体检 -->
+                <template v-if="auditFor(lib.id) && auditFor(lib.id).state.phase !== 'idle'">
+                  <LiveProgress
+                    v-if="auditFor(lib.id).state.running"
+                    :state="auditFor(lib.id).state"
+                    @stop="stopAudit(lib.id)"
+                  />
+                  <div v-else-if="auditFor(lib.id).state.phase === 'error'" class="scan-err">
+                    <AppIcon name="alert" :size="14" /> 字幕体检失败:{{ auditFor(lib.id).state.error }}
+                  </div>
+
+                  <div class="audit-sum">
+                    <div class="audit-sum-head">
+                      <span class="card-title" style="margin:0"><AppIcon name="subtitles" :size="15" /> 字幕体检(bdrip)</span>
+                      <button class="btn sm" @click="auditOpen[lib.id] = !auditOpen[lib.id]">
+                        {{ auditOpen[lib.id] ? '收起' : '展开' }}结果
+                      </button>
+                    </div>
+                    <div class="audit-tiles">
+                      <span class="tiny"><b class="num">{{ auditFor(lib.id).state.total }}</b> 个 bdrip 文件</span>
+                      <span class="tiny"><b class="num">{{ auditFor(lib.id).state.with_subs }}</b> 有外挂字幕</span>
+                      <span class="tiny"><b class="num">{{ auditFor(lib.id).state.embedded }}</b> 有内嵌字幕</span>
+                      <span class="tiny"><b class="num warn">{{ auditFor(lib.id).state.missing }}</b> 缺字幕</span>
+                      <span v-if="auditFor(lib.id).state.skipped" class="tiny dim">跳过 {{ auditFor(lib.id).state.skipped }} 个非 bdrip</span>
+                      <span v-if="auditFor(lib.id).state.unverified" class="tiny dim" :title="`${auditFor(lib.id).state.list_errors} 个目录读取失败(源上已不存在或无权限)`">
+                        {{ auditFor(lib.id).state.unverified }} 个无法判断
+                      </span>
+                      <span class="tiny dim">{{ fmtClock(auditFor(lib.id).state.finished_at || auditFor(lib.id).state.started_at) }}</span>
+                    </div>
+
+                    <div v-if="auditOpen[lib.id]" class="audit-body">
+                      <EmptyState
+                        v-if="!auditFor(lib.id).items.length"
+                        icon="check" title="没有缺字幕的剧集"
+                        :text="auditFor(lib.id).state.running ? '外挂字幕已经查完,正在后台确认内嵌字幕。' : '这个库里每个 bdrip 文件都能找到字幕。'"
+                      />
+                      <div v-else class="audit-groups">
+                        <div v-for="g in auditGroups(auditFor(lib.id).items)" :key="g.key" class="audit-group">
+                          <div class="audit-group-head">
+                            <router-link v-if="g.showId" :to="`/item/${g.showId}`" class="audit-show">{{ g.show }}</router-link>
+                            <span v-else class="audit-show">{{ g.show }}</span>
+                            <span class="badge warn">{{ g.count }} 集</span>
+                            <span v-if="g.checking" class="tiny dim">· {{ g.checking }} 集待确认</span>
+                          </div>
+                          <div v-for="s in g.seasons" :key="s.seasonId" class="audit-season">
+                            <div class="audit-season-head tiny">
+                              <router-link v-if="s.seasonId" :to="`/season/${s.seasonId}`">第 {{ s.season }} 季</router-link>
+                              <span v-else>第 {{ s.season }} 季</span>
+                            </div>
+                            <div class="audit-eps">
+                              <router-link
+                                v-for="e in s.episodes" :key="e.file_id"
+                                class="audit-ep" :class="{ pending: e.checking, failed: e.error }"
+                                :to="e.season_id ? `/season/${e.season_id}` : `/item/${e.item_id}`"
+                                :title="e.path + (e.error ? '\n探测失败:' + e.error : '')"
+                              >
+                                {{ auditEpisodeLabel(e) }}
+                                <span v-if="e.checking" class="dot-pending">?</span>
+                                <span v-else-if="e.error" class="dot-failed">!</span>
+                              </router-link>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                      <div class="tiny dim audit-note">
+                        带 <b>?</b> 的还没确认完(正在探测内嵌字幕轨),可能随时从名单里消失;
+                        带 <b>!</b> 的是探测失败,还没定论。这里只查 bdrip —— WebRip 的字幕多半烧在画面里,
+                        没有文件也没有轨道可查,报了也不准。
+                        <template v-if="auditFor(lib.id).state.unverified">
+                          另有 {{ auditFor(lib.id).state.unverified }} 个文件因为所在目录读不出来(源上已删除或无权限)没有计入,
+                          它们既不算缺字幕也不算有字幕。
+                        </template>
+                      </div>
+                    </div>
+                  </div>
+                </template>
               </template>
             </div>
           </div>
@@ -1324,14 +1463,46 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
 .lib-card { padding: var(--sp-4) var(--sp-5); }
 .lib-line { display: flex; align-items: center; gap: 14px; }
 .lib-actions { display: flex; gap: 8px; flex: none; flex-wrap: wrap; }
-.scan-live { margin-top: 14px; }
-.scan-line { margin-top: 8px; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
-.scan-phase { display: inline-flex; align-items: center; gap: 6px; color: var(--brand); font-weight: 600; }
-.scan-cur { color: var(--text-4); max-width: 46%; direction: rtl; text-align: left; }
+/* 扫描/体检的进度显示由 LiveProgress 组件自己带样式 */
 .scan-done { margin-top: 10px; display: flex; align-items: center; gap: 6px; color: var(--text-3); }
 .scan-done svg { color: var(--ok); }
 .scan-warn { color: var(--warn); }
 .scan-err { margin-top: 10px; display: flex; align-items: center; gap: 7px; color: var(--danger); font-weight: 600; font-size: var(--fs-13); }
+
+/* 字幕体检:摘要一行 + 按剧集聚合的缺字幕名单 */
+.audit-sum { margin-top: 14px; border-top: 1px solid var(--line-1); padding-top: 12px; }
+.audit-sum-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.audit-tiles { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 9px; color: var(--text-3); }
+.audit-tiles .num { color: var(--text-1); font-variant-numeric: tabular-nums; }
+.audit-tiles .num.warn { color: var(--warn); }
+.audit-tiles .dim, .audit-note { color: var(--text-4); }
+.audit-body { margin-top: 14px; }
+.audit-groups { display: flex; flex-direction: column; gap: 14px; }
+.audit-group {
+  border: 1px solid var(--line-1); border-radius: var(--r-m);
+  padding: 11px 13px; background: var(--bg-2);
+}
+.audit-group-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.audit-show { font-weight: 650; font-size: var(--fs-14); color: var(--text-1); }
+a.audit-show:hover { color: var(--brand); }
+.badge.warn { color: var(--warn); border-color: rgba(251, 191, 36, 0.4); }
+.audit-season { margin-top: 9px; }
+.audit-season-head { color: var(--text-4); margin-bottom: 5px; }
+.audit-season-head a:hover { color: var(--brand); }
+.audit-eps { display: flex; gap: 6px; flex-wrap: wrap; }
+.audit-ep {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 9px; border-radius: var(--r-pill);
+  border: 1px solid var(--line-1); background: var(--bg-3);
+  font-size: var(--fs-12); color: var(--text-2); white-space: nowrap;
+}
+.audit-ep:hover { border-color: var(--brand); color: var(--text-1); }
+/* 还没确认完的(正在探测内嵌字幕轨)—— 可能随时从名单里消失 */
+.audit-ep.pending { border-style: dashed; color: var(--text-4); }
+.audit-ep.failed { border-color: rgba(255, 107, 107, 0.45); color: var(--danger); }
+.audit-ep .dot-pending, .audit-ep .dot-failed { font-weight: 700; }
+.audit-note { margin-top: 13px; line-height: 1.7; }
+.audit-note b { color: var(--text-3); }
 
 .type-picker { display: flex; gap: 8px; flex-wrap: wrap; }
 .test-line { display: flex; align-items: center; gap: 10px; margin-top: 10px; flex-wrap: wrap; }

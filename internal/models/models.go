@@ -1,6 +1,9 @@
 package models
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
 // Account roles. Only RoleAdmin reaches the settings backend; RoleUser is a
 // viewer that can browse, play and keep its own playback progress.
@@ -136,6 +139,8 @@ type Progress struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// ScanState is the snapshot of a scan's counters, as the settings page reads
+// them. The live one is owned by ScanProgress, which copies it out under a lock.
 type ScanState struct {
 	LibraryID int64   `json:"library_id"`
 	Running   bool    `json:"running"`
@@ -152,5 +157,94 @@ type ScanState struct {
 	WalkErrs   int    `json:"walk_errors,omitempty"`
 	FirstErr   string `json:"first_error,omitempty"`
 
+	// Events is the live feed for the settings page, oldest first: what the scan
+	// has just been doing. ScanProgress.Snapshot fills it; it is empty on a state
+	// that was never attached to one.
+	Events []ScanEvent `json:"events,omitempty"`
+
 	FinishedAt float64 `json:"finished_at,omitempty"`
+}
+
+// ScanEvent is one thing a running scan just did, for the live feed the settings
+// page shows. Scans are long and mostly silent, so without this the only sign of
+// life is a counter; with it the log scrolls the way a build log does.
+type ScanEvent struct {
+	// Seq rises by one per event. The client keeps the highest it has seen and
+	// appends only what is newer, so a poll that arrives twice, or a client that
+	// was on another page for a while, cannot duplicate or reorder the feed.
+	Seq  int64   `json:"seq"`
+	At   float64 `json:"at"`
+	Kind string  `json:"kind"` // dir | file | show | season | episode | sub | meta | warn
+	Text string  `json:"text"`
+}
+
+// scanEventRing bounds the feed. A client polls every couple of seconds and only
+// ever displays the last handful, so a hundred is generous; what matters is that
+// it cannot grow without limit on a scan of a hundred thousand files.
+const scanEventRing = 100
+
+// ScanProgress is a scan's live state. Every field is written by the walking and
+// organizing goroutines while the HTTP handler reads it to answer a poll, so the
+// state lives behind a mutex and callers get a copy: returning the struct itself
+// would hand a caller a value that keeps changing under it.
+type ScanProgress struct {
+	mu     sync.Mutex
+	state  ScanState
+	events []ScanEvent
+	seq    int64
+}
+
+func NewScanProgress(libraryID int64) *ScanProgress {
+	return &ScanProgress{state: ScanState{LibraryID: libraryID, Phase: "idle"}}
+}
+
+// Update mutates the state under the lock.
+func (p *ScanProgress) Update(fn func(st *ScanState)) {
+	p.mu.Lock()
+	fn(&p.state)
+	p.mu.Unlock()
+}
+
+// Set is Update for the common case of assigning whole fields.
+func (p *ScanProgress) Set(st ScanState) {
+	p.mu.Lock()
+	p.state = st
+	p.mu.Unlock()
+}
+
+// AddEvent appends one line to the live feed, dropping the oldest when full.
+func (p *ScanProgress) AddEvent(kind, text string) {
+	if text == "" {
+		return
+	}
+	p.mu.Lock()
+	p.seq++
+	p.events = append(p.events, ScanEvent{
+		Seq:  p.seq,
+		At:   float64(time.Now().UnixMilli()) / 1000,
+		Kind: kind,
+		Text: text,
+	})
+	if len(p.events) > scanEventRing {
+		p.events = append(p.events[:0], p.events[len(p.events)-scanEventRing:]...)
+	}
+	p.mu.Unlock()
+}
+
+// Snapshot is a copy of the state and the feed, safe to marshal while the scan
+// keeps running. events is the last `want` lines, oldest first; want <= 0 means
+// as many as the ring holds.
+func (p *ScanProgress) Snapshot(want int) (ScanState, []ScanEvent) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	st := p.state
+	if want <= 0 || want > len(p.events) {
+		want = len(p.events)
+	}
+	ev := make([]ScanEvent, want)
+	copy(ev, p.events[len(p.events)-want:])
+	// The feed rides along with the state so one JSON object carries both: the
+	// settings page polls a single endpoint for progress and the log behind it.
+	st.Events = ev
+	return st, ev
 }
