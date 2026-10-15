@@ -76,6 +76,8 @@ func (s *Store) migrate() error {
 			salt TEXT NOT NULL,
 			role TEXT NOT NULL DEFAULT 'user',
 			status TEXT NOT NULL DEFAULT 'active',
+			email TEXT NOT NULL DEFAULT '',
+			email_verified INTEGER NOT NULL DEFAULT 0,
 			created_at TIMESTAMP NOT NULL,
 			last_login_at TIMESTAMP
 		)`,
@@ -84,6 +86,18 @@ func (s *Store) migrate() error {
 			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 			expires_at TIMESTAMP NOT NULL
 		)`,
+		// One-shot tokens mailed to a user: kind 'verify' proves an address,
+		// kind 'reset' authorises a new password. Rows cascade with the account,
+		// and only one of each kind is kept per user, so asking for a new link
+		// invalidates the previous one.
+		`CREATE TABLE IF NOT EXISTS auth_tokens (
+			token TEXT PRIMARY KEY,
+			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			kind TEXT NOT NULL,
+			expires_at TIMESTAMP NOT NULL,
+			created_at TIMESTAMP NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_auth_tokens_user ON auth_tokens(user_id, kind)`,
 		`CREATE TABLE IF NOT EXISTS sources (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			name TEXT NOT NULL,
@@ -170,22 +184,38 @@ func (s *Store) migrate() error {
 // migrateUsers adds the columns a database from before multi-user support is
 // missing. Existing rows keep working: the single account such a database had
 // was created as an admin by the setup flow, so it stays an active admin.
+//
+// The email columns land empty, which is what exempts long-standing accounts
+// from the address check — an owner who turns verification on must not find
+// their own account locked out behind a mailbox it never had.
 func (s *Store) migrateUsers() error {
 	cols := []struct{ name, ddl string }{
 		{"status", `ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`},
 		{"last_login_at", `ALTER TABLE users ADD COLUMN last_login_at TIMESTAMP`},
+		{"email", `ALTER TABLE users ADD COLUMN email TEXT NOT NULL DEFAULT ''`},
+		{"email_verified", `ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0`},
 	}
 	for _, c := range cols {
-		has, err := s.hasColumn("users", c.name)
-		if err != nil {
+		if err := s.addColumn("users", c.name, c.ddl); err != nil {
 			return err
 		}
-		if has {
-			continue
-		}
-		if _, err := s.DB.Exec(c.ddl); err != nil {
-			return fmt.Errorf("users.%s: %w", c.name, err)
-		}
+	}
+	return nil
+}
+
+// addColumn adds one column to an existing table when it predates it. SQLite
+// has no "ADD COLUMN IF NOT EXISTS", and migrate() runs on every start, so the
+// current columns are read first.
+func (s *Store) addColumn(table, column, ddl string) error {
+	has, err := s.hasColumn(table, column)
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	if _, err := s.DB.Exec(ddl); err != nil {
+		return fmt.Errorf("%s.%s: %w", table, column, err)
 	}
 	return nil
 }
@@ -237,14 +267,17 @@ func (s *Store) hasColumn(table, column string) (bool, error) {
 
 // userCols is the column list every user query scans, in the order scanUser
 // reads them, so adding a column means touching those two places only.
-const userCols = `id, name, pass_hash, salt, role, status, created_at, last_login_at`
+const userCols = `id, name, pass_hash, salt, role, status, email, email_verified, created_at, last_login_at`
 
 func scanUser(row interface{ Scan(...any) error }) (*models.User, error) {
 	u := &models.User{}
 	var last sql.NullTime
-	if err := row.Scan(&u.ID, &u.Name, &u.PassHash, &u.Salt, &u.Role, &u.Status, &u.CreatedAt, &last); err != nil {
+	var verified int
+	if err := row.Scan(&u.ID, &u.Name, &u.PassHash, &u.Salt, &u.Role, &u.Status,
+		&u.Email, &verified, &u.CreatedAt, &last); err != nil {
 		return nil, err
 	}
+	u.EmailVerified = verified != 0
 	if last.Valid {
 		t := last.Time
 		u.LastLogin = &t
@@ -293,8 +326,8 @@ func (s *Store) CreateUser(u *models.User) error {
 	if u.Status == "" {
 		u.Status = models.StatusActive
 	}
-	res, err := s.DB.Exec(`INSERT INTO users (name, pass_hash, salt, role, status, created_at) VALUES (?,?,?,?,?,?)`,
-		u.Name, u.PassHash, u.Salt, u.Role, u.Status, time.Now())
+	res, err := s.DB.Exec(`INSERT INTO users (name, pass_hash, salt, role, status, email, email_verified, created_at) VALUES (?,?,?,?,?,?,?,?)`,
+		u.Name, u.PassHash, u.Salt, u.Role, u.Status, u.Email, boolToInt(u.EmailVerified), time.Now())
 	if err != nil {
 		return err
 	}
@@ -302,11 +335,26 @@ func (s *Store) CreateUser(u *models.User) error {
 	return nil
 }
 
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 // UserByName looks a name up case-insensitively: SQLite's default = is
 // case-sensitive, which would let someone register "Admin" next to an existing
 // "admin" and sign in as a convincing impostor in the UI.
 func (s *Store) UserByName(name string) (*models.User, error) {
 	return scanUser(s.DB.QueryRow(`SELECT `+userCols+` FROM users WHERE name = ? COLLATE NOCASE`, name))
+}
+
+// UserByLogin finds the account behind a sign-in form or a "forgot password"
+// box, where the person may type either their name or their address.
+func (s *Store) UserByLogin(nameOrEmail string) (*models.User, error) {
+	return scanUser(s.DB.QueryRow(
+		`SELECT `+userCols+` FROM users WHERE name = ? COLLATE NOCASE OR (email <> '' AND email = ? COLLATE NOCASE)`,
+		nameOrEmail, nameOrEmail))
 }
 
 func (s *Store) UserByID(id int64) (*models.User, error) {
@@ -320,6 +368,16 @@ func (s *Store) UserByID(id int64) (*models.User, error) {
 func (s *Store) NameTaken(name string, exceptID int64) (bool, error) {
 	var n int
 	err := s.DB.QueryRow(`SELECT COUNT(*) FROM users WHERE name = ? COLLATE NOCASE AND id <> ?`, name, exceptID).Scan(&n)
+	return n > 0, err
+}
+
+// EmailTaken reports whether another account already claims that address. An
+// address identifies a person for password resets, so two accounts must not
+// share one.
+func (s *Store) EmailTaken(email string, exceptID int64) (bool, error) {
+	var n int
+	err := s.DB.QueryRow(`SELECT COUNT(*) FROM users WHERE email <> '' AND email = ? COLLATE NOCASE AND id <> ?`,
+		email, exceptID).Scan(&n)
 	return n > 0, err
 }
 
@@ -345,6 +403,71 @@ func (s *Store) UpdateUserPassword(id int64, hash, salt string) error {
 
 func (s *Store) TouchLastLogin(id int64, t time.Time) error {
 	_, err := s.DB.Exec(`UPDATE users SET last_login_at = ? WHERE id = ?`, t, id)
+	return err
+}
+
+// SetUserEmail stores an address and whether it has been proven. Changing the
+// address clears the flag unless the caller explicitly vouches for it (an admin
+// marking an account verified, or a completed verification link).
+func (s *Store) SetUserEmail(id int64, email string, verified bool) error {
+	_, err := s.DB.Exec(`UPDATE users SET email = ?, email_verified = ? WHERE id = ?`,
+		email, boolToInt(verified), id)
+	return err
+}
+
+// ---------- one-shot auth tokens ----------
+
+// Auth token kinds. Each account keeps at most one token per kind, so asking
+// for a new link invalidates the previous one.
+const (
+	TokenVerifyEmail   = "verify"
+	TokenResetPassword = "reset"
+)
+
+// CreateAuthToken issues token, replacing any outstanding one of the same kind
+// for that user. Returning the old link useless is the point: a mailbox full of
+// half-used links should not be a set of live keys.
+func (s *Store) CreateAuthToken(token string, userID int64, kind string, expires time.Time) error {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM auth_tokens WHERE user_id = ? AND kind = ?`, userID, kind); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO auth_tokens (token, user_id, kind, expires_at, created_at) VALUES (?,?,?,?,?)`,
+		token, userID, kind, expires, time.Now()); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// AuthTokenUserID resolves a token of the given kind, without judging whether
+// it has expired — the caller decides what to tell the user.
+func (s *Store) AuthTokenUserID(token, kind string) (int64, time.Time, error) {
+	var userID int64
+	var expires time.Time
+	err := s.DB.QueryRow(`SELECT user_id, expires_at FROM auth_tokens WHERE token = ? AND kind = ?`, token, kind).
+		Scan(&userID, &expires)
+	return userID, expires, err
+}
+
+func (s *Store) DeleteAuthToken(token string) error {
+	_, err := s.DB.Exec(`DELETE FROM auth_tokens WHERE token = ?`, token)
+	return err
+}
+
+// DeleteAuthTokens drops a user's outstanding tokens, used after a reset so the
+// link that was just followed cannot be replayed.
+func (s *Store) DeleteAuthTokens(userID int64, kind string) error {
+	_, err := s.DB.Exec(`DELETE FROM auth_tokens WHERE user_id = ? AND kind = ?`, userID, kind)
+	return err
+}
+
+// PruneAuthTokens drops tokens that have expired.
+func (s *Store) PruneAuthTokens() error {
+	_, err := s.DB.Exec(`DELETE FROM auth_tokens WHERE expires_at < ?`, time.Now())
 	return err
 }
 

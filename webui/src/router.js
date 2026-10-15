@@ -4,6 +4,10 @@ import { toast } from './toast.js'
 
 const routes = [
   { path: '/login', component: () => import('./views/Login.vue'), meta: { public: true, chrome: false } },
+  // The links in outgoing mail land here. Public and bare: someone following a
+  // reset link has no session, and does not need the site chrome around a form.
+  { path: '/verify-email', component: () => import('./views/VerifyEmail.vue'), meta: { public: true, chrome: false, title: '验证邮箱' } },
+  { path: '/reset-password', component: () => import('./views/ResetPassword.vue'), meta: { public: true, chrome: false, title: '重设密码' } },
   { path: '/', component: () => import('./views/Home.vue'), meta: { title: '首页', overlay: true } },
   { path: '/library/:id', component: () => import('./views/Library.vue'), meta: { title: '媒体库', overlay: true } },
   { path: '/item/:id', component: () => import('./views/Detail.vue'), meta: { title: '详情', overlay: true } },

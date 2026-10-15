@@ -3,31 +3,49 @@ import { ref, computed, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { api } from '../api.js'
 import AppIcon from '../components/AppIcon.vue'
+import Turnstile from '../components/Turnstile.vue'
 
 const route = useRoute()
 const host = location.host
 const name = ref('')
 const password = ref('')
 const confirm = ref('')
+const email = ref('')
 const showPw = ref(false)
 const error = ref('')
 const notice = ref('')
 const busy = ref(false)
 const checking = ref(true)
-const mode = ref('login') // login | register
-const bootstrap = ref({ setup_needed: false, can_register: false, registration: 'open', min_password: 4 })
+const mode = ref('login') // login | register | forgot
+const turnstileToken = ref('')
+const turnstileStatus = ref('loading')
+const turnstile = ref(null)
+const bootstrap = ref({
+  setup_needed: false, can_register: false, registration: 'open', min_password: 4,
+  require_email: false, mail_enabled: false, turnstile: { enabled: false, site_key: '' },
+})
 
 const setupNeeded = computed(() => !!bootstrap.value.setup_needed)
 const canRegister = computed(() => !setupNeeded.value && !!bootstrap.value.can_register)
 const minPassword = computed(() => bootstrap.value.min_password || 4)
+const needsEmail = computed(() => !!bootstrap.value.require_email)
+const turnstileOn = computed(() => !!bootstrap.value.turnstile?.enabled)
+const siteKey = computed(() => bootstrap.value.turnstile?.site_key || '')
+// The admin turned verification on but the server cannot send mail, so signup
+// is closed from the visitor's point of view. Say why instead of hiding the tab.
+const mailBroken = computed(() => !!bootstrap.value.require_email && !bootstrap.value.mail_enabled)
+// A challenge that never loaded cannot be solved, and submitting without a
+// token would only be rejected by the server.
+const blocked = computed(() => turnstileOn.value && turnstileStatus.value === 'failed')
 // "审核" mode is the admin saying yes, but not yet: worth spelling out so a new
 // arrival is not left wondering why the sign-in they just created fails.
 const needsApproval = computed(() => bootstrap.value.registration === 'approval' && canRegister.value)
 
 onMounted(async () => {
   try {
-    bootstrap.value = await api.get('/api/bootstrap')
+    bootstrap.value = { ...bootstrap.value, ...(await api.get('/api/bootstrap')) }
     if (setupNeeded.value) name.value = 'admin'
+    if (!turnstileOn.value) turnstileStatus.value = 'ready'
   } catch (e) {
     error.value = e.message
   } finally {
@@ -44,6 +62,8 @@ function switchMode(m) {
   confirm.value = ''
 }
 
+// One submit handler for three forms: setup, signup and sign-in all end the same
+// way (a session and a redirect), while "forgot" only sends mail.
 async function submit() {
   error.value = ''
   notice.value = ''
@@ -51,27 +71,49 @@ async function submit() {
     error.value = '两次输入的密码不一致'
     return
   }
+  if (blocked.value) {
+    error.value = '人机验证组件没有加载成功,请联系管理员'
+    return
+  }
   busy.value = true
   try {
     if (setupNeeded.value) {
       await api.post('/api/setup', { name: name.value, password: password.value })
+    } else if (mode.value === 'forgot') {
+      const res = await api.post('/api/auth/forgot-password', {
+        login: name.value, turnstile_token: turnstileToken.value,
+      })
+      notice.value = res?.message || '如果这个账号存在并且绑定了邮箱,重置密码的邮件已经发出'
+      turnstile.value?.reset()
+      busy.value = false
+      return
     } else if (mode.value === 'register') {
-      const res = await api.post('/api/auth/register', { name: name.value, password: password.value })
-      // Approval mode creates the account but refuses to sign it in yet.
-      if (res?.pending) {
+      const res = await api.post('/api/auth/register', {
+        name: name.value, password: password.value, email: email.value,
+        turnstile_token: turnstileToken.value,
+      })
+      // Approval mode and email verification both create the account but refuse
+      // to sign it in yet.
+      if (res?.pending || res?.created) {
         notice.value = res.message || '注册成功,等待管理员审核通过后即可登录'
         mode.value = 'login'
         password.value = ''
         confirm.value = ''
+        turnstile.value?.reset()
         busy.value = false
         return
       }
     } else {
-      await api.post('/api/auth/login', { name: name.value, password: password.value })
+      await api.post('/api/auth/login', {
+        name: name.value, password: password.value, turnstile_token: turnstileToken.value,
+      })
     }
     location.href = route.query.redirect || '/'
   } catch (e) {
     error.value = e.message
+    // A challenge is consumed by the attempt that used it, so a retry needs a
+    // fresh one or the server would reject it as a duplicate.
+    turnstile.value?.reset()
     busy.value = false
   }
 }
@@ -121,10 +163,11 @@ const features = [
     <section class="form-side">
       <form class="form" @submit.prevent="submit">
         <div class="form-head">
-          <h2>{{ setupNeeded ? '初始化管理员' : mode === 'register' ? '注册' : '登录' }}</h2>
+          <h2>{{ setupNeeded ? '初始化管理员' : mode === 'register' ? '注册' : mode === 'forgot' ? '找回密码' : '登录' }}</h2>
           <p class="small">
             <template v-if="setupNeeded">第一次使用,先创建一个管理员账号。</template>
             <template v-else-if="mode === 'register'">创建一个账号,登录后即可浏览与播放全部媒体。</template>
+            <template v-else-if="mode === 'forgot'">填写用户名或邮箱,我们把重置链接发到你的邮箱。</template>
             <template v-else>使用你的账号继续。</template>
           </p>
         </div>
@@ -140,16 +183,21 @@ const features = [
           >注册</button>
         </div>
 
+        <div v-if="mailBroken && mode !== 'forgot'" class="flash warn">
+          <AppIcon name="alert" :size="16" />
+          <span>管理员开启了邮箱验证,但服务器还没配好邮件发送,暂时不能注册。</span>
+        </div>
+
         <div class="field">
-          <label for="login-name">用户名</label>
+          <label for="login-name">{{ mode === 'forgot' ? '用户名或邮箱' : '用户名' }}</label>
           <input
             id="login-name" v-model="name" autocomplete="username"
-            :placeholder="mode === 'register' ? '2-32 个字符' : 'admin'"
+            :placeholder="mode === 'register' ? '2-32 个字符' : mode === 'forgot' ? 'admin 或 you@example.com' : 'admin'"
             required :disabled="busy || checking"
           />
         </div>
 
-        <div class="field">
+        <div v-if="mode !== 'forgot'" class="field">
           <label for="login-pw">密码</label>
           <div class="pw-wrap">
             <input
@@ -168,6 +216,15 @@ const features = [
           <span v-if="setupNeeded" class="hint">这个账号拥有全部管理权限,请妥善保管。</span>
         </div>
 
+        <div v-if="mode === 'register' && needsEmail" class="field">
+          <label for="login-email">邮箱</label>
+          <input
+            id="login-email" v-model="email" type="email" autocomplete="email"
+            placeholder="you@example.com" required :disabled="busy || checking"
+          />
+          <span class="hint">会发一封验证邮件,点里面的链接后才能登录。</span>
+        </div>
+
         <div v-if="mode === 'register'" class="field">
           <label for="login-pw2">确认密码</label>
           <input
@@ -175,6 +232,14 @@ const features = [
             autocomplete="new-password" placeholder="再输入一次" required :disabled="busy || checking"
           />
         </div>
+
+        <Turnstile
+          v-if="turnstileOn && !setupNeeded"
+          ref="turnstile"
+          :site-key="siteKey"
+          @update:token="turnstileToken = $event"
+          @update:status="turnstileStatus = $event"
+        />
 
         <Transition name="fade">
           <div v-if="error" class="flash err"><AppIcon name="alert" :size="16" /> {{ error }}</div>
@@ -184,23 +249,31 @@ const features = [
           <div v-if="notice" class="flash ok"><AppIcon name="check" :size="16" /> {{ notice }}</div>
         </Transition>
 
-        <button class="btn primary lg block" :disabled="busy || checking">
+        <button class="btn primary lg block" :disabled="busy || checking || blocked">
           <template v-if="busy">请稍候…</template>
           <template v-else-if="checking">检查服务…</template>
           <template v-else-if="setupNeeded">
             <AppIcon name="lock" :size="16" /> 创建并进入
           </template>
           <template v-else-if="mode === 'register'">
-            <AppIcon name="user" :size="16" /> 注册并进入
+            <AppIcon name="user" :size="16" /> 注册
+          </template>
+          <template v-else-if="mode === 'forgot'">
+            <AppIcon name="link" :size="16" /> 发送重置邮件
           </template>
           <template v-else>
             <AppIcon name="lock" :size="16" /> 登录
           </template>
         </button>
 
+        <div v-if="!setupNeeded && bootstrap.mail_enabled" class="form-links">
+          <button v-if="mode !== 'forgot'" type="button" class="linkish" @click="switchMode('forgot')">忘记密码?</button>
+          <button v-else type="button" class="linkish" @click="switchMode('login')">返回登录</button>
+        </div>
+
         <p v-if="needsApproval" class="hint approval">
           <AppIcon name="clock" :size="13" />
-          注册后需要管理员审核通过才能登录。
+          注册后需要管理员审核通过才能登录<template v-if="needsEmail">,并需要先完成邮箱验证</template>。
         </p>
 
         <div class="foot tiny">
@@ -317,6 +390,17 @@ const features = [
 .mode-switch button.on { background: var(--bg-3); color: var(--text-1); box-shadow: var(--sh-1); }
 
 .approval { display: flex; align-items: center; gap: 6px; margin: var(--sp-4) 0 0; text-align: center; justify-content: center; }
+
+/* 忘记密码 / 返回登录 */
+.form-links { display: flex; justify-content: center; margin-top: var(--sp-4); }
+.linkish {
+  font-size: var(--fs-13);
+  color: var(--text-3);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  transition: color var(--t-fast);
+}
+.linkish:hover { color: var(--brand); }
 
 @media (max-width: 980px) {
   .login { grid-template-columns: 1fr; }

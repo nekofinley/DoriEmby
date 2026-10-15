@@ -21,11 +21,18 @@ func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{
 		"setup_needed": n == 0,
-		// The sign-in page renders its tabs from this: setup, sign-in, and
-		// whether to offer signup at all.
-		"registration": s.Cfg.Users.Registration,
-		"can_register": n > 0 && s.Cfg.RegistrationAllowed(),
-		"min_password": s.passwordMin(),
+		// The sign-in page renders its tabs and its form from this: setup,
+		// sign-in, signup, whether an address is required, and whether a
+		// CAPTCHA has to be solved first.
+		"registration":  s.Cfg.Users.Registration,
+		"can_register":  n > 0 && s.Cfg.RegistrationAllowed() && !(s.Cfg.Users.RequireEmail && !s.Cfg.MailEnabled()),
+		"min_password":  s.passwordMin(),
+		"require_email": s.Cfg.EmailVerificationRequired(),
+		"mail_enabled":  s.Cfg.MailEnabled(),
+		"turnstile": map[string]any{
+			"enabled":  s.Cfg.TurnstileEnabled(),
+			"site_key": s.Cfg.Turnstile.SiteKey,
+		},
 	})
 }
 
@@ -70,8 +77,9 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name     string `json:"name"`
-		Password string `json:"password"`
+		Name           string `json:"name"`
+		Password       string `json:"password"`
+		TurnstileToken string `json:"turnstile_token"`
 	}
 	if err := readBody(r, &req); err != nil {
 		fail(w, 400, "参数错误")
@@ -80,6 +88,16 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	key := clientIP(r)
 	if !s.loginLimiter.Allow(key) {
 		fail(w, 429, "尝试过于频繁,请稍后再试")
+		return
+	}
+	// The challenge is checked before the password is even looked at: that is
+	// what makes each guess cost a solved challenge rather than a hash.
+	if err := s.verifyTurnstile(r, req.TurnstileToken); err != nil {
+		if wait := s.loginLimiter.Hit(key); wait > 0 {
+			fail(w, 429, fmt.Sprintf("尝试过于频繁,请 %d 秒后再试", wait))
+			return
+		}
+		fail(w, 400, err.Error())
 		return
 	}
 	// An unknown name and a wrong password are answered identically, and both
@@ -102,6 +120,13 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	case models.StatusDisabled:
 		fail(w, 403, "账号已被管理员禁用")
+		return
+	}
+	// Only an address that was actually collected can hold an account back, so
+	// accounts predating this feature are unaffected. Turning the setting off
+	// again lets everyone through, which is the way out if the mail server dies.
+	if s.Cfg.EmailVerificationRequired() && u.EmailPending() {
+		fail(w, 403, "请先完成邮箱验证:在登录页点「重新发送验证邮件」")
 		return
 	}
 	s.loginLimiter.Reset(key)
@@ -185,6 +210,8 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request, user *m
 		"bgm":              s.Cfg.BGM,
 		"playback":         s.Cfg.Playback,
 		"users":            s.Cfg.Users,
+		"smtp":             s.Cfg.SMTP,
+		"turnstile":        s.Cfg.Turnstile,
 	}
 	writeJSON(w, 200, cfg)
 }
@@ -198,8 +225,10 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request, user *m
 		DevWebDir       *string         `json:"dev_web_dir"`
 		TMDB            *configTMDB     `json:"tmdb"`
 		BGM             *configBGM      `json:"bgm"`
-		Playback        *configPlayback `json:"playback"`
-		Users           *configUsers    `json:"users"`
+		Playback        *configPlayback  `json:"playback"`
+		Users           *configUsers     `json:"users"`
+		SMTP            *configSMTP      `json:"smtp"`
+		Turnstile       *configTurnstile `json:"turnstile"`
 	}
 	if err := readBody(r, &req); err != nil {
 		fail(w, 400, err.Error())
@@ -303,6 +332,66 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request, user *m
 		if req.Users.MinPassword != nil && *req.Users.MinPassword > 0 {
 			s.Cfg.Users.MinPassword = *req.Users.MinPassword
 		}
+		if req.Users.RequireEmail != nil {
+			s.Cfg.Users.RequireEmail = *req.Users.RequireEmail
+		}
+		if req.Users.BaseURL != nil {
+			s.Cfg.Users.BaseURL = strings.TrimRight(strings.TrimSpace(*req.Users.BaseURL), "/")
+		}
+	}
+	if req.SMTP != nil {
+		// Every field is optional-by-pointer so a form that only edits the host
+		// cannot wipe the password it never loaded.
+		if req.SMTP.Host != nil {
+			s.Cfg.SMTP.Host = strings.TrimSpace(*req.SMTP.Host)
+		}
+		if req.SMTP.Port != nil && *req.SMTP.Port > 0 {
+			s.Cfg.SMTP.Port = *req.SMTP.Port
+		}
+		if req.SMTP.Username != nil {
+			s.Cfg.SMTP.Username = strings.TrimSpace(*req.SMTP.Username)
+		}
+		if req.SMTP.Password != nil {
+			s.Cfg.SMTP.Password = *req.SMTP.Password
+		}
+		if req.SMTP.From != nil {
+			s.Cfg.SMTP.From = strings.TrimSpace(*req.SMTP.From)
+		}
+		if req.SMTP.FromName != nil {
+			s.Cfg.SMTP.FromName = strings.TrimSpace(*req.SMTP.FromName)
+		}
+		if req.SMTP.Encryption != nil {
+			switch *req.SMTP.Encryption {
+			case config.SMTPStartTLS, config.SMTPImplicitTLS, config.SMTPNone:
+				s.Cfg.SMTP.Encryption = *req.SMTP.Encryption
+			default:
+				fail(w, 400, "加密方式只能是 starttls / tls / none")
+				return
+			}
+		}
+		if req.SMTP.Proxy != nil {
+			s.Cfg.SMTP.Proxy = strings.TrimSpace(*req.SMTP.Proxy)
+		}
+		if req.SMTP.SkipVerify != nil {
+			s.Cfg.SMTP.SkipVerify = *req.SMTP.SkipVerify
+		}
+	}
+	if req.Turnstile != nil {
+		if req.Turnstile.Enabled != nil {
+			s.Cfg.Turnstile.Enabled = *req.Turnstile.Enabled
+		}
+		if req.Turnstile.SiteKey != nil {
+			s.Cfg.Turnstile.SiteKey = strings.TrimSpace(*req.Turnstile.SiteKey)
+		}
+		if req.Turnstile.SecretKey != nil {
+			s.Cfg.Turnstile.SecretKey = strings.TrimSpace(*req.Turnstile.SecretKey)
+		}
+		if req.Turnstile.UseProxy != nil {
+			s.Cfg.Turnstile.UseProxy = *req.Turnstile.UseProxy
+		}
+		if req.Turnstile.Proxy != nil {
+			s.Cfg.Turnstile.Proxy = strings.TrimSpace(*req.Turnstile.Proxy)
+		}
 	}
 	if err := s.Cfg.Save(s.configFile()); err != nil {
 		fail(w, 500, err.Error())
@@ -348,4 +437,26 @@ type configPlayback = struct {
 type configUsers = struct {
 	Registration *string `json:"registration"`
 	MinPassword  *int    `json:"min_password"`
+	RequireEmail *bool   `json:"require_email"`
+	BaseURL      *string `json:"base_url"`
+}
+
+type configSMTP = struct {
+	Host       *string `json:"host"`
+	Port       *int    `json:"port"`
+	Username   *string `json:"username"`
+	Password   *string `json:"password"`
+	From       *string `json:"from"`
+	FromName   *string `json:"from_name"`
+	Encryption *string `json:"encryption"`
+	Proxy      *string `json:"proxy"`
+	SkipVerify *bool   `json:"skip_verify"`
+}
+
+type configTurnstile = struct {
+	Enabled   *bool   `json:"enabled"`
+	SiteKey   *string `json:"site_key"`
+	SecretKey *string `json:"secret_key"`
+	UseProxy  *bool   `json:"use_proxy"`
+	Proxy     *string `json:"proxy"`
 }

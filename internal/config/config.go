@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // DefaultTMDBProxy is the usual local SOCKS5 port (Clash/v2rayN default).
@@ -26,6 +27,54 @@ const (
 // enforced.
 const DefaultMinPassword = 4
 
+// SMTP encryption modes.
+const (
+	// SMTPStartTLS connects in the clear and upgrades on port 587 (the common
+	// submission port). The default.
+	SMTPStartTLS = "starttls"
+	// SMTPImplicitTLS wraps the connection in TLS from the first byte (port 465).
+	SMTPImplicitTLS = "tls"
+	// SMTPNone suits a local relay on the same machine.
+	SMTPNone = "none"
+)
+
+// SMTP is the outbound mail server used for address verification and password
+// resets. With no host configured the mail features stay off: registration
+// never asks for an address and the settings page says so.
+type SMTP struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Username string `json:"username"`
+	// Password lives in config.json in clear text. That file is already this
+	// server's trust boundary (it holds the session secret), so a second secret
+	// store would only add one more place to leak.
+	Password string `json:"password"`
+	// From is the envelope sender; it defaults to Username, because most
+	// providers reject a From that is not the authenticated mailbox.
+	From     string `json:"from"`
+	FromName string `json:"from_name"`
+	// Encryption is one of SMTPStartTLS / SMTPImplicitTLS / SMTPNone.
+	Encryption string `json:"encryption"`
+	// Proxy routes the SMTP connection through socks5:// or http://. Gmail's
+	// SMTP is unreachable from mainland China without one.
+	Proxy string `json:"proxy"`
+	// SkipVerify disables certificate checks, for a self-signed local relay.
+	SkipVerify bool `json:"skip_verify"`
+}
+
+// Turnstile is Cloudflare's CAPTCHA widget, used on the sign-in and signup
+// forms. Both keys are required before it is enforced.
+type Turnstile struct {
+	Enabled   bool   `json:"enabled"`
+	SiteKey   string `json:"site_key"`
+	SecretKey string `json:"secret_key"`
+	// UseProxy routes the server-side siteverify call. The widget itself is
+	// loaded by the visitor's browser, which must be able to reach
+	// challenges.cloudflare.com.
+	UseProxy bool   `json:"use_proxy"`
+	Proxy    string `json:"proxy"`
+}
+
 // Users controls who may get an account on this server, and how strong their
 // passwords have to be.
 type Users struct {
@@ -35,6 +84,31 @@ type Users struct {
 	// MinPassword is the shortest password accepted at signup, when an admin
 	// creates an account, and when a password is changed.
 	MinPassword int `json:"min_password"`
+	// RequireEmail makes a self-registration prove it owns an address before it
+	// can sign in. It needs a working SMTP server, so it is ignored — and the
+	// settings page says so — while none is configured.
+	RequireEmail bool `json:"require_email"`
+	// BaseURL is the address this server is reached at, used to build the links
+	// in outgoing mail. Left empty, the link is built from the request's Host,
+	// which is right for a plain LAN address and wrong behind a proxy.
+	BaseURL string `json:"base_url"`
+}
+
+// MailEnabled reports whether outbound mail can actually be sent.
+func (c *Config) MailEnabled() bool { return strings.TrimSpace(c.SMTP.Host) != "" }
+
+// EmailVerificationRequired reports whether a new signup has to prove it owns
+// its address. The mail server check matters: asking for a verification that
+// can never arrive would leave the account unusable and the owner locked out.
+func (c *Config) EmailVerificationRequired() bool {
+	return c.Users.RequireEmail && c.MailEnabled()
+}
+
+// TurnstileEnabled reports whether requests must carry a valid CAPTCHA token.
+// A half-filled configuration (enabled but missing a key) counts as off, so a
+// typo can never lock everybody out of the sign-in page.
+func (c *Config) TurnstileEnabled() bool {
+	return c.Turnstile.Enabled && strings.TrimSpace(c.Turnstile.SiteKey) != "" && strings.TrimSpace(c.Turnstile.SecretKey) != ""
 }
 
 type TMDB struct {
@@ -109,17 +183,19 @@ type Playback struct {
 }
 
 type Config struct {
-	Port            int      `json:"port"`
-	DataDir         string   `json:"data_dir"`
-	Secret          string   `json:"secret"`
-	FFmpeg          string   `json:"ffmpeg"`
-	FFProbe         string   `json:"ffprobe"`
-	TMDB            TMDB     `json:"tmdb"`
-	BGM             BGMTV    `json:"bgm"`
-	Playback        Playback `json:"playback"`
-	Users           Users    `json:"users"`
-	ScanConcurrency int      `json:"scan_concurrency"`
-	DevWebDir       string   `json:"dev_web_dir"`
+	Port            int       `json:"port"`
+	DataDir         string    `json:"data_dir"`
+	Secret          string    `json:"secret"`
+	FFmpeg          string    `json:"ffmpeg"`
+	FFProbe         string    `json:"ffprobe"`
+	TMDB            TMDB      `json:"tmdb"`
+	BGM             BGMTV     `json:"bgm"`
+	Playback        Playback  `json:"playback"`
+	Users           Users     `json:"users"`
+	SMTP            SMTP      `json:"smtp"`
+	Turnstile       Turnstile `json:"turnstile"`
+	ScanConcurrency int       `json:"scan_concurrency"`
+	DevWebDir       string    `json:"dev_web_dir"`
 }
 
 // RegistrationAllowed reports whether visitors may create their own account,
@@ -160,6 +236,15 @@ func Defaults() *Config {
 		Users: Users{
 			Registration: RegistrationOpen,
 			MinPassword:  DefaultMinPassword,
+		},
+		SMTP: SMTP{
+			Port:       587,
+			Encryption: SMTPStartTLS,
+			FromName:   "DoriyaMedia",
+		},
+		Turnstile: Turnstile{
+			UseProxy: true,
+			Proxy:    DefaultTMDBProxy,
 		},
 		ScanConcurrency: 4,
 	}
@@ -263,6 +348,37 @@ func (c *Config) normalize() {
 	}
 	if c.Users.MinPassword > 128 {
 		c.Users.MinPassword = 128
+	}
+	// A link in an email has to be absolute, so a base URL that ends in a slash
+	// would produce "//verify-email" — harmless in a browser, ugly in a mail
+	// client, and easy to prevent here.
+	c.Users.BaseURL = strings.TrimRight(strings.TrimSpace(c.Users.BaseURL), "/")
+
+	if strings.TrimSpace(c.SMTP.Host) != "" {
+		c.SMTP.Host = strings.TrimSpace(c.SMTP.Host)
+		switch c.SMTP.Encryption {
+		case SMTPStartTLS, SMTPImplicitTLS, SMTPNone:
+		default:
+			c.SMTP.Encryption = SMTPStartTLS
+		}
+		if c.SMTP.Port <= 0 || c.SMTP.Port > 65535 {
+			// The usual port for the chosen mode, so filling in only the host
+			// still works.
+			if c.SMTP.Encryption == SMTPImplicitTLS {
+				c.SMTP.Port = 465
+			} else {
+				c.SMTP.Port = 587
+			}
+		}
+		if strings.TrimSpace(c.SMTP.From) == "" {
+			c.SMTP.From = c.SMTP.Username
+		}
+		if strings.TrimSpace(c.SMTP.FromName) == "" {
+			c.SMTP.FromName = "DoriyaMedia"
+		}
+	}
+	if c.Turnstile.Proxy == "" {
+		c.Turnstile.Proxy = DefaultTMDBProxy
 	}
 	if c.FFmpeg == "" {
 		c.FFmpeg = "ffmpeg"

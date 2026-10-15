@@ -32,10 +32,12 @@ type Server struct {
 	// someone has to remember to bump.
 	Version string
 
-	// loginLimiter and registerLimiter bound password guessing and signup
-	// floods per client address. Both live in memory; see attemptLimiter.
+	// loginLimiter, registerLimiter and mailLimiter bound password guessing,
+	// signup floods and outbound mail. All three live in memory; see
+	// attemptLimiter.
 	loginLimiter    *attemptLimiter
 	registerLimiter *attemptLimiter
+	mailLimiter     *attemptLimiter
 }
 
 func New(store *db.Store, cfg *config.Config, scanner *scan.Scanner, meta *metadata.Manager, engine *media.Engine, webFS fs.FS, version string) *Server {
@@ -45,9 +47,12 @@ func New(store *db.Store, cfg *config.Config, scanner *scan.Scanner, meta *metad
 		// Ten wrong passwords per address per five minutes is far more than a
 		// person needs and far too slow to guess with; five signups per hour
 		// keeps a shared address (a family, a dorm) working while stopping a
-		// script from filling the user table.
+		// script from filling the user table. Five messages per hour applies
+		// the same reasoning to the mail server: enough to get yourself back
+		// in, not enough to be worth abusing.
 		loginLimiter:    newAttemptLimiter(10, 5*time.Minute),
 		registerLimiter: newAttemptLimiter(5, time.Hour),
+		mailLimiter:     newAttemptLimiter(5, time.Hour),
 	}
 }
 
@@ -207,6 +212,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/auth/password", s.requireAuth(s.handleChangePassword))
 	mux.HandleFunc("GET /api/bootstrap", s.handleBootstrap)
 
+	// email verification and password recovery (public: the links arrive in a
+	// mailbox, so there is no session to present yet)
+	mux.HandleFunc("POST /api/auth/verify-email", s.handleVerifyEmail)
+	mux.HandleFunc("POST /api/auth/resend-verification", s.handleResendVerification)
+	mux.HandleFunc("POST /api/auth/forgot-password", s.handleForgotPassword)
+	mux.HandleFunc("POST /api/auth/reset-password", s.handleResetPassword)
+	mux.HandleFunc("PUT /api/auth/email", s.requireAuth(s.handleSetOwnEmail))
+	mux.HandleFunc("POST /api/auth/email/resend", s.requireAuth(s.handleResendOwnVerification))
+
 	// user management (admin only)
 	mux.HandleFunc("GET /api/admin/users", s.requireAdmin(s.handleListUsers))
 	mux.HandleFunc("POST /api/admin/users", s.requireAdmin(s.handleCreateUser))
@@ -214,6 +228,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/admin/users/{id}", s.requireAdmin(s.handleDeleteUser))
 	mux.HandleFunc("POST /api/admin/users/{id}/password", s.requireAdmin(s.handleSetUserPassword))
 	mux.HandleFunc("POST /api/admin/users/{id}/revoke", s.requireAdmin(s.handleRevokeUserSessions))
+	mux.HandleFunc("POST /api/admin/mail/test", s.requireAdmin(s.handleMailTest))
 
 	// system
 	mux.HandleFunc("GET /api/system/info", s.requireAuth(s.handleSystemInfo))

@@ -11,6 +11,7 @@ const tabs = [
   { id: 'libraries', label: '媒体库', icon: 'film', desc: '路径、类型与扫描' },
   { id: 'playback', label: '刮削与播放', icon: 'sparkles', desc: 'TMDB、Bangumi 与播放决策' },
   { id: 'users', label: '用户', icon: 'users', desc: '账号、角色与注册策略' },
+  { id: 'mail', label: '邮件与验证', icon: 'link', desc: 'SMTP、邮箱验证与 Cloudflare 人机验证' },
   { id: 'system', label: '系统', icon: 'server', desc: '工具路径与运行状态' },
 ]
 
@@ -241,6 +242,8 @@ async function saveConfig() {
       bgm: cfg.value.bgm,
       playback: cfg.value.playback,
       users: cfg.value.users,
+      smtp: cfg.value.smtp,
+      turnstile: cfg.value.turnstile,
     })
     toast.ok('配置已保存,立即生效')
     await loadAll()
@@ -348,6 +351,62 @@ function statusLabel(u) {
   if (u.status === 'disabled') return '已禁用'
   return '正常'
 }
+
+// ---------- 邮箱：管理员代填与代为验证 ----------
+
+async function setUserEmail(u) {
+  const email = prompt(`为「${u.name}」填写邮箱地址(留空表示清除):`, u.email || '')
+  if (email === null) return
+  await patchUser(u, { email }, email.trim() ? '邮箱已保存,可点「标记已验证」直接放行' : '邮箱已清除')
+}
+
+async function verifyUserEmail(u, verified) {
+  await patchUser(u, { email_verified: verified }, verified ? `已把「${u.name}」的邮箱标记为已验证` : `已取消「${u.name}」的邮箱验证`)
+}
+
+// ============================ 邮件与人机验证 ============================
+
+const mailTesting = ref(false)
+const mailResult = ref(null)
+const mailTestTo = ref('')
+
+const encryptions = [
+  { id: 'starttls', label: 'STARTTLS', hint: '默认 587 端口,先明文连接再升级加密' },
+  { id: 'tls', label: '隐式 TLS', hint: '默认 465 端口,从第一字节就加密(QQ/163 常用)' },
+  { id: 'none', label: '不加密', hint: '仅本机中继,或服务器只监听 25 端口时' },
+]
+
+// 常见邮箱的服务器地址,省得去查;密码栏多数要填「授权码」而不是登录密码。
+const presets = [
+  { id: 'qq', label: 'QQ 邮箱', host: 'smtp.qq.com', port: 465, encryption: 'tls' },
+  { id: '163', label: '163 邮箱', host: 'smtp.163.com', port: 465, encryption: 'tls' },
+  { id: 'gmail', label: 'Gmail', host: 'smtp.gmail.com', port: 587, encryption: 'starttls' },
+  { id: 'outlook', label: 'Outlook', host: 'smtp-mail.outlook.com', port: 587, encryption: 'starttls' },
+]
+
+function applyPreset(p) {
+  cfg.value.smtp.host = p.host
+  cfg.value.smtp.port = p.port
+  cfg.value.smtp.encryption = p.encryption
+}
+
+async function testMail() {
+  mailTesting.value = true
+  mailResult.value = null
+  try {
+    // Send whatever is in the form, so a fix can be tried before saving it.
+    await api.put('/api/config', { smtp: cfg.value.smtp })
+    mailResult.value = await api.post('/api/admin/mail/test', { to: mailTestTo.value })
+  } catch (e) {
+    mailResult.value = { ok: false, error: e.message }
+  } finally {
+    mailTesting.value = false
+  }
+}
+
+// 站点地址只用于邮件里的链接,留空就按访问者用的地址拼。
+const mailReady = computed(() => !!(cfg.value?.smtp?.host || '').trim())
+const verifyButNoMail = computed(() => !!cfg.value?.users?.require_email && !mailReady.value)
 
 const anyScanning = computed(() => (scanStates.value || []).some((s) => s.running))
 </script>
@@ -807,6 +866,19 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                 <input v-model.number="cfg.users.min_password" type="number" min="4" max="128" step="1" />
                 <span class="hint">注册、管理员建号与改密都按这个长度校验,至少 4 位。</span>
               </div>
+              <div class="field wide">
+                <label class="check-line">
+                  <input type="checkbox" v-model="cfg.users.require_email" />
+                  注册需要邮箱验证(注册后必须点邮件里的链接才能登录)
+                </label>
+                <span v-if="verifyButNoMail" class="hint warn-text">
+                  还没填 SMTP 服务器,邮箱验证不会生效,注册也会被拒绝 —— 请先到「邮件与验证」里配好。
+                </span>
+                <span v-else class="hint">
+                  只影响自助注册的新账号;<b>已有账号不受影响</b>(它们没有邮箱,不会被挡在门外)。
+                  管理员建的账号、以及用账号设置自己绑邮箱的人,都由你或他们自己验证。
+                </span>
+              </div>
             </div>
             <div class="save-bar flat">
               <span class="tiny">改完记得保存</span>
@@ -882,6 +954,14 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                     创建于 {{ fmtDate(u.created_at) }} ·
                     {{ u.last_login_at ? '上次登录 ' + fmtRelative(u.last_login_at) : '从未登录' }}
                   </div>
+                  <div v-if="u.email" class="tiny email-line">
+                    <AppIcon name="link" :size="12" />
+                    <span class="truncate">{{ u.email }}</span>
+                    <span class="badge" :class="u.email_verified ? 'ok' : 'warn'">
+                      {{ u.email_verified ? '已验证' : '未验证' }}
+                    </span>
+                  </div>
+                  <div v-else class="tiny">未绑定邮箱</div>
                 </div>
               </div>
 
@@ -905,6 +985,18 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
                   @click="patchUser(u, { role: u.role === 'admin' ? 'user' : 'admin' }, u.role === 'admin' ? `「${u.name}」已降为普通用户` : `「${u.name}」已成为管理员`)"
                 ><AppIcon :name="u.role === 'admin' ? 'user' : 'settings'" :size="14" /> {{ u.role === 'admin' ? '降为用户' : '设为管理员' }}</button>
 
+                <button class="btn sm" @click="setUserEmail(u)">
+                  <AppIcon name="link" :size="14" /> {{ u.email ? '改邮箱' : '设邮箱' }}
+                </button>
+                <button
+                  v-if="u.email && !u.email_verified" class="btn sm"
+                  @click="verifyUserEmail(u, true)"
+                ><AppIcon name="check" :size="14" /> 标记已验证</button>
+                <button
+                  v-else-if="u.email" class="btn sm ghost" title="邮箱又变得可疑时用"
+                  @click="verifyUserEmail(u, false)"
+                ><AppIcon name="alert" :size="14" /> 取消验证</button>
+
                 <button class="btn sm" @click="pwTarget = u; pwValue = ''"><AppIcon name="lock" :size="14" /> 重置密码</button>
                 <button class="btn sm" @click="revokeSessions(u)"><AppIcon name="power" :size="14" /> 踢下线</button>
 
@@ -918,6 +1010,152 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
           </div>
 
           <EmptyState v-else icon="users" title="还没有其他用户" text="打开上面的注册开关,或直接添加一个账号。" />
+        </section>
+
+        <!-- ---------- mail & captcha ---------- -->
+        <section v-show="tab === 'mail'" class="stack">
+          <div class="card">
+            <div class="card-title"><AppIcon name="link" :size="16" /> 邮件发送(SMTP)</div>
+            <div class="tiny">
+              注册验证、找回密码都靠它发信。填好后用下面的「测试发送」验证一次,不收信就没必要开邮箱验证。
+            </div>
+
+            <div class="preset-row">
+              <span class="tiny">快速填充:</span>
+              <button v-for="p in presets" :key="p.id" class="chip sm" @click="applyPreset(p)">{{ p.label }}</button>
+            </div>
+
+            <div class="form-grid mt-4">
+              <div class="field">
+                <label>SMTP 服务器</label>
+                <input v-model="cfg.smtp.host" placeholder="smtp.qq.com" />
+              </div>
+              <div class="field">
+                <label>端口</label>
+                <input v-model.number="cfg.smtp.port" type="number" min="1" max="65535" placeholder="465" />
+              </div>
+              <div class="field">
+                <label>用户名</label>
+                <input v-model="cfg.smtp.username" placeholder="you@qq.com" />
+                <span class="hint">一般是完整邮箱地址。</span>
+              </div>
+              <div class="field">
+                <label>密码 / 授权码</label>
+                <input v-model="cfg.smtp.password" type="password" placeholder="不是登录密码,是邮箱设置里生成的授权码" />
+                <span class="hint">QQ / 163 / Gmail 都要用「授权码」或「应用专用密码」,不是网页登录密码。</span>
+              </div>
+              <div class="field">
+                <label>发件人地址</label>
+                <input v-model="cfg.smtp.from" placeholder="留空则用上面的用户名" />
+              </div>
+              <div class="field">
+                <label>发件人显示名</label>
+                <input v-model="cfg.smtp.from_name" placeholder="DoriyaMedia" />
+              </div>
+            </div>
+
+            <div class="field">
+              <label>加密方式</label>
+              <div class="type-cards">
+                <button
+                  v-for="e in encryptions" :key="e.id" class="type-card"
+                  :class="{ on: cfg.smtp.encryption === e.id }" @click="cfg.smtp.encryption = e.id"
+                >
+                  <AppIcon :name="e.id === 'none' ? 'lockOpen' : 'lock'" :size="18" />
+                  <span class="tc-label">{{ e.label }}</span>
+                  <span class="tiny">{{ e.hint }}</span>
+                </button>
+              </div>
+            </div>
+
+            <div class="form-grid">
+              <div class="field">
+                <label>发送走代理(可选)</label>
+                <input v-model="cfg.smtp.proxy" placeholder="socks5://127.0.0.1:7890" />
+                <span class="hint">留空直连。Gmail 的 SMTP 在国内需要代理才能连上。</span>
+              </div>
+              <div class="field">
+                <label>站点地址(邮件里的链接用)</label>
+                <input v-model="cfg.users.base_url" placeholder="https://media.example.com" />
+                <span class="hint">留空则按访问者的地址自动拼。反代/域名访问时建议填,否则邮件里的链接可能指向内网地址。</span>
+              </div>
+            </div>
+
+            <div class="field wide">
+              <label class="check-line">
+                <input type="checkbox" v-model="cfg.smtp.skip_verify" />
+                跳过 TLS 证书校验(仅用于自签证书的本地中继)
+              </label>
+            </div>
+
+            <div class="btn-row">
+              <input v-model="mailTestTo" class="input test-to" placeholder="收件邮箱(留空发给自己)" />
+              <button class="btn" :disabled="mailTesting || !mailReady" @click="testMail">
+                <AppIcon name="wifi" :size="15" /> {{ mailTesting ? '发送中…' : '测试发送' }}
+              </button>
+            </div>
+            <Transition name="fade">
+              <div v-if="mailResult" class="flash mt-4" :class="mailResult.ok ? 'ok' : 'err'">
+                <AppIcon :name="mailResult.ok ? 'check' : 'alert'" :size="16" />
+                <span>{{ mailResult.ok ? mailResult.message : mailResult.error }}</span>
+              </div>
+            </Transition>
+
+            <div class="save-bar flat">
+              <span class="tiny">测试发送会先保存当前填写的内容</span>
+              <button class="btn primary" @click="saveConfig"><AppIcon name="check" :size="15" /> 保存配置</button>
+            </div>
+          </div>
+
+          <!-- Cloudflare Turnstile -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="card-title"><AppIcon name="lock" :size="16" /> Cloudflare 人机验证(Turnstile)</div>
+                <div class="tiny">在登录页与注册页显示验证组件,挡住脚本猜密码和批量注册。免费,去 Cloudflare 后台建一个 Turnstile 站点即可拿到两把钥匙。</div>
+              </div>
+              <label class="switch" :class="{ on: cfg.turnstile.enabled }" :aria-checked="!!cfg.turnstile.enabled" role="switch">
+                <input type="checkbox" v-model="cfg.turnstile.enabled" class="sr-only" />
+              </label>
+            </div>
+
+            <div class="form-grid mt-4">
+              <div class="field">
+                <label>Site Key(公开,给浏览器用)</label>
+                <input v-model="cfg.turnstile.site_key" placeholder="0x4AAAAAAA..." />
+              </div>
+              <div class="field">
+                <label>Secret Key(私密,服务端校验用)</label>
+                <input v-model="cfg.turnstile.secret_key" type="password" placeholder="0x4AAAAAAA..." />
+              </div>
+            </div>
+
+            <div class="field">
+              <label>服务端校验走代理(可选)</label>
+              <input v-model="cfg.turnstile.proxy" placeholder="socks5://127.0.0.1:7890" />
+              <span class="hint">
+                这只影响服务端向 Cloudflare 发起的校验请求;访客浏览器仍要能访问
+                <code>challenges.cloudflare.com</code> 才能显示出验证框 —— 国内网络下这是最大的一道坎。
+              </span>
+            </div>
+
+            <div v-if="cfg.turnstile.enabled && !(cfg.turnstile.site_key && cfg.turnstile.secret_key)" class="flash warn">
+              <AppIcon name="alert" :size="16" />
+              <span>两把钥匙都填齐才会真正生效,现在这样等于没开。</span>
+            </div>
+            <div v-if="cfg.turnstile.enabled && cfg.turnstile.site_key && cfg.turnstile.secret_key" class="flash warn">
+              <AppIcon name="alert" :size="16" />
+              <span>
+                开启后,如果服务器连不上 Cloudflare,<b>所有人都无法登录</b>(包括你)。
+                真遇上这情况:把 config.json 里的 <code>turnstile.enabled</code> 改成 false 再重启服务。
+              </span>
+            </div>
+
+            <div class="save-bar flat">
+              <span class="tiny">开启后立即生效,登录页会多出验证框</span>
+              <button class="btn primary" @click="saveConfig"><AppIcon name="check" :size="15" /> 保存配置</button>
+            </div>
+          </div>
         </section>
 
         <!-- ---------- system ---------- -->
@@ -1157,6 +1395,13 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
 }
 .u-main { flex: 1; min-width: 0; }
 .u-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.email-line { display: flex; align-items: center; gap: 6px; margin-top: 3px; }
+
+/* ---------- mail & captcha ---------- */
+.preset-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: var(--sp-4); }
+.test-to { flex: 1; min-width: 200px; }
+.warn-text { color: #fcd34d; }
+.btn-row .input { min-height: 38px; }
 
 .set-skeleton { padding-top: calc(var(--header-h) + 40px); }
 

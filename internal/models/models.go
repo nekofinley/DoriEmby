@@ -20,14 +20,19 @@ const (
 )
 
 type User struct {
-	ID        int64      `json:"id"`
-	Name      string     `json:"name"`
-	PassHash  string     `json:"-"`
-	Salt      string     `json:"-"`
-	Role      string     `json:"role"`
-	Status    string     `json:"status"`
-	CreatedAt time.Time  `json:"created_at"`
-	LastLogin *time.Time `json:"last_login_at,omitempty"`
+	ID       int64  `json:"id"`
+	Name     string `json:"name"`
+	PassHash string `json:"-"`
+	Salt     string `json:"-"`
+	Role     string `json:"role"`
+	Status   string `json:"status"`
+	Email    string `json:"email,omitempty"`
+	// EmailVerified is false for an address that was typed but never proven.
+	// An empty Email is never "unverified" — it simply was not asked for, which
+	// is what keeps accounts predating this feature out of the gate.
+	EmailVerified bool       `json:"email_verified"`
+	CreatedAt     time.Time  `json:"created_at"`
+	LastLogin     *time.Time `json:"last_login_at,omitempty"`
 }
 
 // IsAdmin reports whether the account may reach the settings backend.
@@ -35,6 +40,10 @@ func (u *User) IsAdmin() bool { return u != nil && u.Role == RoleAdmin }
 
 // CanLogin reports whether the account is currently allowed to sign in.
 func (u *User) CanLogin() bool { return u != nil && u.Status == StatusActive }
+
+// EmailPending reports whether the account still owes proof of its address.
+// Only an address that was actually collected can be pending.
+func (u *User) EmailPending() bool { return u != nil && u.Email != "" && !u.EmailVerified }
 
 type Session struct {
 	Token     string    `json:"token"`

@@ -96,8 +96,10 @@ func normalizeStatus(status string) string {
 // is the admin's registration policy.
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name     string `json:"name"`
-		Password string `json:"password"`
+		Name           string `json:"name"`
+		Password       string `json:"password"`
+		Email          string `json:"email"`
+		TurnstileToken string `json:"turnstile_token"`
 	}
 	if err := readBody(r, &req); err != nil {
 		fail(w, 400, "参数错误")
@@ -117,6 +119,13 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	if !s.Cfg.RegistrationAllowed() {
 		fail(w, 403, "管理员已关闭注册")
+		return
+	}
+	// Asking for a verification that can never arrive would create an account
+	// nobody can use, so the missing mail server is reported before anything is
+	// written.
+	if s.Cfg.Users.RequireEmail && !s.Cfg.MailEnabled() {
+		fail(w, 503, "管理员开启了邮箱验证,但服务器还没有配置邮件发送,请联系管理员")
 		return
 	}
 	key := clientIP(r)
@@ -143,7 +152,34 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	u := &models.User{Name: name, Role: models.RoleUser, Status: models.StatusActive}
+	needEmail := s.Cfg.EmailVerificationRequired()
+	var email string
+	if needEmail {
+		email, err = normalizeEmail(req.Email)
+		if err != nil {
+			fail(w, 400, err.Error())
+			return
+		}
+		used, err := s.Store.EmailTaken(email, 0)
+		if err != nil {
+			fail(w, 500, err.Error())
+			return
+		}
+		if used {
+			fail(w, 409, "这个邮箱已被其他账号使用")
+			return
+		}
+	}
+
+	// The challenge is checked last, so fixing a typo in the form does not cost
+	// the visitor a fresh one.
+	if err := s.verifyTurnstile(r, req.TurnstileToken); err != nil {
+		s.registerLimiter.Hit(key)
+		fail(w, 400, err.Error())
+		return
+	}
+
+	u := &models.User{Name: name, Role: models.RoleUser, Status: models.StatusActive, Email: email}
 	if s.Cfg.Users.Registration == config.RegistrationApproval {
 		u.Status = models.StatusPending
 	}
@@ -153,6 +189,29 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.registerLimiter.Hit(key)
+
+	if needEmail {
+		// The account exists either way; only the mail can fail, and then the
+		// person can ask for another link once the admin has fixed SMTP.
+		body := map[string]any{
+			"created": true,
+			"pending": u.Status == models.StatusPending,
+		}
+		if err := s.sendVerification(r, u); err != nil {
+			body["verify_email_sent"] = false
+			body["message"] = "账号已创建,但验证邮件发送失败: " + err.Error() + "。修好后可在登录页点「重新发送验证邮件」。"
+		} else {
+			body["verify_email_sent"] = true
+			msg := "验证邮件已发送到 " + u.Email + ",请点邮件里的链接完成验证"
+			if u.Status == models.StatusPending {
+				msg += ";验证之后还需要管理员审核通过"
+			}
+			body["message"] = msg
+		}
+		writeJSON(w, 202, body)
+		return
+	}
+
 	if u.Status == models.StatusPending {
 		writeJSON(w, 202, map[string]any{
 			"pending": true,
@@ -302,9 +361,11 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request, actor 
 		return
 	}
 	var req struct {
-		Name   *string `json:"name"`
-		Role   *string `json:"role"`
-		Status *string `json:"status"`
+		Name          *string `json:"name"`
+		Role          *string `json:"role"`
+		Status        *string `json:"status"`
+		Email         *string `json:"email"`
+		EmailVerified *bool   `json:"email_verified"`
 	}
 	if err := readBody(r, &req); err != nil {
 		fail(w, 400, "参数错误")
@@ -380,6 +441,54 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request, actor 
 				fail(w, 500, err.Error())
 				return
 			}
+		}
+	}
+	// An admin can correct an address or vouch for one by hand, which is the way
+	// out for someone whose mail never arrived.
+	if req.Email != nil || req.EmailVerified != nil {
+		email := target.Email
+		if req.Email != nil {
+			// An empty address is allowed here: it removes the record and with
+			// it any pending verification.
+			if strings.TrimSpace(*req.Email) == "" {
+				email = ""
+			} else {
+				normalized, err := normalizeEmail(*req.Email)
+				if err != nil {
+					fail(w, 400, err.Error())
+					return
+				}
+				email = normalized
+			}
+			if email != "" && email != target.Email {
+				used, err := s.Store.EmailTaken(email, target.ID)
+				if err != nil {
+					fail(w, 500, err.Error())
+					return
+				}
+				if used {
+					fail(w, 409, "这个邮箱已被其他账号使用")
+					return
+				}
+			}
+		}
+		verified := target.EmailVerified
+		// A new address has proven nothing by itself.
+		if email != target.Email {
+			verified = false
+		}
+		if req.EmailVerified != nil {
+			verified = *req.EmailVerified
+		}
+		if email == "" {
+			verified = false
+		}
+		if email != target.Email || verified != target.EmailVerified {
+			if err := s.Store.SetUserEmail(target.ID, email, verified); err != nil {
+				fail(w, 500, err.Error())
+				return
+			}
+			target.Email, target.EmailVerified = email, verified
 		}
 	}
 	writeJSON(w, 200, map[string]any{"user": target})
