@@ -408,6 +408,7 @@ func (c *Config) Abs() string {
 }
 
 func (c *Config) DBPath() string    { return filepath.Join(c.Abs(), "doriyamedia.db") }
+func (c *Config) SitePath() string  { return filepath.Join(c.Abs(), "site.json") }
 func (c *Config) ImagesDir() string { return filepath.Join(c.Abs(), "images") }
 func (c *Config) LogsDir() string   { return filepath.Join(c.Abs(), "logs") }
 

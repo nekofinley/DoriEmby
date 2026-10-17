@@ -1,5 +1,9 @@
 <script setup>
+import { computed } from 'vue'
 import AppIcon from './AppIcon.vue'
+import SiteText from './SiteText.vue'
+import { site, listOf } from '../site/store.js'
+import { accentVars } from '../site/schema.js'
 
 // version comes from the server's own /api/system/info, so the footer reports
 // the running binary rather than a number baked into the bundle.
@@ -7,47 +11,49 @@ defineProps({
   me: { type: Object, default: null },
   version: { type: String, default: '' },
 })
+
+const columns = computed(() => listOf('footer.columns'))
+const capabilities = computed(() => listOf('footer.capabilities.items'))
+// The footer wears the same accent as the login page; nothing else is restyled.
+const footStyle = computed(() => accentVars(site.doc.site.accent))
 </script>
 
 <template>
-  <footer class="foot">
+  <footer class="foot" :style="footStyle">
     <div class="inner">
       <div class="col brand-col">
         <div class="brand">
           <span class="logo"><AppIcon name="play" :size="12" filled /></span>
-          <span class="wordmark">Doriya<span>Media</span></span>
+          <span class="wordmark">
+            <SiteText k="footer.wordmark.name" /><SiteText k="footer.wordmark.suffix" class="wm-suffix" />
+          </span>
         </div>
-        <p class="tiny">
-          轻量自建流媒体服务器:挂载网盘、扫描媒体库、TMDB / Bangumi 刮削,
-          针对 iOS Safari 自动选择 302 直连、代理或 HLS 转封装播放。
-        </p>
+        <SiteText k="footer.about" as="p" class="tiny" multiline />
         <div class="status">
           <span class="pulse"></span>
-          <span class="tiny">本地服务运行中<template v-if="version"> · {{ version }}</template></span>
+          <span class="tiny">
+            <SiteText k="footer.status" as="span" /><template v-if="version"> · {{ version }}</template>
+          </span>
         </div>
       </div>
 
-      <div class="col">
-        <div class="h">浏览</div>
-        <router-link to="/">首页</router-link>
-        <router-link to="/browse">文件浏览</router-link>
+      <div v-for="(col, ci) in columns" :key="ci" class="col">
+        <SiteText :k="`footer.columns.${ci}.heading`" as="div" class="h" />
+        <router-link v-for="(l, li) in col.links" :key="li" :to="l.to || '/'">
+          <SiteText :k="`footer.columns.${ci}.links.${li}.label`" passive />
+        </router-link>
       </div>
 
       <div class="col">
-        <div class="h">管理</div>
-        <router-link to="/settings">存储源 / 媒体库</router-link>
-        <router-link to="/settings">刮削与播放</router-link>
-      </div>
-
-      <div class="col">
-        <div class="h">播放能力</div>
-        <div class="tiny line"><AppIcon name="check" :size="13" /> 302 直连 · 不占带宽</div>
-        <div class="tiny line"><AppIcon name="check" :size="13" /> HLS 转封装 · 视频直拷</div>
-        <div class="tiny line"><AppIcon name="check" :size="13" /> iOS Safari 自动适配</div>
+        <SiteText k="footer.capabilities.heading" as="div" class="h" />
+        <div v-for="(it, i) in capabilities" :key="i" class="tiny line">
+          <AppIcon name="check" :size="13" />
+          <SiteText :k="`footer.capabilities.items.${i}`" passive />
+        </div>
       </div>
     </div>
     <div class="base">
-      <span class="tiny">© {{ new Date().getFullYear() }} DoriyaMedia · 仅供个人媒体库使用</span>
+      <SiteText k="footer.copyright" as="span" class="tiny" />
       <span class="spacer"></span>
       <span v-if="me" class="tiny">{{ me.name }}</span>
     </div>
@@ -65,7 +71,7 @@ defineProps({
   margin: 0 auto;
   padding: clamp(32px, 4vw, 56px) var(--gutter) clamp(20px, 3vw, 32px);
   display: grid;
-  grid-template-columns: minmax(280px, 1.6fr) repeat(3, minmax(140px, 1fr));
+  grid-template-columns: minmax(280px, 1.6fr) repeat(auto-fit, minmax(130px, 1fr));
   gap: var(--sp-6) var(--sp-5);
 }
 .col { display: flex; flex-direction: column; gap: 9px; align-items: flex-start; }
@@ -84,11 +90,11 @@ defineProps({
   display: grid; place-items: center;
   width: 26px; height: 26px;
   border-radius: 9px;
-  background: linear-gradient(150deg, var(--brand-2), #d98a12 70%);
+  background: linear-gradient(150deg, var(--brand-2), var(--brand) 70%);
   color: var(--brand-ink);
 }
 .wordmark { font-family: var(--font-display); font-size: var(--fs-15); font-weight: 800; letter-spacing: -0.03em; }
-.wordmark span { color: var(--text-3); font-weight: 600; }
+.wordmark .wm-suffix { color: var(--text-3); font-weight: 600; }
 .brand-col p { max-width: 46ch; line-height: 1.7; margin: 0; }
 .status { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
 .pulse {

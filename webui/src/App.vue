@@ -5,7 +5,9 @@ import { api } from './api.js'
 import { me, loadMe } from './auth.js'
 import AppHeader from './components/AppHeader.vue'
 import AppFooter from './components/AppFooter.vue'
+import SiteToolbar from './components/SiteToolbar.vue'
 import ToastHost from './components/ToastHost.vue'
+import { ctx } from './site/store.js'
 
 const route = useRoute()
 const version = ref('')
@@ -24,6 +26,8 @@ onMounted(async () => {
     // authenticated, so it is asked for only once there is a session; if it
     // fails the footer simply omits the version.
     version.value = (await api.get('/api/system/info')).version || ''
+    ctx.version = version.value
+    ctx.user = me.value.name || ''
   } catch {}
 })
 </script>
@@ -52,6 +56,9 @@ onMounted(async () => {
     <AppFooter :me="me" :version="version" />
     <ToastHost />
   </div>
+
+  <!-- the owner's editing toolbar: admin only, absent on the player -->
+  <SiteToolbar />
 </template>
 
 <style scoped>

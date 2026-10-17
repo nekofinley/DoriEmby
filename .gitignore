@@ -1,4 +1,5 @@
 data/
+data-test-run/
 config.json
 *.db
 *.db-wal
@@ -6,6 +7,9 @@ config.json
 # build artifacts
 *.exe
 *.exe~
+
+# scratch dir used when the default TEMP is not writable for esbuild
+.tmp/
 
 # local UI verification sandbox (fixtures, screenshots, seeding)
 .uitest/

@@ -28,7 +28,32 @@
     "preprobe_max_files": 50,
     "preprobe_concurrency": 2,
     "apple_hevc_copy": false,
-    "hls_session_packager": false
+    "hls_session_packager": false,
+    "hls_cache_mb": 2048
+  },
+  "users": {
+    "registration": "open",
+    "min_password": 4,
+    "require_email": false,
+    "base_url": ""
+  },
+  "smtp": {
+    "host": "",
+    "port": 587,
+    "username": "",
+    "password": "",
+    "from": "",
+    "from_name": "DoriyaMedia",
+    "encryption": "starttls",
+    "proxy": "",
+    "skip_verify": false
+  },
+  "turnstile": {
+    "enabled": false,
+    "site_key": "",
+    "secret_key": "",
+    "use_proxy": true,
+    "proxy": "socks5://127.0.0.1:7890"
   },
   "scan_concurrency": 4,
   "dev_web_dir": ""

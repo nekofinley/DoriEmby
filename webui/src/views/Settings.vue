@@ -1,11 +1,15 @@
 <script setup>
 import { ref, onMounted, onBeforeUnmount, computed, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { api, fmtDate, fmtRelative } from '../api.js'
 import { me } from '../auth.js'
 import AppIcon from '../components/AppIcon.vue'
 import EmptyState from '../components/EmptyState.vue'
 import LiveProgress from '../components/LiveProgress.vue'
 import { toast } from '../toast.js'
+import { site, setToolbar, panelTab, publishedLabel, dirty } from '../site/store.js'
+
+const router = useRouter()
 
 const tabs = [
   { id: 'sources', label: '存储源', icon: 'cloud', desc: 'OpenList / WebDAV / 本地目录' },
@@ -13,8 +17,16 @@ const tabs = [
   { id: 'playback', label: '刮削与播放', icon: 'sparkles', desc: 'TMDB、Bangumi 与播放决策' },
   { id: 'users', label: '用户', icon: 'users', desc: '账号、角色与注册策略' },
   { id: 'mail', label: '邮件与验证', icon: 'link', desc: 'SMTP、邮箱验证与 Cloudflare 人机验证' },
+  { id: 'site', label: '站点外观', icon: 'wand', desc: '登录页文案、布局与页脚' },
   { id: 'system', label: '系统', icon: 'server', desc: '工具路径与运行状态' },
 ]
+
+// Open the editing toolbar, optionally somewhere else and on a given panel.
+function openEditor(where, which) {
+  setToolbar(true)
+  panelTab.value = which
+  if (where) router.push(where)
+}
 
 const tab = ref(localStorage.getItem('dm:settings-tab') || 'sources')
 watch(tab, (v) => localStorage.setItem('dm:settings-tab', v))
@@ -1298,6 +1310,63 @@ const anyScanning = computed(() => (scanStates.value || []).some((s) => s.runnin
         </section>
 
         <!-- ---------- system ---------- -->
+        <section v-show="tab === 'site'" class="stack">
+          <div class="card">
+            <div class="card-title"><AppIcon name="wand" :size="16" /> 用编辑工具栏改站点外观</div>
+            <p class="tiny" style="line-height: 1.7; margin: 0">
+              打开工具栏后,页面右下角会出现一条浮动工具栏(<b>文案 / 布局 / 页脚</b>)。
+              标题、段落、按钮文字都可以直接在页面上点着改,右边调布局,
+              改动<b>立刻</b>能在页面上看到;<b>发布</b>之后所有访客才会看到新版本。
+              快捷键:Ctrl/Cmd + S 发布,Ctrl/Cmd + Z 撤销。
+            </p>
+            <div class="row-flex wrap" style="margin-top: 14px">
+              <button class="btn" @click="openEditor('/login', 'copy')">
+                <AppIcon name="type" :size="15" /> 改登录页文案
+              </button>
+              <button class="btn" @click="openEditor('/login', 'layout')">
+                <AppIcon name="layout" :size="15" /> 改登录页布局
+              </button>
+              <button class="btn" @click="openEditor(null, 'footer')">
+                <AppIcon name="list" :size="15" /> 改页脚
+              </button>
+            </div>
+            <div class="save-bar flat">
+              <span class="tiny">
+                <template v-if="dirty"><b style="color: var(--brand)">有未发布的修改</b> · </template>
+                {{ publishedLabel() }}
+              </span>
+              <button class="btn primary" @click="openEditor(null, panelTab || 'copy')">
+                <AppIcon name="wand" :size="15" /> 在此页打开工具栏
+              </button>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-title"><AppIcon name="eye" :size="16" /> 当前文案</div>
+            <div class="form-grid">
+              <div class="field">
+                <label>站点名</label>
+                <input :value="site.doc.site.title" readonly />
+              </div>
+              <div class="field">
+                <label>登录页大标题</label>
+                <input :value="site.doc.login.pitch.title" readonly />
+              </div>
+              <div class="field">
+                <label>登录页小标签</label>
+                <input :value="site.doc.login.pitch.eyebrow" readonly />
+              </div>
+              <div class="field">
+                <label>页脚状态</label>
+                <input :value="site.doc.footer.status" readonly />
+              </div>
+            </div>
+            <p class="tiny" style="margin: 0">
+              这些内容随时可以在工具栏里改,这里只是让你一眼看到当前用的是哪一版。
+            </p>
+          </div>
+        </section>
+
         <section v-show="tab === 'system'" class="stack">
           <div v-if="sys" class="tiles">
             <div class="tile">

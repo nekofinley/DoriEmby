@@ -4,9 +4,11 @@ import { useRoute } from 'vue-router'
 import { api } from '../api.js'
 import AppIcon from '../components/AppIcon.vue'
 import Turnstile from '../components/Turnstile.vue'
+import SiteText from '../components/SiteText.vue'
+import { site, listOf, setToolbar, toolbarOn } from '../site/store.js'
+import { ACCENTS, CORNERS, SPLITS, accentVars } from '../site/schema.js'
 
 const route = useRoute()
-const host = location.host
 const name = ref('')
 const password = ref('')
 const confirm = ref('')
@@ -118,16 +120,48 @@ async function submit() {
   }
 }
 
-const features = [
-  { icon: 'cloud', t: '挂载网盘', d: 'OpenList / WebDAV / 本地目录,扫描即入库' },
-  { icon: 'sparkles', t: '智能刮削', d: 'TMDB 与 Bangumi 补全中文标题、海报与简介' },
-  { icon: 'playCircle', t: '302 直连', d: '网盘直链直连播放,几乎不占服务器带宽' },
-  { icon: 'layers', t: '自动转封装', d: 'iOS 播不了的 MKV / HEVC 自动封装成 HLS' },
-]
+// ---------------------------------------------------------- site content ---
+
+const layout = computed(() => site.doc.login.layout)
+const features = computed(() => listOf('login.features'))
+// Which set of form copy applies right now; the same key drives the panel.
+const formMode = computed(() => (setupNeeded.value ? 'setup' : mode.value))
+const submitIcon = computed(() => ({ setup: 'lock', register: 'user', forgot: 'link', login: 'lock' }[formMode.value]))
+
+function rgba(hex, alpha) {
+  const h = String(hex).replace('#', '')
+  const full = h.length === 3 ? h.split('').map((c) => c + c).join('') : h
+  const n = parseInt(full, 16)
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`
+}
+
+// Everything the layout panel offers, handed to CSS as variables so the page
+// rearranges itself without a single conditional class in the markup.
+const loginStyle = computed(() => {
+  const l = layout.value || {}
+  const art = { subtle: 'saturate(0.75) brightness(0.62)', normal: 'none', bold: 'saturate(1.3) brightness(1.32)' }
+  return {
+    '--lg-cols': (SPLITS.find((s) => s.id === l.split) || SPLITS[0]).cols,
+    '--lg-form-max': `${l.formWidth || 380}px`,
+    '--lg-feature-cols': String(l.featureCols === 1 ? 1 : 2),
+    '--lg-art': art[l.artTone] || 'none',
+    '--lg-art-glow': rgba(ACCENTS.find((x) => x.id === site.doc.site.accent)?.brand || '#f0a92e', 0.22),
+    ...(CORNERS[l.corners] || {}),
+    ...accentVars(site.doc.site.accent),
+  }
+})
 </script>
 
 <template>
-  <div class="login">
+  <div
+    class="login"
+    :class="{
+      'aside-right': layout.aside === 'right',
+      'no-art': !layout.showArt,
+      'no-features': !layout.showFeatures,
+    }"
+    :style="loginStyle"
+  >
     <!-- ================= left: brand story ================= -->
     <section class="aside">
       <div class="art"></div>
@@ -135,24 +169,23 @@ const features = [
       <div class="aside-inner">
         <div class="brand">
           <span class="logo"><AppIcon name="play" :size="15" filled /></span>
-          <span class="wordmark">Doriya<span>Media</span></span>
+          <span class="wordmark">
+            <SiteText k="login.brand.name" /><SiteText k="login.brand.suffix" class="wm-suffix" />
+          </span>
         </div>
 
         <div class="pitch">
-          <span class="eyebrow">自建流媒体服务器</span>
-          <h1 class="display-1">把你的网盘变成一座私人影院</h1>
-          <p class="muted">
-            挂载网盘、扫描媒体库、刮削海报,然后在电脑、手机、iPad 上直接播放。
-            针对 iOS Safari 的播放决策引擎会自动选择最省事的那条路。
-          </p>
+          <SiteText k="login.pitch.eyebrow" as="span" class="eyebrow" />
+          <SiteText k="login.pitch.title" as="h1" class="display-1" />
+          <SiteText k="login.pitch.body" as="p" class="muted" multiline />
         </div>
 
         <ul class="features">
-          <li v-for="f in features" :key="f.t">
+          <li v-for="(f, i) in features" :key="i">
             <span class="fi"><AppIcon :name="f.icon" :size="16" /></span>
             <span>
-              <b>{{ f.t }}</b>
-              <em>{{ f.d }}</em>
+              <SiteText :k="`login.features.${i}.t`" as="b" />
+              <SiteText :k="`login.features.${i}.d`" as="em" />
             </span>
           </li>
         </ul>
@@ -163,24 +196,19 @@ const features = [
     <section class="form-side">
       <form class="form" @submit.prevent="submit">
         <div class="form-head">
-          <h2>{{ setupNeeded ? '初始化管理员' : mode === 'register' ? '注册' : mode === 'forgot' ? '找回密码' : '登录' }}</h2>
-          <p class="small">
-            <template v-if="setupNeeded">第一次使用,先创建一个管理员账号。</template>
-            <template v-else-if="mode === 'register'">创建一个账号,登录后即可浏览与播放全部媒体。</template>
-            <template v-else-if="mode === 'forgot'">填写用户名或邮箱,我们把重置链接发到你的邮箱。</template>
-            <template v-else>使用你的账号继续。</template>
-          </p>
+          <SiteText :k="`login.form.${formMode}.title`" as="h2" />
+          <SiteText :k="`login.form.${formMode}.desc`" as="p" class="small" multiline />
         </div>
 
         <div v-if="canRegister" class="mode-switch" role="tablist">
           <button
             type="button" role="tab" :aria-selected="mode === 'login'"
             :class="{ on: mode === 'login' }" @click="switchMode('login')"
-          >登录</button>
+          ><SiteText k="login.form.tabLogin" passive /></button>
           <button
             type="button" role="tab" :aria-selected="mode === 'register'"
             :class="{ on: mode === 'register' }" @click="switchMode('register')"
-          >注册</button>
+          ><SiteText k="login.form.tabRegister" passive /></button>
         </div>
 
         <div v-if="mailBroken && mode !== 'forgot'" class="flash warn">
@@ -189,7 +217,9 @@ const features = [
         </div>
 
         <div class="field">
-          <label for="login-name">{{ mode === 'forgot' ? '用户名或邮箱' : '用户名' }}</label>
+          <label for="login-name">
+            <SiteText :k="`login.form.labels.${mode === 'forgot' ? 'nameOrMail' : 'name'}`" passive />
+          </label>
           <input
             id="login-name" v-model="name" autocomplete="username"
             :placeholder="mode === 'register' ? '2-32 个字符' : mode === 'forgot' ? 'admin 或 you@example.com' : 'admin'"
@@ -198,7 +228,7 @@ const features = [
         </div>
 
         <div v-if="mode !== 'forgot'" class="field">
-          <label for="login-pw">密码</label>
+          <label for="login-pw"><SiteText k="login.form.labels.password" passive /></label>
           <div class="pw-wrap">
             <input
               id="login-pw" v-model="password" :type="showPw ? 'text' : 'password'"
@@ -217,7 +247,7 @@ const features = [
         </div>
 
         <div v-if="mode === 'register' && needsEmail" class="field">
-          <label for="login-email">邮箱</label>
+          <label for="login-email"><SiteText k="login.form.labels.email" passive /></label>
           <input
             id="login-email" v-model="email" type="email" autocomplete="email"
             placeholder="you@example.com" required :disabled="busy || checking"
@@ -226,7 +256,7 @@ const features = [
         </div>
 
         <div v-if="mode === 'register'" class="field">
-          <label for="login-pw2">确认密码</label>
+          <label for="login-pw2"><SiteText k="login.form.labels.confirm" passive /></label>
           <input
             id="login-pw2" v-model="confirm" :type="showPw ? 'text' : 'password'"
             autocomplete="new-password" placeholder="再输入一次" required :disabled="busy || checking"
@@ -252,23 +282,19 @@ const features = [
         <button class="btn primary lg block" :disabled="busy || checking || blocked">
           <template v-if="busy">请稍候…</template>
           <template v-else-if="checking">检查服务…</template>
-          <template v-else-if="setupNeeded">
-            <AppIcon name="lock" :size="16" /> 创建并进入
-          </template>
-          <template v-else-if="mode === 'register'">
-            <AppIcon name="user" :size="16" /> 注册
-          </template>
-          <template v-else-if="mode === 'forgot'">
-            <AppIcon name="link" :size="16" /> 发送重置邮件
-          </template>
           <template v-else>
-            <AppIcon name="lock" :size="16" /> 登录
+            <AppIcon :name="submitIcon" :size="16" />
+            <SiteText :k="`login.form.submit.${formMode}`" passive />
           </template>
         </button>
 
         <div v-if="!setupNeeded && bootstrap.mail_enabled" class="form-links">
-          <button v-if="mode !== 'forgot'" type="button" class="linkish" @click="switchMode('forgot')">忘记密码?</button>
-          <button v-else type="button" class="linkish" @click="switchMode('login')">返回登录</button>
+          <button v-if="mode !== 'forgot'" type="button" class="linkish" @click="switchMode('forgot')">
+            <SiteText k="login.form.forgotLink" passive />
+          </button>
+          <button v-else type="button" class="linkish" @click="switchMode('login')">
+            <SiteText k="login.form.backToLogin" passive />
+          </button>
         </div>
 
         <p v-if="needsApproval" class="hint approval">
@@ -278,22 +304,35 @@ const features = [
 
         <div class="foot tiny">
           <AppIcon name="wifi" :size="13" />
-          <span>服务运行在本机 <code>{{ host }}</code> · 数据只保存在你自己的服务器上</span>
+          <SiteText k="login.form.foot" as="span" multiline />
         </div>
       </form>
     </section>
+
+    <!-- the way in for the owner: only an admin ever sees this -->
+    <button v-if="site.canEdit && !toolbarOn" class="st-handle" @click="setToolbar(true)">
+      <AppIcon name="wand" :size="14" /> 编辑此页
+    </button>
   </div>
 </template>
 
 <style scoped>
-.login { min-height: 100dvh; display: grid; grid-template-columns: 1.15fr 0.85fr; }
+.login {
+  min-height: 100dvh;
+  display: grid;
+  grid-template-columns: var(--lg-cols, 1.15fr 0.85fr);
+}
+/* "品牌面板在右侧" — the two halves swap places without changing the markup. */
+.login.aside-right .aside { order: 2; }
+.login.aside-right .form-side { order: 1; }
 
 /* ---------- aside ---------- */
 .aside { position: relative; overflow: hidden; display: flex; align-items: center; }
 .art {
   position: absolute; inset: 0;
+  filter: var(--lg-art, none);
   background:
-    radial-gradient(60% 55% at 78% 12%, rgba(240, 169, 46, 0.22), transparent 62%),
+    radial-gradient(60% 55% at 78% 12%, var(--lg-art-glow, rgba(240, 169, 46, 0.22)), transparent 62%),
     radial-gradient(52% 60% at 14% 22%, rgba(74, 108, 255, 0.2), transparent 64%),
     radial-gradient(70% 70% at 40% 108%, rgba(220, 74, 120, 0.16), transparent 66%),
     linear-gradient(160deg, #0d1018, #07080b 62%);
@@ -312,6 +351,7 @@ const features = [
   position: absolute; inset: 0;
   background: linear-gradient(100deg, rgba(6, 7, 10, 0.72) 30%, rgba(6, 7, 10, 0.2) 100%);
 }
+.login.no-art .art, .login.no-art .aside-scrim { display: none; }
 .aside-inner {
   position: relative;
   display: flex;
@@ -325,17 +365,24 @@ const features = [
   display: grid; place-items: center;
   width: 34px; height: 34px;
   border-radius: 11px;
-  background: linear-gradient(150deg, var(--brand-2), #d98a12 70%);
+  background: linear-gradient(150deg, var(--brand-2), var(--brand) 70%);
   color: var(--brand-ink);
-  box-shadow: 0 6px 20px rgba(240, 169, 46, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.5);
+  box-shadow: 0 6px 20px var(--brand-tint), inset 0 1px 0 rgba(255, 255, 255, 0.5);
 }
 .wordmark { font-family: var(--font-display); font-size: 19px; font-weight: 800; letter-spacing: -0.035em; }
-.wordmark span { color: var(--text-3); font-weight: 600; }
+.wordmark .wm-suffix { color: var(--text-3); font-weight: 600; }
 .pitch { display: flex; flex-direction: column; gap: 12px; }
 .pitch h1 { margin: 4px 0 2px; }
 .pitch p { max-width: 46ch; margin: 0; }
 
-.features { list-style: none; display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-4); margin: 0; padding: 0; }
+.features {
+  list-style: none;
+  display: grid;
+  grid-template-columns: repeat(var(--lg-feature-cols, 2), minmax(0, 1fr));
+  gap: var(--sp-4);
+  margin: 0; padding: 0;
+}
+.login.no-features .features { display: none; }
 .features li { display: flex; gap: 12px; align-items: flex-start; }
 .fi {
   display: grid; place-items: center;
@@ -350,7 +397,7 @@ const features = [
 
 /* ---------- form ---------- */
 .form-side { display: flex; align-items: center; justify-content: center; padding: clamp(24px, 5vw, 56px); background: var(--bg-0); }
-.form { width: 100%; max-width: 380px; display: flex; flex-direction: column; }
+.form { width: 100%; max-width: var(--lg-form-max, 380px); display: flex; flex-direction: column; }
 .form-head { margin-bottom: var(--sp-5); }
 .form-head h2 { font-size: clamp(22px, 3vw, 28px); margin-bottom: 6px; }
 .form-head p { margin: 0; }
@@ -365,7 +412,9 @@ const features = [
 }
 .pw-toggle:hover { color: var(--text-1); background: rgba(255, 255, 255, 0.07); }
 .foot { display: flex; align-items: center; gap: 7px; margin-top: var(--sp-5); line-height: 1.5; }
-.foot code { font-family: var(--font-mono); color: var(--text-3); }
+
+/* The accent the layout panel picks has to reach the shared form controls too. */
+.login :deep(.field input:focus) { box-shadow: 0 0 0 3px var(--brand-tint); }
 
 /* login / register switch — the same segmented look the rest of the app uses */
 .mode-switch {
@@ -409,7 +458,7 @@ const features = [
     min-height: 100dvh;
     padding: max(28px, env(safe-area-inset-top)) 22px calc(28px + env(safe-area-inset-bottom));
     background:
-      radial-gradient(80% 50% at 80% 0%, rgba(240, 169, 46, 0.14), transparent 60%),
+      radial-gradient(80% 50% at 80% 0%, var(--lg-art-glow, rgba(240, 169, 46, 0.14)), transparent 60%),
       radial-gradient(60% 50% at 10% 10%, rgba(74, 108, 255, 0.12), transparent 62%),
       var(--bg-0);
   }

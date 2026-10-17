@@ -1,6 +1,7 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { loadMe, resetAuth } from './auth.js'
 import { toast } from './toast.js'
+import { site } from './site/store.js'
 
 const routes = [
   { path: '/login', component: () => import('./views/Login.vue'), meta: { public: true, chrome: false } },
@@ -44,6 +45,7 @@ router.beforeEach(async (to) => {
 })
 
 router.afterEach((to) => {
-  const base = 'DoriyaMedia'
+  // The site name is editable from the toolbar, so the tab title follows it.
+  const base = site.doc.site.title || 'DoriyaMedia'
   document.title = to.meta.title ? `${to.meta.title} · ${base}` : base
 })

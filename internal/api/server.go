@@ -16,6 +16,7 @@ import (
 	"doriyamedia/internal/metadata"
 	"doriyamedia/internal/models"
 	"doriyamedia/internal/scan"
+	"doriyamedia/internal/site"
 )
 
 type Server struct {
@@ -27,6 +28,9 @@ type Server struct {
 	Engine     *media.Engine
 	WebFS      fs.FS // embedded dist root
 	DevWeb     string
+	// Site holds the owner's wording / layout / footer edits. Nil disables the
+	// /api/site routes (the toolbar reports the storage as unavailable).
+	Site *site.Store
 	// Version is the build version the linker stamped into main.version, so the
 	// UI can report the binary it is actually talking to rather than a constant
 	// someone has to remember to bump.
@@ -278,6 +282,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("HEAD /api/stream/{id}", s.allowPlayerAuth(s.handleStream))
 	mux.HandleFunc("GET /api/hls/{id}/{rest...}", s.allowPlayerAuth(s.handleHLS))
 	mux.HandleFunc("GET /api/subs/{id}/{sub}", s.allowPlayerAuth(s.handleSubtitle))
+
+	// site content (login page wording/layout, footer) — read by every visitor,
+	// written only by the admin from the editing toolbar
+	mux.HandleFunc("GET /api/site", s.handleGetSite)
+	mux.HandleFunc("PUT /api/site", s.requireAdmin(s.handlePutSite))
+	mux.HandleFunc("DELETE /api/site", s.requireAdmin(s.handleResetSite))
 
 	// progress
 	mux.HandleFunc("POST /api/progress", s.requireAuth(s.handleSaveProgress))

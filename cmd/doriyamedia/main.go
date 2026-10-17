@@ -14,6 +14,7 @@ import (
 	"doriyamedia/internal/metadata"
 	"doriyamedia/internal/models"
 	"doriyamedia/internal/scan"
+	"doriyamedia/internal/site"
 	"doriyamedia/internal/source"
 	"doriyamedia/internal/web"
 )
@@ -80,6 +81,11 @@ func main() {
 
 	srv := api.New(store, cfg, scanner, manager, engine, web.Dist(), version)
 	srv.ConfigPath = *cfgPath
+	siteStore, err := site.Open(cfg.SitePath())
+	if err != nil {
+		log.Fatalf("open site content: %v", err)
+	}
+	srv.Site = siteStore
 
 	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Port)
 	if os.Getenv("DORIYAMEDIA_LOCAL") == "1" {

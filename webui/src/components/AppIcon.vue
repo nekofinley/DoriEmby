@@ -72,6 +72,15 @@ const P = {
   wand: 'M5 19 17 7M14.5 4.5l1 1M19 9l1 1M16 4l3 3M4 20l1.5-1.5',
   history: 'M4 12a8 8 0 1 0 2.5-5.8M4 5v4h4M12 8v4.5l3 1.8',
   starHalf: 'M12 3.6v11.2M12 3.6l2.6 5.4 5.9.8-4.3 4.1 1 5.9-5.2-2.8',
+  // site editing toolbar
+  type: 'M5 7V5h14v2M12 5v14M9 19h6',
+  layout: 'M4 4h16v16H4zM10 4v16M10 11h10',
+  palette: 'M12 21a9 9 0 1 1 0-18c4.9 0 9 3.6 9 8 0 2.5-2 4-4.5 4H15a2 2 0 0 0-1.5 3.3A2 2 0 0 1 12 21zM7.5 12.5h.01M10 8.5h.01M14.5 7.5h.01M17 11h.01',
+  sliders: 'M4 7h9M17 7h3M4 17h3M11 17h9M15 4.2v5.6M9 14.2v5.6',
+  undo: 'M8 5 3.5 9.5 8 14M3.5 9.5H14a6 6 0 0 1 0 12H9',
+  redo: 'M16 5l4.5 4.5L16 14M20.5 9.5H10a6 6 0 0 0 0 12h5',
+  upload: 'M12 16V4M8 8l4-4 4 4M5 16v3a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3',
+  grip: 'M9 6h.01M9 12h.01M9 18h.01M15 6h.01M15 12h.01M15 18h.01',
 }
 
 const props = defineProps({
